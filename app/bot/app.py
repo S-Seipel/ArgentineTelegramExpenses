@@ -11,7 +11,6 @@ from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -102,17 +101,7 @@ def build_application(
     )
     application.add_handler(
         MessageHandler(
-            filters.PHOTO, _photo_handler
-        )
-    )
-    application.add_handler(
-        MessageHandler(
             filters.VOICE | filters.AUDIO, _voice_handler
-        )
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            _vision_callback_handler, pattern=r"^vision:"
         )
     )
     application.add_handler(
@@ -147,24 +136,6 @@ async def _voice_handler(
 
     deps: BotDependencies = context.application.bot_data["deps"]
     await handle_voice(update, context, deps)
-
-
-async def _photo_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    from app.bot.handlers import handle_photo
-
-    deps: BotDependencies = context.application.bot_data["deps"]
-    await handle_photo(update, context, deps)
-
-
-async def _vision_callback_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    from app.bot.handlers import handle_vision_callback
-
-    deps: BotDependencies = context.application.bot_data["deps"]
-    await handle_vision_callback(update, context, deps)
 
 
 __all__ = [

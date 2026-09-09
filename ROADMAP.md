@@ -25,26 +25,14 @@ fancys.
 
 ### 1.2 Receipt / ticket vision
 **Value:** unique feature, lets you snap a paper ticket instead of typing.
-**Effort:** ~4-6h (plus model downloads).
+**Effort:** ~4-6h (plus model downloads). Plus vision LLMs hallucinate
+numeric values; verified that even with `llava:7b` + `qwen3:4b` 2-pass
+the amount extraction is unreliable for receipts with many small line
+items. Deferred — fix the data path before adding the surface.
 
-- Use `llava:7b` (default) or `llama3.2-vision` via Ollama multimodal endpoint.
-- New `MessageHandler(filters.PHOTO, _photo_handler)`.
-- Download photo, base64, send to `/api/chat` with `images=[...]`.
-- Prompt: extract merchant, items, total, date as JSON.
-- Map the JSON to a normal `register_expense` flow.
-- Model is heavy (3-7GB) and slower than text. First call after idle
-  takes 10-20s.
-
-### 1.3 Dashboard web (`/dashboard`)
+### 1.3 Dashboard web (`/dashboard`) ✅ done
 **Value:** visualization that beats scrolling through chat.
 **Effort:** ~3-4h.
-
-- FastAPI already serves on `:8000`. Add a static `/dashboard` route.
-- Chart.js from CDN, no build step.
-- JSON endpoints:
-  - `GET /api/summary?period=month` → totals per category per day.
-  - `GET /api/trend?period=year` → monthly totals over time.
-- HTML template with line + pie charts.
 
 ---
 
