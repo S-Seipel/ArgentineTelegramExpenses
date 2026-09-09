@@ -618,9 +618,9 @@ async function refresh() {
   subtitle.classList.add('refreshing');
 
   const periodParam = '?period=' + currentPeriod;
-  let summary, trend, recent, budgets, recurring, comparison, projection;
+  let summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum;
   try {
-    const [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum] =
+    [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum] =
       await Promise.all([
         getJSON('/api/summary' + periodParam),
         getJSON('/api/trend' + periodParam),
