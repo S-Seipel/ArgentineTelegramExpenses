@@ -11,9 +11,10 @@ import logging
 from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import distinct
+from sqlalchemy import distinct, select
 
 from app.database.database import session_scope
+from app.recurring.models import RecurringExpense
 from app.recurring.repository import RecurringRepository
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
@@ -84,12 +85,7 @@ async def _fire_due_reminders(
         user_ids = [
             row[0]
             for row in session.execute(
-                distinct(
-                    __import__(
-                        "app.recurring.models",
-                        fromlist=["RecurringExpense"],
-                    ).RecurringExpense.telegram_user_id
-                )
+                select(distinct(RecurringExpense.telegram_user_id))
             ).all()
         ]
 

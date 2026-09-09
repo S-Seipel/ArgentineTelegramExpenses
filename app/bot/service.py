@@ -49,6 +49,8 @@ class BotRuntime:
         self.ai = ai
         # user_id -> {"recurring_id": int, "name": str, "amount": Decimal, "currency": str}
         self.pending_reminders: dict[int, dict] = {}
+        # user_id -> pending vision extraction dict awaiting confirm/cancel
+        self.pending_visions: dict[int, dict] = {}
 
     @classmethod
     def create(cls, settings: Settings) -> "BotRuntime":
@@ -296,12 +298,14 @@ def _help_text() -> str:
         "• *gasté 10k en un café*\n"
         "• *ayer gasté 20 dólares en Steam*\n"
         "• *hoy gasté 5k en café y 12k en Uber*\n"
-        "• *gasto 30k en Netflix cada mes el día 15* (recurrente)\n\n"
+        "• *gasto 30k en Netflix cada mes el día 15* (recurrente)\n"
+        "• 📸 *mandame una foto del ticket* — extraigo los datos y los confirmás\n\n"
         "*Consultas:*\n"
         "• *cuánto gasté hoy*\n"
         "• *total del mes*\n"
         "• *cuánto llevo en comida*\n"
         "• *últimos 10 gastos*\n\n"
+        "*Dashboard:* abrí http://localhost:8000/dashboard en el browser\n\n"
         "*Comandos:*\n"
         "/hoy /semana /mes — totales rápidos\n"
         "/gastos — últimos 10 gastos\n"

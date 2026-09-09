@@ -28,9 +28,16 @@ def settings(monkeypatch):
 
 @pytest.fixture
 def in_memory_db(monkeypatch, settings):
-    """Rebuild SQLAlchemy engine against an in-memory SQLite for tests."""
+    """Rebuild SQLAlchemy engine against a shared in-memory SQLite for tests.
+
+    Uses ``StaticPool`` so every checkout from the pool reuses the same
+    single connection. Otherwise, with plain ``:memory:`` SQLite, each
+    new connection (e.g., FastAPI dependency injection in TestClient)
+    would see a fresh empty database.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy import event
+    from sqlalchemy.pool import StaticPool
 
     import app.database.database as db_module
 
@@ -42,6 +49,7 @@ def in_memory_db(monkeypatch, settings):
     engine_ = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
         future=True,
     )
     event.listen(engine_, "connect", _enable_fks)

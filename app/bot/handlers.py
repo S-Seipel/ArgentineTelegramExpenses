@@ -171,9 +171,6 @@ async def handle_voice(
     context: ContextTypes.DEFAULT_TYPE,
     deps: BotDependencies,
 ) -> None:
-    """Download a voice/audio message, transcribe it via Whisper, then
-    route the transcript through the normal text flow.
-    """
     try:
         await _ensure_authorized(update, deps)
     except _SilentStop:
@@ -249,6 +246,205 @@ async def handle_voice(
         f"{reply}"
     )
     await update.effective_message.reply_text(formatted, parse_mode=None)
+
+
+async def handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    deps: BotDependencies,
+) -> None:
+    """Download the highest-resolution photo, ask the vision model to
+    extract a receipt/ticket, and show a confirmation prompt with
+    inline keyboard buttons.
+    """
+    try:
+        await _ensure_authorized(update, deps)
+    except _SilentStop:
+        return
+
+    if update.effective_message is None or update.effective_user is None:
+        return
+    photos = update.effective_message.photo
+    if not photos:
+        return
+    user_id = update.effective_user.id
+    await update.effective_message.chat.send_action(ChatAction.TYPING)
+
+    best = photos[-1]
+    try:
+        tg_file = await context.bot.get_file(best.file_id)
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download photo")
+        await update.effective_message.reply_text(
+            "⚠️ No pude descargar la imagen."
+        )
+        return
+
+    try:
+        extracted = await deps.runtime.ai.describe_image(image_bytes)
+    except AIUnavailable:
+        logger.exception("Vision unreachable")
+        await update.effective_message.reply_text(
+            "🤖 El servicio de visión no responde. Verificá que Ollama "
+            f"esté corriendo y que el modelo `{deps.runtime.settings.vision_model}` "
+            "esté descargado."
+        )
+        return
+    except AIError as exc:
+        await update.effective_message.reply_text(f"🤖 {exc}")
+        return
+    except Exception:
+        logger.exception("Vision error")
+        await update.effective_message.reply_text(
+            "⚠️ Error inesperado procesando la imagen."
+        )
+        return
+
+    confidence = float(extracted.get("confidence") or 0)
+    if confidence < deps.runtime.settings.vision_min_confidence:
+        await update.effective_message.reply_text(
+            f"🤔 No pude leer bien el ticket (confianza {confidence:.0%}). "
+            "¿Lo cargás a mano con el monto?"
+        )
+        return
+    if not extracted.get("amount"):
+        await update.effective_message.reply_text(
+            "🤔 No pude identificar el monto del ticket. "
+            "¿Lo cargás a mano?"
+        )
+        return
+
+    # Stash the extraction pending user confirmation.
+    deps.runtime.pending_visions[user_id] = {
+        "name": extracted.get("name") or "Ticket",
+        "amount": extracted.get("amount"),
+        "currency": (extracted.get("currency") or "ARS").upper(),
+        "category": extracted.get("category") or "Otros",
+        "date": extracted.get("date"),
+        "confidence": confidence,
+    }
+
+    markup = _vision_keyboard()
+    await update.effective_message.reply_text(
+        _format_vision_preview(deps.runtime.pending_visions[user_id]),
+        reply_markup=markup,
+    )
+
+
+async def handle_vision_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    deps: BotDependencies,
+) -> None:
+    """Handle inline keyboard responses for vision previews."""
+    query = update.callback_query
+    if query is None:
+        return
+    user_id = query.from_user.id if query.from_user else 0
+    pending = deps.runtime.pending_visions.pop(user_id, None)
+    await query.answer()
+
+    if pending is None:
+        await query.edit_message_text(
+            "🤔 Esta confirmación ya expiró. Mandame la foto de nuevo."
+        )
+        return
+
+    action = (query.data or "").split(":", 1)[1] if query.data else ""
+    if action == "confirm":
+        await _register_pending_vision_expense(
+            update, deps, user_id, pending
+        )
+    elif action == "cancel":
+        await query.edit_message_text("🗑️ Ticket descartado.")
+    elif action == "edit":
+        deps.runtime.pending_visions[user_id] = pending
+        await query.edit_message_text(
+            "✏️ Respondé con el dato corregido. Ejemplos:\n"
+            "• `monto: 4500`\n"
+            "• `nombre: Café Starbucks`\n"
+            "• `categoría: Café`"
+        )
+
+
+def _vision_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Registrar", callback_data="vision:confirm"),
+                InlineKeyboardButton("✏️ Corregir", callback_data="vision:edit"),
+            ],
+            [
+                InlineKeyboardButton("❌ Descartar", callback_data="vision:cancel"),
+            ],
+        ]
+    )
+
+
+def _format_vision_preview(d: dict) -> str:
+    amt = d.get("amount")
+    currency = d.get("currency") or "ARS"
+    conf = float(d.get("confidence") or 0) * 100
+    date_part = f"\n📅 {d['date']}" if d.get("date") else ""
+    return (
+        f"📸 *Extraído del ticket:*\n\n"
+        f"🏪 *{d.get('name') or 'Ticket'}*\n"
+        f"💰 $ {amt} {currency}\n"
+        f"📂 {d.get('category') or 'Otros'}"
+        f"{date_part}\n"
+        f"\nConfianza: {conf:.0f}%\n\n"
+        f"¿Lo registro?"
+    )
+
+
+async def _register_pending_vision_expense(
+    update: Update, deps: BotDependencies, user_id: int, pending: dict
+) -> None:
+    """Insert the pending vision expense via the existing register_many path."""
+    from datetime import date as _date
+    from decimal import Decimal
+
+    from app.ai.schemas import AIError, AIUnavailable
+    from app.bot.service import _process_message_async
+
+    amount = pending.get("amount")
+    if amount is None:
+        await update.effective_message.reply_text(
+            "🤔 Falta el monto. Reintentá con `/exportar` no, mejor mandá el ticket de nuevo."
+        )
+        return
+    try:
+        amount_dec = Decimal(str(amount))
+    except Exception:
+        await update.effective_message.reply_text("🤔 Monto inválido.")
+        return
+
+    name = pending.get("name") or "Ticket"
+    category = pending.get("category") or "Otros"
+    currency = (pending.get("currency") or "ARS").upper()
+    date_str = pending.get("date")
+
+    text = (
+        f"gasté {amount_dec} {currency} en {name}"
+        + (f" ({category})" if category else "")
+    )
+    today = today_in_tz(deps.runtime.settings.timezone)
+    reply = await _process_message_async(
+        deps.runtime,
+        text,
+        user_id=user_id,
+        today=today,
+    )
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(reply)
+        except Exception:
+            await update.callback_query.message.reply_text(reply)
+    else:
+        await update.effective_message.reply_text(reply)
 
 
 async def _maybe_handle_reminder_reply(

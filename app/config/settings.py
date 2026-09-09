@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     whisper_compute_type: str = Field(
         default="int8", alias="WHISPER_COMPUTE_TYPE"
     )
+    vision_model: str = Field(default="qwen2-vl:7b", alias="VISION_MODEL")
+    vision_min_confidence: float = Field(
+        default=0.5, alias="VISION_MIN_CONFIDENCE"
+    )
 
     timezone: str = Field(
         default="America/Argentina/Buenos_Aires", alias="TIMEZONE"

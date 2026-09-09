@@ -43,6 +43,8 @@ class AIServiceConfig:
     whisper_model_size: str = "base"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
+    vision_model: str = "qwen2-vl:7b"
+    vision_min_confidence: float = 0.5
 
     def http_timeout(self) -> httpx.Timeout:
         """Build an explicit httpx.Timeout with sane sub-budgets.
@@ -67,6 +69,8 @@ class AIService(Protocol):
     ) -> ParsedMessage: ...
 
     async def transcribe(self, audio: bytes) -> str: ...
+
+    async def describe_image(self, image: bytes) -> dict: ...
 
 
 class OllamaAIService:
@@ -168,6 +172,106 @@ class OllamaAIService:
         if not text:
             raise AIError("Whisper returned empty transcription")
         return text
+
+    async def describe_image(self, image: bytes) -> dict:
+        """Send a receipt/ticket image to the vision model and parse the JSON.
+
+        Returns a dict with at least ``confidence``, ``name``, ``amount``,
+        ``currency``, ``date``, ``category`` and ``needs_clarification``.
+        Raises ``AIUnavailable`` on transport failures and ``AIError`` for
+        malformed responses or missing model.
+        """
+        import base64
+        import time
+
+        if not image:
+            raise AIError("Empty image payload")
+        encoded = base64.b64encode(image).decode("ascii")
+        prompt = (
+            "Sos un asistente que extrae datos de tickets / facturas de "
+            "Argentina. Devolvés SOLO un objeto JSON con: name (comercio o "
+            "descripción corta), amount (número decimal positivo), currency "
+            "(ARS, USD u otra), date (YYYY-MM-DD o null si no se ve), "
+            "category (una hoja válida del árbol: Comida, Restaurante, "
+            "Café, Supermercado, Transporte, Uber, Taxi, Combustible, "
+            "Transporte público, Juegos, Cine, Suscripciones, Salidas, "
+            "Ropa, Tecnología, Salud, Educación, Hogar, Viajes, Regalos, "
+            "Servicios, Otros), confidence (0-1), needs_clarification "
+            "(boolean) y clarification_question (string|null). Si no podés "
+            "leer algún campo, devolvé null y bajá confidence."
+        )
+        payload = {
+            "model": self.cfg.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [encoded],
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": 2048,
+                "num_predict": 512,
+            },
+        }
+        url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
+        start = time.perf_counter()
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise AIUnavailable(
+                f"Ollama is unreachable at {self.cfg.base_url}: {exc}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "Vision timeout after %.1fs", time.perf_counter() - start
+            )
+            raise AIUnavailable("Vision request timed out") from exc
+        elapsed = time.perf_counter() - start
+        if response.status_code == 404:
+            raise AIError(
+                f"Modelo de visión no encontrado. "
+                f"Ejecutá: ollama pull {self.cfg.vision_model}"
+            )
+        if response.status_code != 200:
+            raise AIError(
+                f"Vision returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+        data = response.json()
+        content = (
+            data.get("message", {}).get("content")
+            or data.get("response")
+        )
+        if not content:
+            raise AIError("Vision returned empty content")
+        text = str(content).strip()
+        try:
+            parsed = _extract_json(text)
+        except AIError as exc:
+            raise AIError(f"Vision JSON parse failed: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise AIError("Vision response was not a JSON object")
+        logger.info(
+            "Vision ok: %.2fs (confidence=%s)",
+            elapsed,
+            parsed.get("confidence"),
+        )
+        # Normalize shape — accept missing keys gracefully.
+        parsed.setdefault("name", None)
+        parsed.setdefault("amount", None)
+        parsed.setdefault("currency", "ARS")
+        parsed.setdefault("date", None)
+        parsed.setdefault("category", None)
+        parsed.setdefault("confidence", 0.0)
+        parsed.setdefault("needs_clarification", False)
+        parsed.setdefault("clarification_question", None)
+        return parsed
 
     async def interpret(
         self, message: str, *, user_context: str | None = None
@@ -317,6 +421,8 @@ def build_default_ai_service(settings: Settings) -> OllamaAIService:
         whisper_model_size=settings.whisper_model_size,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
+        vision_model=settings.vision_model,
+        vision_min_confidence=settings.vision_min_confidence,
     )
     return OllamaAIService(cfg)
 
@@ -328,6 +434,7 @@ class StubAIService:
         self.scripted = scripted or {}
         self.calls: list[str] = []
         self.transcripts: list[bytes] = []
+        self.descriptions: list[bytes] = []
 
     async def interpret(
         self, message: str, *, user_context: str | None = None
@@ -350,6 +457,13 @@ class StubAIService:
     async def transcribe(self, audio: bytes) -> str:
         self.transcripts.append(audio)
         return ""
+
+    async def describe_image(self, image: bytes) -> dict:
+        self.descriptions.append(image)
+        return {
+            "needs_clarification": True,
+            "confidence": 0.0,
+        }
 
     async def aclose(self) -> None:
         return None
