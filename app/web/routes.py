@@ -6,6 +6,7 @@ since the bot is single-user. Bind to ``127.0.0.1`` only (see docker-compose).
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -158,6 +159,138 @@ async def api_fixed_expenses(
     with session_scope() as s:
         bills = fixed_expenses_current_month(s, user_id, today)
     return {"items": bills}
+
+
+@router.post("/api/fixed-expenses")
+async def api_create_fixed_expense(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Create a new fixed expense from the dashboard."""
+    from app.fixed_expenses.service import (
+        FixedExpenseDraft,
+        FixedExpenseService,
+        FixedExpenseValidationError,
+        current_month_year,
+    )
+    from app.fixed_expenses.repository import FixedExpenseRepository
+
+    try:
+        amount = Decimal(str(payload.get("expected_amount", "0")))
+    except (InvalidOperation, TypeError):
+        raise HTTPException(status_code=400, detail="Monto inválido.")
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Falta el nombre.")
+    method = (payload.get("payment_method") or "").strip() or None
+    try:
+        due_day = int(payload.get("due_day_of_month", 1))
+    except (ValueError, TypeError):
+        due_day = 1
+    currency = (payload.get("currency") or "ARS").upper()
+    draft = FixedExpenseDraft(
+        name=name,
+        expected_amount=amount,
+        currency=currency,
+        payment_method=method,
+        due_day_of_month=due_day,
+        category=payload.get("category"),
+    )
+    with session_scope() as s:
+        repo = FixedExpenseRepository(s)
+        service = FixedExpenseService(repo)
+        try:
+            obj = service.add(user_id, draft)
+        except FixedExpenseValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "id": obj.id,
+        "name": obj.name,
+        "expected_amount": float(obj.expected_amount),
+        "currency": obj.currency,
+        "payment_method": obj.payment_method,
+        "due_day_of_month": obj.due_day_of_month,
+    }
+
+
+@router.post("/api/fixed-expenses/{fixed_id}/pay")
+async def api_mark_paid(
+    fixed_id: int,
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Mark a fixed expense as paid for the current month."""
+    from app.fixed_expenses.service import (
+        FixedExpenseService,
+        current_month_year,
+    )
+    from app.fixed_expenses.repository import FixedExpenseRepository
+
+    actual = payload.get("actual_amount")
+    amount_dec = None
+    if actual is not None and actual != "":
+        try:
+            amount_dec = Decimal(str(actual))
+            if amount_dec <= 0:
+                raise ValueError
+        except (InvalidOperation, ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Monto real inválido.")
+    my = current_month_year(today)
+    with session_scope() as s:
+        repo = FixedExpenseRepository(s)
+        service = FixedExpenseService(repo)
+        obj, _ = service.mark_paid(user_id, fixed_id, my, actual_amount=amount_dec)
+        if obj is None:
+            raise HTTPException(status_code=404, detail="Gasto fijo no encontrado.")
+    return {"ok": True, "id": fixed_id, "month_year": my}
+
+
+@router.post("/api/fixed-expenses/{fixed_id}/unpay")
+async def api_unmark_paid(
+    fixed_id: int,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.fixed_expenses.service import (
+        FixedExpenseService,
+        current_month_year,
+    )
+    from app.fixed_expenses.repository import FixedExpenseRepository
+
+    my = current_month_year(today)
+    with session_scope() as s:
+        repo = FixedExpenseRepository(s)
+        service = FixedExpenseService(repo)
+        ok = service.unmark(user_id, fixed_id, my)
+        if not ok:
+            raise HTTPException(
+                status_code=404, detail="Gasto fijo o pago no encontrado."
+            )
+    return {"ok": True, "id": fixed_id}
+
+
+@router.post("/api/fixed-expenses/{fixed_id}/skip")
+async def api_skip(
+    fixed_id: int,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.fixed_expenses.service import (
+        FixedExpenseService,
+        current_month_year,
+    )
+    from app.fixed_expenses.repository import FixedExpenseRepository
+
+    my = current_month_year(today)
+    with session_scope() as s:
+        repo = FixedExpenseRepository(s)
+        service = FixedExpenseService(repo)
+        obj, _ = service.mark_skipped(user_id, fixed_id, my)
+        if obj is None:
+            raise HTTPException(status_code=404, detail="Gasto fijo no encontrado.")
+    return {"ok": True, "id": fixed_id}
 
 
 @router.get("/api/month-summary")
@@ -450,6 +583,71 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .delta-flat { color: var(--muted); }
 
     /* ===========================================================
+       Inputs and small buttons (used by gastos fijos form)
+       =========================================================== */
+    .fx-input {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s ease, background 0.2s ease;
+    }
+    .fx-input:focus {
+      border-color: rgba(96, 165, 250, 0.5);
+      background: rgba(255, 255, 255, 0.06);
+    }
+    select.fx-input { cursor: pointer; }
+
+    .fx-btn {
+      background: rgba(255, 255, 255, 0.04);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      color: var(--text);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+    .fx-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: rgba(255, 255, 255, 0.18);
+      transform: translateY(-1px);
+    }
+    .fx-btn-primary {
+      background: linear-gradient(135deg, #34d399 0%, #60a5fa 100%);
+      color: #0a0f1e;
+      border-color: transparent;
+      font-weight: 600;
+    }
+    .fx-btn-primary:hover {
+      box-shadow: 0 8px 20px rgba(52, 211, 153, 0.30);
+    }
+    .fx-btn-tiny {
+      padding: 4px 8px;
+      font-size: 11px;
+      border-radius: 6px;
+    }
+    .fx-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    .fx-skip-btn {
+      background: rgba(255, 255, 255, 0.03);
+      border-color: rgba(255, 255, 255, 0.06);
+      color: var(--muted);
+    }
+
+    /* ===========================================================
        Background chart colors (Apple-inspired palette)
        =========================================================== */
 
@@ -520,6 +718,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div id="fixed-list"></div>
+
+      <div id="fixed-add-row" style="margin-top:14px; display:none">
+        <div class="panel" style="padding:16px">
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end">
+            <div style="flex:2; min-width:160px">
+              <label class="subtitle" style="display:block; margin-bottom:4px">Nombre</label>
+              <input id="fx-name" type="text" placeholder="CASA" class="fx-input">
+            </div>
+            <div style="flex:1; min-width:120px">
+              <label class="subtitle" style="display:block; margin-bottom:4px">Monto esperado</label>
+              <input id="fx-amount" type="number" placeholder="90000" class="fx-input">
+            </div>
+            <div style="flex:1; min-width:90px">
+              <label class="subtitle" style="display:block; margin-bottom:4px">Día del mes</label>
+              <input id="fx-day" type="number" min="1" max="31" placeholder="10" class="fx-input">
+            </div>
+            <div style="flex:1; min-width:140px">
+              <label class="subtitle" style="display:block; margin-bottom:4px">Método</label>
+              <select id="fx-method" class="fx-input">
+                <option value="">(sin método)</option>
+                <option value="TRANSFERENCIA">Transferencia</option>
+                <option value="EFECTIVO">Efectivo</option>
+                <option value="DEBITO">Débito automático</option>
+                <option value="TARJETA">Tarjeta</option>
+                <option value="MERCADO PAGO">Mercado Pago</option>
+                <option value="APP">App</option>
+              </select>
+            </div>
+            <div style="display:flex; gap:6px">
+              <button id="fx-save" class="fx-btn fx-btn-primary">Guardar</button>
+              <button id="fx-cancel" class="fx-btn">Cancelar</button>
+            </div>
+          </div>
+          <div id="fx-error" class="subtitle" style="color:#f87171; margin-top:8px; display:none"></div>
+        </div>
+      </div>
+
+      <div id="fixed-actions" style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap">
+        <button id="fx-add-btn" class="fx-btn fx-btn-primary">+ Agregar gasto fijo</button>
+        <div class="subtitle" style="margin-left:auto; align-self:center">
+          ¿No tenés gastos fijos? Empezá agregando arriba.
+        </div>
+      </div>
     </div>
 
     <div class="row">
@@ -912,34 +1153,150 @@ function renderFixedExpenses(fixed, monthSum) {
   const STATUS_ICON = {
     pending: '⏳', paid_exact: '✅', paid_more: '💰', paid_less: '⚠️', skipped: '⏭️',
   };
+  const statusPillCls = {
+    pending: 'bad', paid_exact: 'ok', paid_more: 'warn',
+    paid_less: 'warn', skipped: '',
+  };
+  const statusLabel = {
+    pending: 'pendiente', paid_exact: 'pagado',
+    paid_more: 'pagado +', paid_less: 'pagado -', skipped: 'salteado',
+  };
   document.getElementById('fixed-list').innerHTML = items.map(b => {
     const icon = STATUS_ICON[b.status] || '⏳';
     const method = b.payment_method || '—';
     let actualStr = '';
-    let actualColor = '';
     if (b.actual_amount != null && b.actual_amount !== b.expected_amount) {
       const diff = b.actual_amount - b.expected_amount;
       const sign = diff > 0 ? '+' : '';
       const cls = diff > 0 ? 'paid-more' : 'paid-less';
       actualStr = ` <span class="${cls}">→ $${fmt.format(b.actual_amount)} (${sign}${fmt.format(Math.abs(diff))})</span>`;
-      actualColor = diff > 0 ? '#fbbf24' : '#f87171';
     }
+    let actionsHTML = '';
+    if (b.status === 'pending') {
+      actionsHTML = `
+        <div class="fx-actions">
+          <input type="number" id="pay-amt-${b.id}" placeholder="monto (opcional)"
+                 class="fx-input fx-btn-tiny" style="width:130px">
+          <button class="fx-btn fx-btn-primary fx-btn-tiny"
+                  onclick="fxPay(${b.id})">✓ Pagar</button>
+          <button class="fx-btn fx-btn-tiny" onclick="fxSkip(${b.id})">Saltear</button>
+        </div>`;
+    } else if (b.status === 'paid_exact' || b.status === 'paid_more' || b.status === 'paid_less') {
+      actionsHTML = `
+        <div class="fx-actions">
+          <button class="fx-btn fx-btn-tiny" onclick="fxUnpay(${b.id})">↶ Deshacer</button>
+        </div>`;
+    } else if (b.status === 'skipped') {
+      actionsHTML = `
+        <div class="fx-actions">
+          <button class="fx-btn fx-btn-tiny" onclick="fxUnpay(${b.id})">↶ Reactivar</button>
+        </div>`;
+    }
+    const pillBg = b.status === 'skipped'
+      ? 'background:rgba(255,255,255,0.06); color:#94a3b8' : '';
     return `
-      <div class="budget-row">
+      <div class="budget-row" data-fx-id="${b.id}">
         <div style="display:flex; align-items:center; gap:10px">
           <span style="font-size:18px; line-height:1">${icon}</span>
           <div style="flex:1">
             <div><strong>${escapeHTML(b.name)}</strong>
-              <span class="pill ${b.status === 'paid_exact' ? 'ok' : b.status === 'paid_more' ? 'warn' : b.status === 'paid_less' ? 'warn' : b.status === 'skipped' ? '' : 'bad'}"
-                    style="${b.status === 'skipped' ? 'background:rgba(255,255,255,0.06); color:#94a3b8' : ''}">
-                ${b.status === 'pending' ? 'pendiente' : b.status === 'paid_exact' ? 'pagado' : b.status === 'paid_more' ? 'pagado +' : b.status === 'paid_less' ? 'pagado -' : 'salteado'}
+              <span class="pill ${statusPillCls[b.status] || 'bad'}"
+                    style="${pillBg}">
+                ${statusLabel[b.status] || b.status}
               </span>
             </div>
             <div class="subtitle">$${fmt.format(b.expected_amount)} ${b.currency} · ${method} · día ${b.due_day_of_month}${actualStr}</div>
+            ${actionsHTML}
           </div>
         </div>
       </div>`;
   }).join('');
+}
+
+async function fxCreate() {
+  const errEl = document.getElementById('fx-error');
+  errEl.style.display = 'none';
+  const name = document.getElementById('fx-name').value.trim();
+  const amount = parseFloat(document.getElementById('fx-amount').value);
+  const day = parseInt(document.getElementById('fx-day').value || '1', 10);
+  const method = document.getElementById('fx-method').value;
+  if (!name) { fxShowError('Falta el nombre.'); return; }
+  if (!Number.isFinite(amount) || amount <= 0) { fxShowError('Monto inválido.'); return; }
+  try {
+    const r = await fetch('/api/fixed-expenses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name, expected_amount: amount,
+        due_day_of_month: day, payment_method: method, currency: 'ARS',
+      }),
+    });
+    if (!r.ok) {
+      const detail = (await r.json()).detail || ('HTTP ' + r.status);
+      fxShowError(detail);
+      return;
+    }
+    // Reset and hide the form, then refresh data.
+    document.getElementById('fx-name').value = '';
+    document.getElementById('fx-amount').value = '';
+    document.getElementById('fx-day').value = '';
+    document.getElementById('fx-method').value = '';
+    document.getElementById('fixed-add-row').style.display = 'none';
+    await refresh();
+  } catch (err) {
+    fxShowError('Error de red: ' + err.message);
+  }
+}
+
+function fxShowError(msg) {
+  const errEl = document.getElementById('fx-error');
+  errEl.textContent = msg;
+  errEl.style.display = 'block';
+}
+
+async function fxAction(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : null,
+    });
+    if (!r.ok) {
+      const detail = (await r.json().catch(() => null) || {}).detail
+        || ('HTTP ' + r.status);
+      alert('Error: ' + detail);
+      return;
+    }
+    await refresh();
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
+async function fxPay(id) {
+  const input = document.getElementById('pay-amt-' + id);
+  const amount = input && input.value ? parseFloat(input.value) : null;
+  if (amount !== null && (!Number.isFinite(amount) || amount <= 0)) {
+    alert('Monto inválido.');
+    return;
+  }
+  await fxAction('/api/fixed-expenses/' + id + '/pay',
+    amount !== null ? { actual_amount: amount } : {});
+}
+
+async function fxSkip(id) {
+  await fxAction('/api/fixed-expenses/' + id + '/skip');
+}
+
+async function fxUnpay(id) {
+  await fxAction('/api/fixed-expenses/' + id + '/unpay');
+}
+
+function fxToggleAdd() {
+  const row = document.getElementById('fixed-add-row');
+  const isHidden = row.style.display === 'none' || !row.style.display;
+  row.style.display = isHidden ? 'block' : 'none';
+  if (isHidden) document.getElementById('fx-name').focus();
 }
 
 function palette(n) {
@@ -1007,6 +1364,19 @@ refresh().catch(err => {
   document.getElementById('subtitle').textContent = 'Error: ' + err.message;
 });
 setInterval(() => refresh().catch(() => {}), 60000);
+
+document.getElementById('fx-add-btn').addEventListener('click', fxToggleAdd);
+document.getElementById('fx-cancel').addEventListener('click', () => {
+  document.getElementById('fixed-add-row').style.display = 'none';
+  document.getElementById('fx-error').style.display = 'none';
+});
+document.getElementById('fx-save').addEventListener('click', fxCreate);
+document.getElementById('fx-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') fxCreate();
+});
+document.getElementById('fx-amount').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') fxCreate();
+});
 </script>
 </body>
 </html>

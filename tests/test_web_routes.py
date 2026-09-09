@@ -120,7 +120,7 @@ def test_api_recent_limit_validation(client):
     assert r.status_code == 422
 
 
-def test_api_fixed_expenses_empty(client):
+def test_api_fixed_expenses_empty(in_memory_db, client):
     r = client.get("/api/fixed-expenses")
     assert r.status_code == 200
     assert r.json() == {"items": []}
@@ -145,7 +145,7 @@ def test_api_fixed_expenses_returns_status(in_memory_db, client):
     assert items[0]["status"] == "paid_exact"
 
 
-def test_api_month_summary_no_budget(client):
+def test_api_month_summary_no_budget(in_memory_db, client):
     r = client.get("/api/month-summary")
     assert r.status_code == 200
     data = r.json()
@@ -167,6 +167,178 @@ def test_api_month_summary_with_income(in_memory_db, client):
     data = r.json()
     assert data["income"] == 1000000.0
     assert data["extra"] == 50000.0
+
+
+def test_api_create_fixed_expense(in_memory_db, client):
+    r = client.post(
+        "/api/fixed-expenses",
+        json={
+            "name": "CASA",
+            "expected_amount": 90000,
+            "payment_method": "TRANSFERENCIA",
+            "due_day_of_month": 10,
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["name"] == "CASA"
+    assert data["expected_amount"] == 90000.0
+    assert data["currency"] == "ARS"
+    assert data["payment_method"] == "TRANSFERENCIA"
+    assert data["due_day_of_month"] == 10
+
+    # Should appear in the GET endpoint
+    r = client.get("/api/fixed-expenses")
+    assert len(r.json()["items"]) == 1
+
+
+def test_api_create_fixed_expense_invalid(in_memory_db, client):
+    # Missing name
+    r = client.post("/api/fixed-expenses", json={
+        "name": "",
+        "expected_amount": 1000,
+    })
+    assert r.status_code == 400
+
+    # Zero amount
+    r = client.post("/api/fixed-expenses", json={
+        "name": "X",
+        "expected_amount": 0,
+    })
+    assert r.status_code == 400
+
+
+def test_api_pay_fixed_expense(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        bill = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000"),
+            payment_method="TRANSFERENCIA", due_day_of_month=10))
+    fid = bill.id
+
+    # Mark as paid with explicit amount
+    r = client.post(f"/api/fixed-expenses/{fid}/pay",
+                    json={"actual_amount": 92000})
+    assert r.status_code == 200
+
+    # Verify it shows paid with diff
+    r = client.get("/api/fixed-expenses")
+    items = r.json()["items"]
+    assert items[0]["status"] == "paid_more"
+    assert items[0]["actual_amount"] == 92000.0
+    assert items[0]["diff"] == 2000.0
+
+
+def test_api_pay_fixed_expense_exact(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        bill = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000")))
+    fid = bill.id
+
+    r = client.post(f"/api/fixed-expenses/{fid}/pay",
+                    json={})  # no actual_amount -> uses expected
+    assert r.status_code == 200
+    r = client.get("/api/fixed-expenses")
+    assert r.json()["items"][0]["status"] == "paid_exact"
+
+
+def test_api_pay_fixed_expense_invalid_amount(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        bill = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000")))
+    r = client.post(f"/api/fixed-expenses/{bill.id}/pay",
+                    json={"actual_amount": 0})
+    assert r.status_code == 400
+
+
+def test_api_pay_fixed_expense_not_found(client):
+    r = client.post("/api/fixed-expenses/99999/pay", json={})
+    assert r.status_code == 404
+
+
+def test_api_skip_fixed_expense(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        bill = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="DENTISTA", expected_amount=Decimal("32000")))
+    r = client.post(f"/api/fixed-expenses/{bill.id}/skip", json={})
+    assert r.status_code == 200
+    r = client.get("/api/fixed-expenses")
+    assert r.json()["items"][0]["status"] == "skipped"
+
+
+def test_api_unpay_fixed_expense(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        bill = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000")))
+        svc.mark_paid(user_id=123456, fixed_id=bill.id,
+                      month_year=today_in_tz("UTC").strftime("%Y-%m"))
+
+    r = client.post(f"/api/fixed-expenses/{bill.id}/unpay", json={})
+    assert r.status_code == 200
+    r = client.get("/api/fixed-expenses")
+    assert r.json()["items"][0]["status"] == "pending"
+
+
+def test_api_full_flow_via_dashboard(in_memory_db, client):
+    """E2E: create via POST, mark paid with diff, verify summary."""
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    # Create two bills
+    r1 = client.post("/api/fixed-expenses", json={
+        "name": "CASA", "expected_amount": 90000,
+        "payment_method": "TRANSFERENCIA", "due_day_of_month": 10,
+    })
+    r2 = client.post("/api/fixed-expenses", json={
+        "name": "GYM", "expected_amount": 60000,
+        "payment_method": "EFECTIVO", "due_day_of_month": 15,
+    })
+    assert r1.status_code == 200 and r2.status_code == 200
+
+    casa_id = r1.json()["id"]
+    gym_id = r2.json()["id"]
+
+    # Set income
+    my = today_in_tz("UTC").strftime("%Y-%m")
+    client.post("/api/month-summary")  # warmup
+    # Set income via service directly
+    with session_scope() as s:
+        FixedExpenseService(FixedExpenseRepository(s)).set_budget(
+            123456, my, income=Decimal("1100000"),
+            extra=Decimal("75000"))
+
+    # Pay CASA exact, GYM more
+    client.post(f"/api/fixed-expenses/{casa_id}/pay", json={})
+    client.post(f"/api/fixed-expenses/{gym_id}/pay",
+                json={"actual_amount": 70000})
+
+    # Verify summary reflects paid amounts
+    r = client.get("/api/month-summary")
+    summary = r.json()
+    assert summary["income"] == 1100000.0
+    assert summary["extra"] == 75000.0
+    # Total paid: 90000 + 70000 = 160000
+    assert summary["total_fixed_paid"] == 160000.0
+    # Liberado = 1100000 + 75000 - 160000 = 1015000
+    assert summary["liberado"] == 1015000.0
 
 
 def test_api_budgets(in_memory_db):
