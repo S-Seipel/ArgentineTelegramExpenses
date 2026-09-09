@@ -554,10 +554,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       opacity: 0.85;
     }
     .budget-row {
-      padding: 12px 0;
+      padding: 16px 0;
       border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
     .budget-row:last-child { border: none; }
+    .budget-row > div > div + div { margin-top: 4px; }
+    .budget-row > div > .fx-actions { margin-top: 10px; }
 
     /* ===========================================================
        Comparison table + Recent table
@@ -900,8 +902,8 @@ async function refresh() {
     return `
       <div class="panel" style="animation-delay:${0.04 * (idx + 1)}s">
         <h2>Total ${summary.period_label.toLowerCase()} <span class="pill ok">${c}</span></h2>
-        <div class="big" data-value="${prev ?? 0}">$${fmt.format(firstLoad ? v : v)}</div>
-        <div style="color:var(--muted); font-size:12px; margin-top:6px">
+        <div class="big" data-value="${prev ?? 0}" style="margin-top:14px">$${fmt.format(firstLoad ? v : v)}</div>
+        <div style="color:var(--muted); font-size:12px; margin-top:10px">
           Día ${summary.days_elapsed} de ${summary.days_in_period}
         </div>
       </div>`;
@@ -1046,16 +1048,16 @@ async function refresh() {
     const dSign = comparison.delta_pct == null ? ''
                  : (comparison.delta_pct > 0 ? '+' : '');
     const top = `
-      <div class="budget-row">
+      <div style="display:flex; flex-direction:column; gap:6px; padding:6px 0 4px">
         <div><strong>${comparison.current.label}</strong>
-             ${currency(comparison.current.total, 'ARS')}</div>
+             <span style="color:var(--muted); margin-left:6px">${currency(comparison.current.total, 'ARS')}</span></div>
         <div><strong>${comparison.previous.label}</strong>
-             ${currency(comparison.previous.total, 'ARS')}</div>
-        <div class="${dClass}" style="font-size:26px; font-weight:600; margin-top:10px">
+             <span style="color:var(--muted); margin-left:6px">${currency(comparison.previous.total, 'ARS')}</span></div>
+        <div class="${dClass}" style="font-size:28px; font-weight:600; margin-top:8px">
           ${dArrow} ${dSign}${comparison.delta_pct == null ? '—' : comparison.delta_pct.toFixed(1) + '%'}
         </div>
       </div>`;
-    const rows = comparison.by_category.slice(0, 8).map(r => {
+    const rows = comparison.by_category.slice(0, 6).map(r => {
       const cls = r.diff_pct == null ? 'delta-flat'
                 : r.diff_pct > 0 ? 'delta-up'
                 : r.diff_pct < 0 ? 'delta-down' : 'delta-flat';
@@ -1068,14 +1070,18 @@ async function refresh() {
         <td class="${cls}">${arrow} ${sign}${r.diff_pct == null ? '—' : r.diff_pct.toFixed(1) + '%'}</td>
       </tr>`;
     }).join('');
+    const moreCount = Math.max(0, comparison.by_category.length - 6);
+    const footer = moreCount > 0
+      ? `<div class="subtitle" style="margin-top:8px; text-align:right">+${moreCount} más…</div>`
+      : '';
     cDiv.innerHTML = top + `
-      <table style="margin-top:14px">
+      <table style="margin-top:18px">
         <thead><tr><th>Categoría</th>
                    <th style="text-align:right">${comparison.current.label}</th>
                    <th style="text-align:right">${comparison.previous.label}</th>
                    <th style="text-align:right">Δ</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table>${footer}`;
   }
 
   // Projection
@@ -1094,15 +1100,18 @@ async function refresh() {
     const sign = projection.delta_vs_previous_pct == null ? ''
               : (projection.delta_vs_previous_pct > 0 ? '+' : '');
     pDiv.innerHTML = `
-      <div class="budget-row">
-        <div><strong>Gastado</strong></div>
-        <div class="big" style="margin-bottom:8px; font-size:32px">$${fmt.format(projection.spent)}</div>
+      <div style="display:flex; flex-direction:column; gap:6px; padding:6px 0 4px">
+        <div class="subtitle" style="font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted)">Gastado</div>
+        <div class="big" style="font-size:32px">$${fmt.format(projection.spent)}</div>
         <div class="subtitle">
           Día ${projection.days_elapsed} de ${projection.days_in_period}
         </div>
-        <div style="margin-top:18px"><strong>Proyección fin de período</strong></div>
+      </div>
+      <div style="height:1px; background:rgba(255,255,255,0.06); margin:18px 0"></div>
+      <div style="display:flex; flex-direction:column; gap:6px">
+        <div class="subtitle" style="font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted)">Proyección fin de período</div>
         <div class="big" style="color:var(--accent); font-size:32px">$${fmt.format(projection.projected_total)}</div>
-        <div class="${dCls}" style="margin-top:10px; font-size:18px; font-weight:500">
+        <div class="${dCls}" style="margin-top:4px; font-size:18px; font-weight:500">
           ${arrow} ${sign}${projection.delta_vs_previous_pct == null ? '—' : projection.delta_vs_previous_pct.toFixed(1) + '%'}
           vs período anterior
         </div>
