@@ -154,6 +154,32 @@ async def handle_text(
             await update.effective_message.reply_text(handled)
             return
 
+    pending_vision = deps.runtime.pending_visions.get(user_id)
+    if pending_vision is not None and pending_vision.get("state") == "editing":
+        from app.utils.corrections import parse_correction
+        corrected = parse_correction(text, pending_vision, today)
+        corrected["state"] = "pending"
+        deps.runtime.pending_visions[user_id] = corrected
+        if corrected.get("amount") is None:
+            await update.effective_message.reply_text(
+                "🤔 Ese texto no parece un monto. "
+                "Mandame un número solo (ej: `19280.50`) o "
+                "`monto: 19280.50`."
+            )
+            return
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Registrar", callback_data="vision:confirm"),
+                InlineKeyboardButton("❌ Descartar", callback_data="vision:cancel"),
+            ],
+        ])
+        await update.effective_message.reply_text(
+            _format_vision_preview(corrected),
+            reply_markup=markup,
+        )
+        return
+
     await update.effective_message.chat.send_action(ChatAction.TYPING)
     try:
         reply = await _process_message_async(
@@ -253,10 +279,7 @@ async def handle_photo(
     context: ContextTypes.DEFAULT_TYPE,
     deps: BotDependencies,
 ) -> None:
-    """Download the highest-resolution photo, ask the vision model to
-    extract a receipt/ticket, and show a confirmation prompt with
-    inline keyboard buttons.
-    """
+    """2-pass receipt OCR: llava transcribes text, qwen3 extracts fields."""
     try:
         await _ensure_authorized(update, deps)
     except _SilentStop:
@@ -268,6 +291,7 @@ async def handle_photo(
     if not photos:
         return
     user_id = update.effective_user.id
+    today = today_in_tz(deps.runtime.settings.timezone)
     await update.effective_message.chat.send_action(ChatAction.TYPING)
 
     best = photos[-1]
@@ -281,8 +305,9 @@ async def handle_photo(
         )
         return
 
+    # Pass 1: pure OCR via vision model
     try:
-        extracted = await deps.runtime.ai.describe_image(image_bytes)
+        raw_text = await deps.runtime.ai.transcribe_receipt(image_bytes)
     except AIUnavailable:
         logger.exception("Vision unreachable")
         await update.effective_message.reply_text(
@@ -301,28 +326,86 @@ async def handle_photo(
         )
         return
 
-    confidence = float(extracted.get("confidence") or 0)
-    if confidence < deps.runtime.settings.vision_min_confidence:
+    if not raw_text or len(raw_text.strip()) < 5:
         await update.effective_message.reply_text(
-            f"🤔 No pude leer bien el ticket (confianza {confidence:.0%}). "
+            "🤔 No pude leer texto del ticket. "
             "¿Lo cargás a mano con el monto?"
         )
         return
-    if not extracted.get("amount"):
+
+    # Pass 2: structured extraction via text LLM
+    try:
+        parsed = await deps.runtime.ai.parse_receipt_text(raw_text)
+    except AIUnavailable:
+        logger.exception("Parse unreachable")
         await update.effective_message.reply_text(
-            "🤔 No pude identificar el monto del ticket. "
-            "¿Lo cargás a mano?"
+            "🤖 El servicio de IA no responde. Probá más tarde."
+        )
+        return
+    except AIError as exc:
+        await update.effective_message.reply_text(f"🤖 {exc}")
+        return
+    except Exception:
+        logger.exception("Parse error")
+        await update.effective_message.reply_text(
+            "⚠️ Error parseando el ticket."
         )
         return
 
-    # Stash the extraction pending user confirmation.
+    amount_raw = parsed.get("total")
+    amount: Decimal | None = None
+    if amount_raw is not None and amount_raw != "":
+        try:
+            amount = Decimal(str(amount_raw))
+        except (InvalidOperation, ValueError):
+            amount = None
+    parsed["amount"] = amount
+
+    from app.utils.receipt_validation import (
+        is_amount_plausible,
+        is_date_recent,
+        score_receipt_confidence,
+    )
+
+    if amount is not None and not is_amount_plausible(amount, parsed.get("currency") or "ARS"):
+        parsed["amount"] = None
+    confidence = score_receipt_confidence(parsed, today)
+
+    if amount is None:
+        deps.runtime.pending_visions[user_id] = {
+            "name": parsed.get("merchant"),
+            "amount": None,
+            "currency": (parsed.get("currency") or "ARS").upper(),
+            "category": parsed.get("category"),
+            "date": parsed.get("date") if is_date_recent(parsed.get("date"), today) else None,
+            "confidence": confidence,
+            "raw_text": raw_text,
+            "state": "editing_amount",
+        }
+        markup = _vision_keyboard()
+        await update.effective_message.reply_text(
+            "🤔 No pude identificar el monto en el ticket.\n"
+            "Mandame el número solo y lo registro. Ej: `19280.50`\n"
+            f"Lo que leí:\n```\n{raw_text[:300]}\n```",
+            reply_markup=markup,
+        )
+        return
+
+    if confidence < deps.runtime.settings.vision_min_confidence:
+        await update.effective_message.reply_text(
+            f"🤔 Lectura dudosa (confianza {confidence:.0%}). "
+            "Te dejo el preview — usá Corregir si querés ajustar."
+        )
+
     deps.runtime.pending_visions[user_id] = {
-        "name": extracted.get("name") or "Ticket",
-        "amount": extracted.get("amount"),
-        "currency": (extracted.get("currency") or "ARS").upper(),
-        "category": extracted.get("category") or "Otros",
-        "date": extracted.get("date"),
+        "name": parsed.get("merchant") or "Ticket",
+        "amount": amount,
+        "currency": (parsed.get("currency") or "ARS").upper(),
+        "category": parsed.get("category") or "Otros",
+        "date": parsed.get("date") if is_date_recent(parsed.get("date"), today) else None,
         "confidence": confidence,
+        "raw_text": raw_text,
+        "state": "pending",
     }
 
     markup = _vision_keyboard()
@@ -359,13 +442,21 @@ async def handle_vision_callback(
     elif action == "cancel":
         await query.edit_message_text("🗑️ Ticket descartado.")
     elif action == "edit":
+        pending["state"] = "editing"
         deps.runtime.pending_visions[user_id] = pending
-        await query.edit_message_text(
-            "✏️ Respondé con el dato corregido. Ejemplos:\n"
-            "• `monto: 4500`\n"
-            "• `nombre: Café Starbucks`\n"
-            "• `categoría: Café`"
-        )
+        if pending.get("amount") is None:
+            await query.edit_message_text(
+                "✏️ Mandame solo el monto correcto: `19280.50`\n"
+                "También válido: `monto: 19280.50`, "
+                "`nombre: Carrefour`, `fecha: 2026-09-08`"
+            )
+        else:
+            await query.edit_message_text(
+                "✏️ Mandame el dato corregido:\n"
+                "• Solo un número: `19280.50` → corrige el monto\n"
+                "• `monto: 19280.50` / `nombre: Carrefour` / "
+                "`fecha: 2026-09-08`"
+            )
 
 
 def _vision_keyboard():
@@ -410,6 +501,7 @@ async def _register_pending_vision_expense(
     from app.ai.schemas import AIError, AIUnavailable
     from app.bot.service import _process_message_async
 
+    today = today_in_tz(deps.runtime.settings.timezone)
     amount = pending.get("amount")
     if amount is None:
         await update.effective_message.reply_text(
@@ -426,6 +518,46 @@ async def _register_pending_vision_expense(
     category = pending.get("category") or "Otros"
     currency = (pending.get("currency") or "ARS").upper()
     date_str = pending.get("date")
+
+    from app.utils.dates import parse_relative_date
+    expense_date = today
+    if date_str:
+        parsed_date = parse_relative_date(date_str, today=today)
+        if parsed_date is not None:
+            expense_date = parsed_date
+
+    if expense_date < today:
+        from app.expenses.service import ExpenseService
+        from app.expenses.repository import ExpenseRepository
+        from app.expenses.schemas import ExpenseDraft
+        from app.database.database import session_scope
+        with session_scope() as s:
+            expense_service = ExpenseService(ExpenseRepository(s))
+            drafts = [
+                ExpenseDraft(
+                    name=name,
+                    amount=amount_dec,
+                    currency=currency,
+                    category=category,
+                    expense_date=expense_date,
+                    confidence=Decimal("1"),
+                )
+            ]
+            outcome = expense_service.register_many(
+                user_id=user_id,
+                drafts=drafts,
+                original_message=f"gasté {amount_dec} {currency} en {name}",
+            )
+            reply = _expense_confirmation(outcome.saved)
+        deps.runtime.pending_visions.pop(user_id, None)
+        if update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(reply)
+            except Exception:
+                await update.callback_query.message.reply_text(reply)
+        else:
+            await update.effective_message.reply_text(reply)
+        return
 
     text = (
         f"gasté {amount_dec} {currency} en {name}"

@@ -73,8 +73,12 @@ class _ScriptedAI(StubAIService):
         super().__init__()
         self._response = response
 
-    async def describe_image(self, image):
-        self.descriptions.append(image)
+    async def transcribe_receipt(self, image):
+        self.ocr_calls.append(image)
+        return "TIGRE 19280.00 2026-09-08"
+
+    async def parse_receipt_text(self, raw_text):
+        self.parse_calls.append(raw_text)
         return self._response
 
 
@@ -82,13 +86,12 @@ class _ScriptedAI(StubAIService):
 async def test_handle_photo_extracts_and_shows_preview(runtime):
     runtime.ai = _ScriptedAI(
         {
-            "name": "Starbucks",
-            "amount": 4500,
+            "merchant": "Starbucks",
+            "total": 4500,
             "currency": "ARS",
             "category": "Café",
             "date": "2026-09-09",
             "confidence": 0.85,
-            "needs_clarification": False,
         }
     )
     bot = _FakeBot(b"\x89PNGfake")
@@ -98,43 +101,22 @@ async def test_handle_photo_extracts_and_shows_preview(runtime):
     deps = BotDependencies(runtime=runtime)
     await handle_photo(update, context, deps)
 
-    # Best resolution was requested.
     assert bot.calls == ["big"]
-    # The runtime has the extraction stashed.
     assert 1 in runtime.pending_visions
     pending = runtime.pending_visions[1]
     assert pending["name"] == "Starbucks"
     assert pending["amount"] == 4500
-    # The bot replied with the preview text + keyboard.
     reply = message.reply_text.call_args.kwargs
     assert "reply_markup" in reply
     text = message.reply_text.call_args.args[0]
     assert "Starbucks" in text
     assert "4.500" in text or "4500" in text
-    assert "85%" in text
 
 
 @pytest.mark.asyncio
-async def test_handle_photo_low_confidence_rejected(runtime):
+async def test_handle_photo_missing_amount_asks_correction(runtime):
     runtime.ai = _ScriptedAI(
-        {"amount": 4500, "currency": "ARS", "confidence": 0.3}
-    )
-    bot = _FakeBot(b"image")
-    update, message = _make_photo_update(1, b"image")
-    context = MagicMock()
-    context.bot = bot
-    deps = BotDependencies(runtime=runtime)
-    await handle_photo(update, context, deps)
-
-    reply = message.reply_text.call_args.args[0]
-    assert "no pude leer" in reply.lower() or "confianza" in reply.lower()
-    assert runtime.pending_visions == {}
-
-
-@pytest.mark.asyncio
-async def test_handle_photo_no_amount_rejected(runtime):
-    runtime.ai = _ScriptedAI(
-        {"name": "X", "amount": None, "currency": "ARS", "confidence": 0.9}
+        {"merchant": "X", "total": None, "currency": "ARS"}
     )
     bot = _FakeBot(b"image")
     update, message = _make_photo_update(1, b"image")
@@ -144,6 +126,27 @@ async def test_handle_photo_no_amount_rejected(runtime):
     await handle_photo(update, context, deps)
     reply = message.reply_text.call_args.args[0]
     assert "monto" in reply.lower()
+    assert "raw_text" in runtime.pending_visions[1] or \
+           runtime.pending_visions[1].get("state") == "editing_amount"
+
+
+@pytest.mark.asyncio
+async def test_handle_photo_ocr_text_too_short(runtime):
+    runtime.ai = _ScriptedAI({})  # parse response doesn't matter
+
+    class _StubOCR(StubAIService):
+        async def transcribe_receipt(self, image):
+            return ""
+
+    runtime.ai = _StubOCR()
+    bot = _FakeBot(b"image")
+    update, message = _make_photo_update(1, b"image")
+    context = MagicMock()
+    context.bot = bot
+    deps = BotDependencies(runtime=runtime)
+    await handle_photo(update, context, deps)
+    reply = message.reply_text.call_args.args[0]
+    assert "no pude leer" in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -171,29 +174,9 @@ async def test_handle_vision_callback_confirm_registers_expense(runtime):
         "category": "Café",
         "date": "2026-09-09",
         "confidence": 0.85,
+        "state": "pending",
     }
-    # Stub AI that classifies the text produced by confirm flow.
-    runtime.ai = StubAIService(
-        scripted={
-            "gasté 4500 ARS en Starbucks (Café)": {
-                "type": "register_expense",
-                "expenses": [
-                    {
-                        "name": "Starbucks",
-                        "amount": 4500,
-                        "currency": "ARS",
-                        "category": "Café",
-                        "date": "2026-09-09",
-                        "confidence": 0.9,
-                        "needs_clarification": False,
-                        "clarification_question": None,
-                    }
-                ],
-                "query": None,
-                "confidence": 0.9,
-            }
-        }
-    )
+    runtime.ai = StubAIService()
 
     query = MagicMock()
     query.data = "vision:confirm"
@@ -207,9 +190,7 @@ async def test_handle_vision_callback_confirm_registers_expense(runtime):
     deps = BotDependencies(runtime=runtime)
     await handle_vision_callback(update, context, deps)
 
-    # Pending should be cleared.
     assert runtime.pending_visions == {}
-    # The user got an answer back.
     query.answer.assert_called_once()
     assert query.edit_message_text.called
     reply = query.edit_message_text.call_args.args[0]

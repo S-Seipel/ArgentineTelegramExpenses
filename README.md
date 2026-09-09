@@ -228,15 +228,25 @@ Acepta voice notes de Telegram (`.ogg` Opus) y archivos de audio genéricos adju
 
 ### Tickets (visión)
 
-Mandá una foto de un ticket y el bot extrae los datos con `llava:7b` corriendo local en Ollama. Te muestra un preview y siempre te pide confirmación antes de registrar.
+Mandá una foto de un ticket y el bot extrae los datos en **dos pasos**:
+1. **llava:7b** hace OCR puro → transcribe el texto literal
+2. **qwen3:4b** parsea el texto → extrae {merchant, total, date, category}
+
+Te muestra un preview y siempre te pide confirmación antes de registrar.
 
 ```
 📸 Foto del ticket
-   ↓
-🏪 Café Starbucks Palermo
-💰 $ 4.500 ARS
-📂 Café
-Confianza: 85%
+   ↓ (llava:7b transcribe)
+"CAFE X 7.000X600.00 4200.00
+ 1.000X5000.00 VERDULERIA 5000.00
+ ...
+ TOTAL: 19280.00"
+   ↓ (qwen3:4b parsea)
+🏪 Tigre
+💰 $ 19.280,50 ARS
+📂 Supermercado
+📅 2026-09-08
+Confianza: 100%
 
 [✅ Registrar]  [✏️ Corregir]
 [❌ Descartar]
@@ -244,14 +254,18 @@ Confianza: 85%
 
 **Setup:**
 ```bash
-ollama pull llava:7b   # ~4.7GB, ~10-20s por foto
+ollama pull llava:7b   # ~4.7GB
 ```
 
 Alternativas más pesadas si necesitás más precisión (requieren más RAM/disco):
-- `llama3.2-vision:11b` — mejor calidad (~7GB)
+- `llama3.2-vision:11b` — mejor calidad OCR (~7GB)
 - `llama3.2-vision:90b` — el más preciso (~50GB, requiere GPU)
 
 Cambiá con `VISION_MODEL` en `.env`.
+
+**Corrección inteligente.** Si la extracción es incorrecta, tap "Corregir" y mandá:
+- Solo un número: `19280.50` → corrige el monto
+- `monto: 19280.50` / `nombre: Carrefour` / `fecha: 2026-09-08`
 
 ### Gastos recurrentes
 

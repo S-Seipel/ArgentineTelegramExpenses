@@ -20,7 +20,13 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.ai.prompts import system_prompt, today_str, user_instructions
+from app.ai.prompts import (
+    receipt_ocr_prompt,
+    receipt_parse_prompt,
+    system_prompt,
+    today_str,
+    user_instructions,
+)
 from app.ai.schemas import (
     AIError,
     AIUnavailable,
@@ -71,6 +77,10 @@ class AIService(Protocol):
     async def transcribe(self, audio: bytes) -> str: ...
 
     async def describe_image(self, image: bytes) -> dict: ...
+
+    async def transcribe_receipt(self, image: bytes) -> str: ...
+
+    async def parse_receipt_text(self, raw_text: str) -> dict: ...
 
 
 class OllamaAIService:
@@ -173,14 +183,147 @@ class OllamaAIService:
             raise AIError("Whisper returned empty transcription")
         return text
 
-    async def describe_image(self, image: bytes) -> dict:
-        """Send a receipt/ticket image to the vision model and parse the JSON.
+    async def transcribe_receipt(self, image: bytes) -> str:
+        """Pass 1 of receipt OCR: pure text transcription via vision model.
 
-        Returns a dict with at least ``confidence``, ``name``, ``amount``,
-        ``currency``, ``date``, ``category`` and ``needs_clarification``.
-        Raises ``AIUnavailable`` on transport failures and ``AIError`` for
-        malformed responses or missing model.
+        Returns the raw text as the model reads it. Does NOT try to
+        extract structured fields - that happens in pass 2 with the text
+        LLM.
         """
+        import base64
+        import time
+
+        if not image:
+            raise AIError("Empty image payload")
+        encoded = base64.b64encode(image).decode("ascii")
+        payload = {
+            "model": self.cfg.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": receipt_ocr_prompt(),
+                    "images": [encoded],
+                }
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": 4096,
+                "num_predict": 1024,
+            },
+        }
+        url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
+        start = time.perf_counter()
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise AIUnavailable(
+                f"Ollama is unreachable at {self.cfg.base_url}: {exc}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "OCR timeout after %.1fs", time.perf_counter() - start
+            )
+            raise AIUnavailable("OCR request timed out") from exc
+        elapsed = time.perf_counter() - start
+        if response.status_code == 404:
+            raise AIError(
+                f"Modelo de visión no encontrado. "
+                f"Ejecutá: ollama pull {self.cfg.vision_model}"
+            )
+        if response.status_code != 200:
+            raise AIError(
+                f"OCR returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+        data = response.json()
+        content = (
+            data.get("message", {}).get("content") or data.get("response")
+        )
+        if not content:
+            raise AIError("OCR returned empty content")
+        text = str(content).strip()
+        logger.info(
+            "OCR ok: %.2fs (%d chars)", elapsed, len(text)
+        )
+        return text
+
+    async def parse_receipt_text(self, raw_text: str) -> dict:
+        """Pass 2 of receipt OCR: extract structured fields from raw text."""
+        import time
+
+        if not raw_text or not raw_text.strip():
+            raise AIError("Empty OCR text")
+        prompt = receipt_parse_prompt(raw_text)
+        payload = {
+            "model": self.cfg.model,
+            "messages": [
+                {"role": "system", "content": system_prompt(
+                    today_str(), self.cfg.timezone
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
+                "num_ctx": 2048,
+                "num_predict": 512,
+            },
+        }
+        url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
+        start = time.perf_counter()
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise AIUnavailable(
+                f"Ollama is unreachable at {self.cfg.base_url}: {exc}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "Parse timeout after %.1fs", time.perf_counter() - start
+            )
+            raise AIUnavailable("Parse request timed out") from exc
+        elapsed = time.perf_counter() - start
+        if response.status_code != 200:
+            raise AIError(
+                f"Parse returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+        data = response.json()
+        content = (
+            data.get("message", {}).get("content") or data.get("response")
+        )
+        if not content:
+            raise AIError("Parse returned empty content")
+        text = str(content).strip()
+        try:
+            parsed = _extract_json(text)
+        except AIError as exc:
+            raise AIError(f"Parse JSON failed: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise AIError("Parse response was not a JSON object")
+        logger.info(
+            "Parse ok: %.2fs (merchant=%s amount=%s)",
+            elapsed,
+            parsed.get("merchant"),
+            parsed.get("total"),
+        )
+        parsed.setdefault("merchant", None)
+        parsed.setdefault("total", None)
+        parsed.setdefault("currency", "ARS")
+        parsed.setdefault("date", None)
+        parsed.setdefault("category", None)
+        parsed.setdefault("confidence", 0.0)
+        return parsed
+
+    async def describe_image(self, image: bytes) -> dict:
         import base64
         import time
 
@@ -435,6 +578,8 @@ class StubAIService:
         self.calls: list[str] = []
         self.transcripts: list[bytes] = []
         self.descriptions: list[bytes] = []
+        self.ocr_calls: list[bytes] = []
+        self.parse_calls: list[str] = []
 
     async def interpret(
         self, message: str, *, user_context: str | None = None
@@ -457,6 +602,15 @@ class StubAIService:
     async def transcribe(self, audio: bytes) -> str:
         self.transcripts.append(audio)
         return ""
+
+    async def transcribe_receipt(self, image: bytes) -> str:
+        self.ocr_calls.append(image)
+        return ""
+
+    async def parse_receipt_text(self, raw_text: str) -> dict:
+        self.parse_calls.append(raw_text)
+        return {"merchant": None, "total": None, "currency": "ARS",
+                "date": None, "category": None, "confidence": 0.0}
 
     async def describe_image(self, image: bytes) -> dict:
         self.descriptions.append(image)
