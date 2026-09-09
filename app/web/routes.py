@@ -639,9 +639,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .fx-actions {
       display: flex;
-      gap: 6px;
+      gap: 10px;
       flex-wrap: wrap;
-      margin-top: 6px;
+      align-items: center;
+      margin-top: 8px;
     }
     .fx-skip-btn {
       background: rgba(255, 255, 255, 0.03);
