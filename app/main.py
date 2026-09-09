@@ -115,6 +115,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from app.web.routes import router as web_router  # noqa: E402
+
+app.include_router(web_router)
+
 
 @app.get("/health")
 async def health() -> dict:
