@@ -502,6 +502,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       position: relative;
       overflow: hidden;
     }
+    #fixed-panel { margin-bottom: 18px; }
     @keyframes panelEnter {
       from { opacity: 0; transform: translateY(12px) scale(0.985); }
       to   { opacity: 1; transform: translateY(0) scale(1); }
