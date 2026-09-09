@@ -194,6 +194,9 @@ Acepta jerga argentina: `10k`, `10 lucas`, `10 mil`, `$10.000`, `10,000`, `20 d�
 - `/recurrentes` — lista los recurrentes activos
 - `/recurrente_off <id>` / `/recurrente_on <id>` — pausa / reanuda
 - `/recurrente_del <id>` — elimina un recurrente
+- `/presupuesto <categoría> <monto> [moneda]` — límite mensual por categoría (avisa al 80% y al 100%)
+- `/presupuestos` — lista presupuestos activos
+- `/presupuesto_del <id>` / `/presupuesto_off <id>` / `/presupuesto_on <id>` — gestión
 
 ### Gastos recurrentes
 
@@ -238,6 +241,22 @@ El bot te avisa a las **09:00 hora local** el día del vencimiento. Respondé:
 - **no** — salta este período
 - **posponer** — te avisa mañana
 - **eliminar** — borra el recurrente
+
+### Presupuestos mensuales
+
+Definí un límite por categoría y el bot te avisa cuando te acercás o lo superás:
+
+```
+/presupuesto comida 50000       # ARS por default
+/presupuesto salidas 200 USD    # moneda custom
+/presupuestos                   # ver todos
+/presupuesto_del 3              # borrar
+```
+
+El bot chequea después de cada gasto. Si tu gasto acumulado en esa categoría
+supera el **80%** del límite te avisa con `⚠️ Cerca del límite`. Si pasa el
+**100%**, te avisa con `🚨 Presupuesto superado`. Una sola notificación por mes
+por categoría.
 
 Cualquier otro texto lo interpreta el LLM, así que podés hablarle natural.
 

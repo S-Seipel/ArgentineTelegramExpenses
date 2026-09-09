@@ -88,6 +88,18 @@ def build_application(
         )
     )
     application.add_handler(
+        CommandHandler(
+            [
+                "presupuesto",
+                "presupuestos",
+                "presupuesto_del",
+                "presupuesto_off",
+                "presupuesto_on",
+            ],
+            _command_handler,
+        )
+    )
+    application.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO, _voice_handler
         )

@@ -151,6 +151,32 @@ class ExpenseRepository:
         rows = self.session.execute(stmt).all()
         return {name: Decimal(total or 0) for name, total in rows}
 
+    def sum_for_category(
+        self,
+        user_id: int,
+        category_name: str,
+        start: date | None = None,
+        end: date | None = None,
+        currency: str | None = None,
+    ) -> Decimal:
+        """Return the total spent in a single category within the window."""
+        stmt = (
+            select(func.coalesce(func.sum(Expense.amount), 0))
+            .join(Category, Category.id == Expense.category_id)
+            .where(
+                Expense.telegram_user_id == user_id,
+                Category.name == category_name,
+            )
+        )
+        if start is not None:
+            stmt = stmt.where(Expense.expense_date >= start)
+        if end is not None:
+            stmt = stmt.where(Expense.expense_date <= end)
+        if currency is not None:
+            stmt = stmt.where(Expense.currency == currency.upper())
+        total = self.session.execute(stmt).scalar_one()
+        return Decimal(total or 0)
+
     def largest(
         self,
         user_id: int,

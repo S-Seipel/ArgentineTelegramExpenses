@@ -24,6 +24,8 @@ from app.recurring.service import (
     RecurringValidationError,
 )
 from app.recurring.schemas import RecurringOut
+from app.budgets.repository import BudgetRepository
+from app.budgets.service import BudgetDraft, BudgetService, BudgetValidationError
 from app.utils.amounts import _normalize_decimal, find_thousand_amounts
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
@@ -98,6 +100,23 @@ async def handle_command(
             service = RecurringService(repo)
             reply = _handle_recurring_command(
                 command, args, service, user_id, today_in_tz(deps.runtime.settings.timezone)
+            )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command in (
+        "/presupuesto",
+        "/presupuestos",
+        "/presupuesto_del",
+        "/presupuesto_off",
+        "/presupuesto_on",
+    ):
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        with session_scope() as session:
+            repo = BudgetRepository(session)
+            service = BudgetService(repo)
+            reply = _handle_budget_command(
+                command, args, service, user_id
             )
         await update.effective_message.reply_text(reply)
         return
@@ -686,3 +705,86 @@ def _recurrentes_list(user_id: int, service: RecurringService) -> str:
     lines.append("")
     lines.append("`/recurrente_del <id>` elimina · `/recurrente_off <id>` pausa · `/recurrente_on <id>` reactiva")
     return "\n".join(lines)
+
+
+def _handle_budget_command(
+    command: str,
+    args: list[str],
+    service: BudgetService,
+    user_id: int,
+) -> str:
+    if command == "/presupuestos":
+        items = service.list(user_id)
+        if not items:
+            return (
+                "🤷 No tenés presupuestos. Creá uno con "
+                "`/presupuesto comida 50000`."
+            )
+        lines = ["💰 *Tus presupuestos mensuales*", ""]
+        for b in items:
+            status = "" if b.is_active else " _(pausado)_"
+            lines.append(
+                f"`#{b.id}` *{b.category_name}* — "
+                f"{format_currency_amount(b.monthly_limit, b.currency)}{status}"
+            )
+        lines.append("")
+        lines.append(
+            "`/presupuesto_del <id>` elimina · "
+            "`/presupuesto_off <id>` pausa · "
+            "`/presupuesto_on <id>` reactiva"
+        )
+        return "\n".join(lines)
+
+    if command == "/presupuesto":
+        if len(args) < 2:
+            return (
+                "❓ Uso: `/presupuesto <categoría> <monto> [moneda]`\n"
+                "Ej: `/presupuesto comida 50000` o "
+                "`/presupuesto salidas 50 USD`"
+            )
+        category = args[0]
+        amount = _parse_user_amount(args[1])
+        if amount is None:
+            return f"❓ No pude interpretar el monto `{args[1]}`."
+        currency = args[2] if len(args) >= 3 else None
+        draft = BudgetDraft(
+            category=category, monthly_limit=amount, currency=currency
+        )
+        try:
+            obj, created = service.upsert_from_draft(user_id, draft)
+        except BudgetValidationError as exc:
+            return f"🤔 {exc}"
+        action = "creado" if created else "actualizado"
+        return (
+            f"💰 Presupuesto {action}:\n"
+            f"*{obj.category.name if obj.category else category}* — "
+            f"{format_currency_amount(obj.monthly_limit, obj.currency)} "
+            f"por mes."
+        )
+
+    if command in ("/presupuesto_del", "/presupuesto_off", "/presupuesto_on"):
+        if not args:
+            return (
+                "❓ Decime el ID. Ej: `/presupuesto_del 3`. "
+                "Usá `/presupuestos` para ver los IDs."
+            )
+        try:
+            budget_id = int(args[0])
+        except ValueError:
+            return "❓ El ID tiene que ser un número entero."
+        if command == "/presupuesto_del":
+            ok = service.delete(user_id, budget_id)
+        elif command == "/presupuesto_off":
+            ok = service.deactivate(user_id, budget_id) is not None
+        else:
+            ok = service.reactivate(user_id, budget_id) is not None
+        if not ok:
+            return f"🤷 No encontré el presupuesto #{budget_id}."
+        action = {
+            "/presupuesto_del": "eliminado",
+            "/presupuesto_off": "pausado",
+            "/presupuesto_on": "reanudado",
+        }[command]
+        return f"💰 Presupuesto #{budget_id} {action}."
+
+    return "Comando no reconocido."

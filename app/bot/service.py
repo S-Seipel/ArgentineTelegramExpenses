@@ -23,6 +23,8 @@ from app.recurring.service import (
     RecurringService,
     RecurringValidationError,
 )
+from app.budgets.repository import BudgetRepository
+from app.budgets.service import BudgetService
 from app.utils.amounts import (
     detect_currency_hint,
     normalize_amount,
@@ -142,7 +144,13 @@ async def _process_message_async(
         if not outcome.saved:
             return "🤔 No pude identificar un gasto válido en el mensaje."
 
-        return _expense_confirmation(outcome.saved)
+        confirmation = _expense_confirmation(outcome.saved)
+        budget_warning = _check_budget_alerts(
+            user_id=user_id, outcome=outcome, today=today
+        )
+        if budget_warning:
+            confirmation = f"{confirmation}\n\n{budget_warning}"
+        return confirmation
 
     if intent_type == "register_recurring":
         if parsed.recurring is None:
@@ -303,7 +311,9 @@ def _help_text() -> str:
         "/exportar — CSV del mes\n"
         "/recurrente_add <nombre> <monto> <día> — recurrente mensual\n"
         "/recurrente_add_anual <nombre> <monto> <mes> <día> — anual\n"
-        "/recurrentes — listar recurrentes"
+        "/recurrentes — listar recurrentes\n"
+        "/presupuesto <categoría> <monto> — límite mensual\n"
+        "/presupuestos — listar presupuestos"
     )
 
 
@@ -317,6 +327,75 @@ def _clarification_message(extracted) -> str:
         return "Necesito un poco más de información para registrar el gasto."
     bullets = "\n".join(f"• {q}" for q in questions if q)
     return f"🤔 {bullets}"
+
+
+def _check_budget_alerts(
+    *, user_id: int, outcome, today
+) -> str | None:
+    """If the just-registered expense trips a budget threshold, append a warning.
+
+    Uses a fresh session and is silent on error — a budget notification is
+    nice-to-have, never a blocker for the expense itself.
+    """
+    from app.categories.models import Category
+
+    alerts: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    for saved in outcome.saved:
+        cache_key = (saved.category_id, saved.currency)
+        if cache_key in seen:
+            continue
+        seen.add(cache_key)
+        try:
+            with session_scope() as session:
+                expense_repo = ExpenseRepository(session)
+                category_name = (
+                    session.query(Category.name)
+                    .filter(Category.id == saved.category_id)
+                    .scalar()
+                )
+                if not category_name:
+                    continue
+                month_start = today.replace(day=1)
+                spent = expense_repo.sum_for_category(
+                    user_id,
+                    category_name=category_name,
+                    start=month_start,
+                    end=today,
+                    currency=saved.currency,
+                )
+                budget_repo = BudgetRepository(session)
+                service = BudgetService(budget_repo)
+                alert = service.evaluate_after_expense(
+                    user_id=user_id,
+                    category_id=saved.category_id,
+                    currency=saved.currency,
+                    spent_in_month=spent,
+                    today=today,
+                )
+                if alert is not None:
+                    alerts.append(_format_budget_alert(alert))
+        except Exception:
+            logger.exception("Budget alert check failed")
+            continue
+    return "\n".join(alerts) if alerts else None
+
+
+def _format_budget_alert(alert) -> str:
+    pct = (alert.percent * 100).quantize(Decimal("1"))
+    if alert.level == "exceeded":
+        return (
+            f"🚨 *Presupuesto superado*: llevás "
+            f"{format_currency_amount(alert.spent, alert.currency)} "
+            f"({pct}%) en *{alert.category_name}* este mes "
+            f"(límite {format_currency_amount(alert.limit, alert.currency)})."
+        )
+    return (
+        f"⚠️ *Cerca del límite*: llevás "
+        f"{format_currency_amount(alert.spent, alert.currency)} "
+        f"({pct}%) en *{alert.category_name}* este mes "
+        f"(límite {format_currency_amount(alert.limit, alert.currency)})."
+    )
 
 
 def _expense_confirmation(saved) -> str:
