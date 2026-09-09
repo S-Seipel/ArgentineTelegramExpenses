@@ -217,6 +217,158 @@ def test_api_summary_unknown_period_defaults_to_month(client):
     assert r.json()["period_label"] == "Este mes"
 
 
+def test_api_trend_accepts_period(client):
+    """Default still works for backwards compat."""
+    r = client.get("/api/trend?period=week")
+    assert r.status_code == 200
+    assert len(r.json()["points"]) == 7
+
+
+def test_api_trend_period_today(client):
+    r = client.get("/api/trend?period=today")
+    assert r.status_code == 200
+    assert len(r.json()["points"]) == 1
+
+
+def test_api_trend_period_week(client):
+    r = client.get("/api/trend?period=week")
+    assert r.status_code == 200
+    assert len(r.json()["points"]) == 7
+
+
+def test_api_trend_period_year(client):
+    r = client.get("/api/trend?period=year")
+    assert r.status_code == 200
+    assert len(r.json()["points"]) == 365
+
+
+def test_api_comparison_accepts_period(in_memory_db, client):
+    today = today_in_tz("UTC")
+    last_month = today.replace(day=1)
+    if last_month.month == 1:
+        prev = last_month.replace(year=last_month.year - 1, month=12)
+    else:
+        prev = last_month.replace(month=last_month.month - 1)
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=123456,
+            drafts=[
+                _draft(name="A", amount=Decimal("10000"), category="Café",
+                       expense_date=today),
+                _draft(name="B", amount=Decimal("5000"), category="Café",
+                       expense_date=prev),
+            ],
+            original_message="seed",
+        )
+    r = client.get("/api/comparison?period=month")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["current"]["total"] == 10000.0
+    assert data["previous"]["total"] == 5000.0
+
+
+def test_api_comparison_period_today(in_memory_db, client):
+    today = today_in_tz("UTC")
+    yesterday = today.replace(day=max(1, today.day - 1))
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=123456,
+            drafts=[
+                _draft(name="A", amount=Decimal("1000"), category="Café",
+                       expense_date=today),
+                _draft(name="B", amount=Decimal("500"), category="Café",
+                       expense_date=yesterday),
+            ],
+            original_message="seed",
+        )
+    r = client.get("/api/comparison?period=today")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["current"]["total"] == 1000.0
+    assert data["previous"]["total"] == 500.0
+
+
+def test_api_projection_accepts_period(in_memory_db, client):
+    today = today_in_tz("UTC")
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=123456,
+            drafts=[
+                _draft(name="A", amount=Decimal("5000"), category="Café",
+                       expense_date=today),
+            ],
+            original_message="seed",
+        )
+    r = client.get("/api/projection?period=month")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["applies"] is True
+    assert data["spent"] == 5000.0
+    assert data["projected_total"] >= 5000.0
+
+
+def test_api_projection_today_does_not_apply(client):
+    r = client.get("/api/projection?period=today")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["applies"] is False
+
+
+def test_api_budgets_accepts_period(in_memory_db, client):
+    today = today_in_tz("UTC")
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=123456,
+            drafts=[
+                _draft(name="A", amount=Decimal("45000"), category="Café",
+                       expense_date=today),
+            ],
+            original_message="seed",
+        )
+        BudgetService(BudgetRepository(s)).upsert_from_draft(
+            user_id=123456,
+            draft=BudgetDraft(category="Café", monthly_limit=Decimal("50000"),
+                              currency=None),
+        )
+    # Month period: percent = 90
+    r = client.get("/api/budgets?period=month")
+    data = r.json()
+    assert data["items"][0]["percent"] == 90.0
+    assert data["items"][0]["effective_limit"] == 50000.0
+    # Week period: limit scaled to ~7/30 = 11666, spent is full 45000
+    r = client.get("/api/budgets?period=week")
+    data = r.json()
+    assert data["items"][0]["effective_limit"] < 50000.0
+    assert data["items"][0]["percent"] > 90.0
+
+
+def test_resolve_period_yesterday():
+    from app.web.queries import resolve_period
+    from app.utils.dates import today_in_tz
+    today = today_in_tz("UTC")
+    window = resolve_period("yesterday", today)
+    assert window.start == window.end
+    assert window.days_in_period == 1
+
+
+def test_resolve_period_last_week():
+    from app.web.queries import resolve_period
+    from app.utils.dates import today_in_tz
+    today = today_in_tz("UTC")
+    window = resolve_period("last_week", today)
+    assert (window.end - window.start).days == 6
+    assert window.days_in_period == 7
+
+
+def test_resolve_period_last_year():
+    from app.web.queries import resolve_period
+    from app.utils.dates import today_in_tz
+    today = today_in_tz("UTC")
+    window = resolve_period("last_year", today)
+    assert window.start.year == today.year - 1
+    assert window.end.year == today.year - 1
+
+
 def test_dashboard_data_uses_only_allowed_user(in_memory_db):
     today = today_in_tz("UTC")
     with session_scope() as s:

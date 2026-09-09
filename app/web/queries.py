@@ -98,6 +98,37 @@ def resolve_period(
             days_in_period=(end - start).days + 1,
             is_full_period=False,
         )
+    if period == "yesterday":
+        y = today - timedelta(days=1)
+        return PeriodWindow(
+            label="Ayer",
+            start=y,
+            end=y,
+            days_elapsed=1,
+            days_in_period=1,
+            is_full_period=True,
+        )
+    if period == "last_week":
+        this_week_start = today - timedelta(days=today.weekday())
+        prev_week_start = this_week_start - timedelta(days=7)
+        prev_week_end = this_week_start - timedelta(days=1)
+        return PeriodWindow(
+            label="Semana pasada",
+            start=prev_week_start,
+            end=prev_week_end,
+            days_elapsed=7,
+            days_in_period=7,
+            is_full_period=True,
+        )
+    if period == "last_year":
+        return PeriodWindow(
+            label="Año pasado",
+            start=today.replace(year=today.year - 1, month=1, day=1),
+            end=today.replace(year=today.year - 1, month=12, day=31),
+            days_elapsed=365,
+            days_in_period=365,
+            is_full_period=True,
+        )
     if period == "custom" and custom_start and custom_end:
         days = (custom_end - custom_start).days + 1
         elapsed = max(1, min(days, (today - custom_start).days + 1))
@@ -231,16 +262,20 @@ def recent_expenses(
 def budget_status(
     session: Session,
     user_id: int,
-    today: date,
+    window: PeriodWindow,
 ) -> list[dict]:
-    """Per active budget: limit, spent this month, percent, alert level."""
+    """Per active budget: limit, spent within the window, percent, alert level.
+
+    Budgets are inherently monthly targets, so for periods other than
+    month we scale the limit proportionally to the period length.
+    """
     rows = session.execute(
         select(Budget)
         .where(Budget.telegram_user_id == user_id, Budget.is_active.is_(True))
     ).scalars().all()
     out: list[dict] = []
+    is_month_period = (window.days_in_period >= 28 and window.days_in_period <= 31)
     for b in rows:
-        month_start = today.replace(day=1)
         cat_name = b.category.name if getattr(b, "category", None) else ""
         total_row = session.execute(
             select(Expense.amount)
@@ -248,14 +283,23 @@ def budget_status(
             .where(
                 Expense.telegram_user_id == user_id,
                 Category.name == cat_name,
-                Expense.expense_date >= month_start,
-                Expense.expense_date <= today,
+                Expense.expense_date >= window.start,
+                Expense.expense_date <= window.end,
                 Expense.currency == b.currency,
             )
         ).all()
         spent = sum((Decimal(a or 0) for (a,) in total_row), Decimal("0"))
         limit_d = Decimal(b.monthly_limit)
-        percent = float((spent / limit_d * 100) if limit_d > 0 else 0)
+        # For month-ish periods, use the budget limit as-is. For shorter
+        # or longer periods, scale linearly so the bar makes sense.
+        if is_month_period:
+            effective_limit = limit_d
+        else:
+            ratio = Decimal(window.days_in_period) / Decimal("30")
+            effective_limit = (limit_d * ratio).quantize(Decimal("0.01"))
+        percent = float(
+            (spent / effective_limit * 100) if effective_limit > 0 else 0
+        )
         if percent >= 100:
             level = "exceeded"
         elif percent >= 80:
@@ -267,6 +311,7 @@ def budget_status(
                 "id": b.id,
                 "category": cat_name,
                 "limit": float(limit_d),
+                "effective_limit": float(effective_limit),
                 "spent": float(spent),
                 "currency": b.currency,
                 "percent": round(percent, 1),

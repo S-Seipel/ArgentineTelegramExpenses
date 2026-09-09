@@ -63,12 +63,21 @@ async def api_summary(
 
 @router.get("/api/trend")
 async def api_trend(
-    days: int = Query(30, ge=1, le=365),
+    period: str = Query("month"),
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
 ):
+    window = resolve_period(period, today)
+    period_to_days = {
+        "today": 1,
+        "week": 7,
+        "month": 30,
+        "last_month": 30,
+        "year": 365,
+    }
+    days = period_to_days.get(period, 30)
     with session_scope() as s:
-        return daily_trend(s, user_id, end=today, days=days)
+        return daily_trend(s, user_id, end=window.end, days=days)
 
 
 @router.get("/api/recent")
@@ -82,33 +91,52 @@ async def api_recent(
 
 @router.get("/api/budgets")
 async def api_budgets(
+    period: str = Query("month"),
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
 ):
+    window = resolve_period(period, today)
     with session_scope() as s:
-        return {"items": budget_status(s, user_id, today)}
+        return {"items": budget_status(s, user_id, window)}
 
 
 @router.get("/api/comparison")
 async def api_comparison(
+    period: str = Query("month"),
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
 ):
-    current = resolve_period("month", today)
-    previous = resolve_period("last_month", today)
+    prev_period = {
+        "today": "yesterday",
+        "week": "last_week",
+        "month": "last_month",
+        "year": "last_year",
+    }.get(period, "last_month")
+    current = resolve_period(period, today)
+    previous = resolve_period(prev_period, today)
     with session_scope() as s:
         return comparison(s, user_id, current, previous)
 
 
 @router.get("/api/projection")
 async def api_projection(
+    period: str = Query("month"),
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
 ):
-    current = resolve_period("month", today)
-    previous = resolve_period("last_month", today)
+    if period == "today":
+        return {"applies": False, "reason": "today"}
+    prev_period = {
+        "week": "last_week",
+        "month": "last_month",
+        "year": "last_year",
+    }.get(period, "last_month")
+    current = resolve_period(period, today)
+    previous = resolve_period(prev_period, today)
     with session_scope() as s:
-        return projection(s, user_id, current, previous)
+        result = projection(s, user_id, current, previous)
+    result["applies"] = True
+    return result
 
 
 @router.get("/api/recurring/upcoming")
@@ -149,7 +177,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .pill.ok { background: rgba(76, 175, 147, 0.18); color: var(--accent); }
     .pill.warn { background: rgba(245, 166, 35, 0.18); color: var(--warn); }
     .pill.bad { background: rgba(232, 93, 117, 0.18); color: var(--bad); }
-    .chart-wrap { position: relative; height: 280px; }
+    .chart-wrap { position: relative; height: 360px; }
+    .chart-wrap.tall { height: 420px; }
     .budget-bar { background: rgba(255,255,255,0.06); border-radius: 6px;
                   height: 10px; overflow: hidden; margin-top: 6px; }
     .budget-fill { height: 100%; transition: width 0.3s; }
@@ -166,7 +195,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .toolbar button.active { background: var(--accent); color: var(--bg);
                               border-color: var(--accent); font-weight: 600; }
     .row { display: grid; gap: 16px;
-           grid-template-columns: 2fr 1fr; margin-bottom: 24px; }
+            grid-template-columns: 1fr 1fr; margin-bottom: 24px; }
     @media (max-width: 800px) { .row { grid-template-columns: 1fr; } }
     .delta-up { color: var(--bad); }
     .delta-down { color: var(--accent); }
@@ -189,18 +218,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="row">
     <div class="panel">
-      <h2>Tendencia (últimos 30 días)</h2>
+      <h2 id="trend-title">Tendencia</h2>
       <div class="chart-wrap"><canvas id="trend-chart"></canvas></div>
     </div>
     <div class="panel">
-      <h2>Por categoría</h2>
-      <div class="chart-wrap"><canvas id="category-chart"></canvas></div>
+      <h2 id="category-title">Por categoría</h2>
+      <div class="chart-wrap tall"><canvas id="category-chart"></canvas></div>
     </div>
   </div>
 
   <div class="row">
     <div class="panel">
-      <h2>Presupuestos del mes</h2>
+      <h2 id="budgets-title">Presupuestos</h2>
       <div id="budgets-list"></div>
     </div>
     <div class="panel">
@@ -211,17 +240,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="row">
     <div class="panel">
-      <h2>Comparativa mes actual vs anterior</h2>
+      <h2 id="comparison-title">Comparativa</h2>
       <div id="comparison-list"></div>
     </div>
-    <div class="panel">
-      <h2>Proyección fin de mes</h2>
+    <div class="panel" id="projection-panel">
+      <h2 id="projection-title">Proyección</h2>
       <div id="projection-card"></div>
     </div>
   </div>
 
   <div class="panel">
-    <h2>Últimos 10 gastos</h2>
+    <h2 id="recent-title">Últimos gastos</h2>
     <table>
       <thead><tr><th>Fecha</th><th>Nombre</th><th>Categoría</th>
                  <th style="text-align:right">Monto</th></tr></thead>
@@ -241,20 +270,65 @@ async function getJSON(url) {
   return r.json();
 }
 
+const PERIOD_LABELS = {
+  today: 'Hoy',
+  week: 'Esta semana',
+  month: 'Este mes',
+  last_month: 'Mes pasado',
+  year: 'Este año',
+};
+
+function trendTitleFor(period) {
+  if (period === 'today') return 'Tendencia (hoy)';
+  if (period === 'week') return 'Tendencia (semana)';
+  if (period === 'month') return 'Tendencia (mes)';
+  if (period === 'last_month') return 'Tendencia (mes pasado)';
+  if (period === 'year') return 'Tendencia (año)';
+  return 'Tendencia';
+}
+
+function comparisonTitleFor(period) {
+  const cur = PERIOD_LABELS[period] || 'Período actual';
+  const prevPeriod = {
+    today: 'ayer', week: 'semana pasada', month: 'mes pasado',
+    last_month: 'mes antepasado', year: 'año pasado',
+  }[period] || 'anterior';
+  return `${cur} vs ${prevPeriod}`;
+}
+
+function projectionApplies(period) {
+  return period !== 'today';
+}
+
 async function refresh() {
+  const periodParam = '?period=' + currentPeriod;
+  const fetches = [
+    getJSON('/api/summary' + periodParam),
+    getJSON('/api/trend' + periodParam),
+    getJSON('/api/recent?limit=10'),
+    getJSON('/api/budgets' + periodParam),
+    getJSON('/api/recurring/upcoming'),
+    getJSON('/api/comparison' + periodParam),
+    getJSON('/api/projection' + periodParam),
+  ];
   const [summary, trend, recent, budgets, recurring, comparison, projection] =
-    await Promise.all([
-      getJSON('/api/summary?period=' + currentPeriod),
-      getJSON('/api/trend?days=30'),
-      getJSON('/api/recent?limit=10'),
-      getJSON('/api/budgets'),
-      getJSON('/api/recurring/upcoming'),
-      getJSON('/api/comparison'),
-      getJSON('/api/projection'),
-    ]);
+    await Promise.all(fetches);
 
   document.getElementById('subtitle').textContent =
     summary.period_label + ' · ' + summary.start + ' → ' + summary.end;
+
+  // Update section titles to reflect the active period.
+  document.getElementById('trend-title').textContent = trendTitleFor(currentPeriod);
+  document.getElementById('budgets-title').textContent =
+    'Presupuestos — ' + summary.period_label.toLowerCase();
+  document.getElementById('comparison-title').textContent =
+    comparisonTitleFor(currentPeriod);
+  document.getElementById('projection-title').textContent =
+    'Proyección — ' + summary.period_label.toLowerCase();
+  document.getElementById('recent-title').textContent =
+    'Últimos 10 gastos';
+  document.getElementById('projection-panel').style.display =
+    projectionApplies(currentPeriod) ? '' : 'none';
 
   // KPI cards
   const totals = Object.entries(summary.total_by_currency || {});
@@ -300,7 +374,15 @@ async function refresh() {
           backgroundColor: palette(cats.length),
         }],
       },
-      options: { plugins: { legend: { position: 'right', labels: { color: '#e6e6e6' } } } },
+      options: {
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: { color: '#e6e6e6', boxWidth: 12, padding: 8, font: { size: 11 } },
+          },
+        },
+      },
     });
   } else {
     document.getElementById('category-chart').replaceWith(
@@ -315,17 +397,19 @@ async function refresh() {
   if (budgets.items.length === 0) {
     bDiv.innerHTML = '<div class="subtitle">No tenés presupuestos. Creá uno con <code>/presupuesto &lt;categoría&gt; &lt;monto&gt;</code> en Telegram.</div>';
   } else {
+    const isMonth = currentPeriod === 'month';
     bDiv.innerHTML = budgets.items.map(b => {
       const color = b.level === 'exceeded' ? '#e85d75'
                    : b.level === 'warning' ? '#f5a623' : '#4caf93';
+      const limitDisp = isMonth ? b.limit : (b.effective_limit || b.limit);
       return `
         <div class="budget-row">
-          <div><strong>${b.category}</strong> · ${currency(b.limit, b.currency)}
+          <div><strong>${b.category}</strong> · ${currency(b.limit, b.currency)} mensual
             <span class="pill ${b.level === 'exceeded' ? 'bad' : b.level === 'warning' ? 'warn' : 'ok'}">
               ${b.percent.toFixed(0)}%
             </span>
           </div>
-          <div class="subtitle">${currency(b.spent, b.currency)} de ${currency(b.limit, b.currency)}</div>
+          <div class="subtitle">${currency(b.spent, b.currency)} de ${currency(limitDisp, b.currency)}${isMonth ? '' : ' (prorrateado)'}</div>
           <div class="budget-bar"><div class="budget-fill"
                style="width:${Math.min(100, b.percent)}%; background:${color}"></div></div>
         </div>`;
@@ -391,7 +475,9 @@ async function refresh() {
 
   // Projection
   const pDiv = document.getElementById('projection-card');
-  if (projection.previous_total === 0 && projection.spent === 0) {
+  if (projection.applies === false) {
+    pDiv.innerHTML = '<div class="subtitle">La proyección aplica solo a períodos en curso (semana, mes, año). Para hoy ya tenés el total cerrado.</div>';
+  } else if (projection.previous_total === 0 && projection.spent === 0) {
     pDiv.innerHTML = '<div class="subtitle">Sin datos suficientes para proyectar.</div>';
   } else {
     const dCls = projection.delta_vs_previous_pct == null ? 'delta-flat'
@@ -413,7 +499,7 @@ async function refresh() {
         <div class="big" style="color:var(--accent)">$${fmt.format(projection.projected_total)}</div>
         <div class="${dCls}" style="margin-top:8px; font-size:18px">
           ${arrow} ${sign}${projection.delta_vs_previous_pct == null ? '—' : projection.delta_vs_previous_pct.toFixed(1) + '%'}
-          vs mes pasado
+          vs período anterior
         </div>
       </div>`;
   }
