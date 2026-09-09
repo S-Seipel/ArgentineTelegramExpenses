@@ -175,7 +175,7 @@ def test_lucas_k_palos_mangos_amount_via_parser(in_memory_db):
 
 
 def test_prompt_documents_argentine_amount_slangs():
-    """The system prompt MUST enumerate the slang rules so the LLM can't miss them."""
+    """The prompt MUST enumerate the slang rules so the LLM can't miss them."""
     sys_prompt = system_prompt("2026-01-19", "America/Argentina/Buenos_Aires")
     usr_prompt = user_instructions("2026-01-19", "America/Argentina/Buenos_Aires")
     combined = sys_prompt + usr_prompt
@@ -187,6 +187,22 @@ def test_prompt_documents_argentine_amount_slangs():
 
 def test_prompt_amount_examples_consistent():
     sys_prompt = system_prompt("2026-01-19", "America/Argentina/Buenos_Aires")
-    assert "'10 lucas'" in sys_prompt and "10000" in sys_prompt
-    # Make sure the rule explicitly warns the model NOT to return 10:
-    assert "no devolver 10" in sys_prompt.lower() or "no devolver 10" in sys_prompt
+    assert "10 lucas" in sys_prompt
+    assert "10000" in sys_prompt
+    # The mapping must make clear "10 lucas" != 10 (always equals 10000).
+    assert "10000" in sys_prompt.split("10 lucas", 1)[1][:60]
+
+
+def test_prompts_stay_under_token_budget():
+    """Guardrail: if anyone bloats the prompt again, this test fails.
+
+    On CPU, each 100 tokens of system prompt ≈ 3s of extra latency.
+    Keep both prompts compact.
+    """
+    sys_prompt = system_prompt("2026-01-19", "America/Argentina/Buenos_Aires")
+    usr_prompt = user_instructions("2026-01-19", "America/Argentina/Buenos_Aires")
+    # ~4 chars/token conservative, divide by 4 to get a rough token count.
+    sys_tokens = len(sys_prompt) // 4
+    usr_tokens = len(usr_prompt) // 4
+    assert sys_tokens < 350, f"system_prompt too long: ~{sys_tokens} tokens"
+    assert usr_tokens < 250, f"user_instructions too long: ~{usr_tokens} tokens"

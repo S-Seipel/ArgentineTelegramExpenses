@@ -219,6 +219,8 @@ class OllamaAIService:
         ) from last_error
 
     async def _call_model(self, system: str, user: str) -> Any:
+        import time
+
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -227,13 +229,18 @@ class OllamaAIService:
             ],
             "stream": False,
             "format": "json",
+            "think": False,
+            "keep_alive": "30m",
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.9,
                 "repeat_penalty": 1.1,
+                "num_ctx": 2048,
+                "num_predict": 512,
             },
         }
         url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
+        start = time.perf_counter()
         try:
             response = await self._client.post(url, json=payload)
         except httpx.ConnectError as exc:
@@ -241,10 +248,15 @@ class OllamaAIService:
                 f"Ollama is unreachable at {self.cfg.base_url}: {exc}"
             ) from exc
         except httpx.TimeoutException as exc:
+            logger.warning(
+                "Ollama timeout after %.1fs", time.perf_counter() - start
+            )
             raise AIUnavailable("Ollama request timed out") from exc
+        elapsed = time.perf_counter() - start
         if response.status_code != 200:
             raise AIError(
-                f"Ollama returned HTTP {response.status_code}: {response.text[:200]}"
+                f"Ollama returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
             )
 
         data = response.json()
@@ -256,6 +268,12 @@ class OllamaAIService:
             raise AIError("Ollama response did not contain content")
 
         text = str(content).strip()
+        logger.info(
+            "Ollama chat ok: %.2fs (prompt=%d, eval_count=%s)",
+            elapsed,
+            len(system) + len(user),
+            data.get("eval_count"),
+        )
         return _extract_json(text)
 
 

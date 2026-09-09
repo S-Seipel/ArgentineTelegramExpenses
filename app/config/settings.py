@@ -28,8 +28,8 @@ class Settings(BaseSettings):
         default="http://host.docker.internal:11434", alias="OLLAMA_BASE_URL"
     )
     ollama_model: str = Field(default="qwen3:4b", alias="OLLAMA_MODEL")
-    ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
-    ollama_max_retries: int = Field(default=2, alias="OLLAMA_MAX_RETRIES")
+    ollama_timeout: float = Field(default=90.0, alias="OLLAMA_TIMEOUT")
+    ollama_max_retries: int = Field(default=1, alias="OLLAMA_MAX_RETRIES")
     whisper_model_size: str = Field(default="base", alias="WHISPER_MODEL_SIZE")
     whisper_device: str = Field(default="cpu", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(
