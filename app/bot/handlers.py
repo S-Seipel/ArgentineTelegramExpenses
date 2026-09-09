@@ -907,10 +907,22 @@ def _handle_fixed_expense_command(
         except ValueError:
             return "❓ El ID tiene que ser un número entero."
         if command == "/gastofijo_del":
-            service.repo.delete_payment_by_fixed_id = None  # noqa
             obj = service.repo.get_by_id(user_id, fid)
             if obj is None:
                 return f"🤷 No encontré el gasto fijo #{fid}."
+            # Cascade-clean: delete all linked payments + their expenses.
+            payments = service.repo.payments_for_fixed(fid)
+            for p in payments:
+                if p.expense_id:
+                    from app.fixed_expenses.service import _delete_expense
+                    _delete_expense(service.repo.session, p.expense_id)
+            # Then delete all payments and the template itself.
+            from app.fixed_expenses.models import FixedExpensePayment
+            (
+                service.repo.session.query(FixedExpensePayment)
+                .filter(FixedExpensePayment.fixed_expense_id == fid)
+                .delete()
+            )
             service.repo.session.delete(obj)
             service.repo.session.commit()
             action = "eliminado"

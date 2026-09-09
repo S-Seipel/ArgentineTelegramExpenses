@@ -130,10 +130,44 @@ class FixedExpenseService:
         month_year: str,
         actual_amount: Decimal | None = None,
         note: str | None = None,
+        paid_on: "date | None" = None,
     ) -> tuple[FixedExpense | None, FixedExpensePayment | None]:
+        """Mark a fixed expense as paid for the given month.
+
+        Also creates or updates a real ``expenses`` row so the
+        dashboard's totals (which read from ``expenses``) stay in sync
+        with the user's checkmarks.
+        """
+        from datetime import date as _date
         obj = self.repo.get_by_id(user_id, fixed_id)
         if obj is None:
             return None, None
+
+        amount = actual_amount if actual_amount is not None else obj.expected_amount
+        paid_on_date = paid_on or _date.today()
+
+        # Look up existing payment for this (fixed, month) pair.
+        existing_payment = self.repo.get_payment(fixed_id, month_year)
+        existing_expense_id = (
+            existing_payment.expense_id if existing_payment else None
+        )
+
+        # Create or update the real expense row.
+        expense_id = _upsert_expense_for_payment(
+            session=self.repo.session,
+            user_id=user_id,
+            amount=amount,
+            currency=obj.currency,
+            name=obj.name,
+            category_id=obj.category_id,
+            paid_on=paid_on_date,
+            existing_expense_id=existing_expense_id,
+            original_message=(
+                f"[gastofijo #{obj.id}] {obj.name} "
+                f"({obj.payment_method or 's/método'})"
+            ),
+        )
+
         payment = self.repo.upsert_payment(
             fixed_id,
             month_year,
@@ -141,6 +175,7 @@ class FixedExpenseService:
             actual_amount=actual_amount,
             note=note,
             skipped=False,
+            expense_id=expense_id,
         )
         return obj, payment
 
@@ -150,9 +185,15 @@ class FixedExpenseService:
         fixed_id: int,
         month_year: str,
     ) -> tuple[FixedExpense | None, FixedExpensePayment | None]:
+        """Mark as skipped: no payment, no expense. Pure status flag."""
         obj = self.repo.get_by_id(user_id, fixed_id)
         if obj is None:
             return None, None
+        # Remove a previously-linked expense if any (so the dashboard
+        # doesn't count a skipped bill).
+        existing = self.repo.get_payment(fixed_id, month_year)
+        if existing and existing.expense_id:
+            _delete_expense(self.repo.session, existing.expense_id)
         payment = self.repo.upsert_payment(
             fixed_id,
             month_year,
@@ -160,6 +201,7 @@ class FixedExpenseService:
             actual_amount=None,
             note=None,
             skipped=True,
+            expense_id=None,
         )
         return obj, payment
 
@@ -169,9 +211,13 @@ class FixedExpenseService:
         fixed_id: int,
         month_year: str,
     ) -> bool:
+        """Undo a previous mark. Also removes the linked expense."""
         obj = self.repo.get_by_id(user_id, fixed_id)
         if obj is None:
             return False
+        existing = self.repo.get_payment(fixed_id, month_year)
+        if existing and existing.expense_id:
+            _delete_expense(self.repo.session, existing.expense_id)
         return self.repo.delete_payment(fixed_id, month_year)
 
     def find_by_name(
@@ -263,3 +309,91 @@ class FixedExpenseService:
 def datetime_now():
     from datetime import datetime
     return datetime.utcnow()
+
+
+# ---------------------------------------------------------------------------
+# Helpers: keep the real ``expenses`` table in sync with fixed payments.
+# ---------------------------------------------------------------------------
+
+def _upsert_expense_for_payment(
+    *,
+    session,
+    user_id: int,
+    amount: Decimal,
+    currency: str,
+    name: str,
+    category_id: int | None,
+    paid_on: "date",
+    existing_expense_id: int | None,
+    original_message: str,
+) -> int:
+    """Create or update the real ``expenses`` row for a fixed payment.
+
+    Returns the ``expenses.id`` of the row.
+    """
+    from datetime import datetime as _dt
+    from app.expenses.models import Expense
+    from app.expenses.service import ExpenseService
+    from app.expenses.repository import ExpenseRepository
+
+    if existing_expense_id is not None:
+        existing = (
+            session.query(Expense)
+            .filter(Expense.id == existing_expense_id)
+            .one_or_none()
+        )
+        if existing is not None:
+            existing.amount = amount
+            existing.currency = currency
+            existing.expense_date = paid_on
+            if category_id is not None:
+                existing.category_id = category_id
+            session.commit()
+            session.refresh(existing)
+            return existing.id
+
+    # Create new.
+    expense_repo = ExpenseRepository(session)
+    expense_service = ExpenseService(expense_repo)
+    from app.expenses.service import ExpenseDraft
+    draft = ExpenseDraft(
+        name=name[:255],
+        amount=amount,
+        currency=currency,
+        category=_resolve_category_name(session, category_id),
+        expense_date=paid_on,
+        confidence=Decimal("1"),
+    )
+    outcome = expense_service.register_many(
+        user_id=user_id,
+        drafts=[draft],
+        original_message=original_message,
+    )
+    if outcome.saved:
+        return outcome.saved[0].id
+    raise RuntimeError("Failed to create linked expense for fixed payment")
+
+
+def _delete_expense(session, expense_id: int) -> None:
+    from app.expenses.models import Expense
+
+    row = (
+        session.query(Expense).filter(Expense.id == expense_id).one_or_none()
+    )
+    if row is None:
+        return
+    session.delete(row)
+    session.commit()
+
+
+def _resolve_category_name(session, category_id: int | None) -> str:
+    """Reverse-resolve a category_id back to a name for ExpenseDraft."""
+    if category_id is None:
+        return "Otros"
+    from app.categories.models import Category
+    row = (
+        session.query(Category).filter(Category.id == category_id).one_or_none()
+    )
+    if row is None:
+        return "Otros"
+    return row.name or "Otros"

@@ -104,6 +104,7 @@ class FixedExpenseRepository:
         actual_amount: Decimal | None = None,
         note: str | None = None,
         skipped: bool = False,
+        expense_id: int | None = None,
     ) -> FixedExpensePayment:
         existing = self.get_payment(fixed_expense_id, month_year)
         if existing is not None:
@@ -114,6 +115,8 @@ class FixedExpenseRepository:
             if note is not None:
                 existing.note = note[:500]
             existing.skipped = skipped
+            if expense_id is not None:
+                existing.expense_id = expense_id
             self.session.commit()
             self.session.refresh(existing)
             return existing
@@ -124,6 +127,7 @@ class FixedExpenseRepository:
             actual_amount=actual_amount,
             note=note[:500] if note else None,
             skipped=skipped,
+            expense_id=expense_id,
         )
         self.session.add(obj)
         self.session.commit()
@@ -150,6 +154,14 @@ class FixedExpenseRepository:
                 FixedExpense.telegram_user_id == user_id,
                 FixedExpensePayment.month_year == month_year,
             )
+        )
+        return list(self.session.execute(stmt).scalars().all())
+
+    def payments_for_fixed(
+        self, fixed_expense_id: int
+    ) -> list[FixedExpensePayment]:
+        stmt = select(FixedExpensePayment).where(
+            FixedExpensePayment.fixed_expense_id == fixed_expense_id
         )
         return list(self.session.execute(stmt).scalars().all())
 

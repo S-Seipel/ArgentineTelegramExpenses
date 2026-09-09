@@ -117,6 +117,11 @@ class FixedExpensePayment(Base):
     skipped: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    expense_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("expenses.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
