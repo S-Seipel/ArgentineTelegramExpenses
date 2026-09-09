@@ -27,7 +27,7 @@ fancys.
 **Value:** unique feature, lets you snap a paper ticket instead of typing.
 **Effort:** ~4-6h (plus model downloads).
 
-- Use `qwen2-vl:7b` or `llama3.2-vision` via Ollama multimodal endpoint.
+- Use `llava:7b` (default) or `llama3.2-vision` via Ollama multimodal endpoint.
 - New `MessageHandler(filters.PHOTO, _photo_handler)`.
 - Download photo, base64, send to `/api/chat` with `images=[...]`.
 - Prompt: extract merchant, items, total, date as JSON.

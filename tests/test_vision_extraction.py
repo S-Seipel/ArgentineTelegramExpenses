@@ -35,7 +35,7 @@ def _service(responder) -> OllamaAIService:
         timeout=10,
         max_retries=0,
         timezone="UTC",
-        vision_model="qwen2-vl:7b",
+        vision_model="llava:7b",
     )
     transport = _MockTransport(responder)
     client = httpx.AsyncClient(transport=transport, timeout=cfg.http_timeout())
@@ -72,7 +72,7 @@ async def test_describe_image_returns_dict():
     assert out["name"] == "Starbucks"
     assert out["amount"] == 4500
     assert out["confidence"] == 0.85
-    assert captured["body"]["model"] == "qwen2-vl:7b"
+    assert captured["body"]["model"] == "llava:7b"
     assert captured["body"]["format"] == "json"
     assert captured["body"]["think"] is False
     assert len(captured["body"]["messages"][0]["images"]) == 1
@@ -108,7 +108,7 @@ async def test_describe_image_empty_raises():
 async def test_describe_image_404_suggests_pull():
     def responder(request: httpx.Request):
         return _json_response(
-            {"error": "model 'qwen2-vl:7b' not found"}, status=404
+            {"error": "model 'llava:7b' not found"}, status=404
         )
 
     svc = _service(responder)

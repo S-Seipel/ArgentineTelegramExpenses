@@ -43,7 +43,7 @@ class AIServiceConfig:
     whisper_model_size: str = "base"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    vision_model: str = "qwen2-vl:7b"
+    vision_model: str = "llava:7b"
     vision_min_confidence: float = 0.5
 
     def http_timeout(self) -> httpx.Timeout:

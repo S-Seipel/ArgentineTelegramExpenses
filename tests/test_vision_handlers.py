@@ -22,7 +22,7 @@ def _settings() -> Settings:
         ollama_model="test",
         timezone="UTC",
         max_message_length=2000,
-        vision_model="qwen2-vl:7b",
+        vision_model="llava:7b",
         vision_min_confidence=0.5,
     )
 

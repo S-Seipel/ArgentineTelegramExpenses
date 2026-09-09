@@ -226,6 +226,33 @@ WHISPER_COMPUTE_TYPE=int8     # int8|float16|float32
 
 Acepta voice notes de Telegram (`.ogg` Opus) y archivos de audio genéricos adjuntos (`.mp3`, etc).
 
+### Tickets (visión)
+
+Mandá una foto de un ticket y el bot extrae los datos con `llava:7b` corriendo local en Ollama. Te muestra un preview y siempre te pide confirmación antes de registrar.
+
+```
+📸 Foto del ticket
+   ↓
+🏪 Café Starbucks Palermo
+💰 $ 4.500 ARS
+📂 Café
+Confianza: 85%
+
+[✅ Registrar]  [✏️ Corregir]
+[❌ Descartar]
+```
+
+**Setup:**
+```bash
+ollama pull llava:7b   # ~4.7GB, ~10-20s por foto
+```
+
+Alternativas más pesadas si necesitás más precisión (requieren más RAM/disco):
+- `llama3.2-vision:11b` — mejor calidad (~7GB)
+- `llama3.2-vision:90b` — el más preciso (~50GB, requiere GPU)
+
+Cambiá con `VISION_MODEL` en `.env`.
+
 ### Gastos recurrentes
 
 Podés crear un gasto recurrente por comando o por lenguaje natural:
