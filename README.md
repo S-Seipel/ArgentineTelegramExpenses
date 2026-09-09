@@ -1,5 +1,8 @@
 # Telegram Expenses
 
+[![CI](https://github.com/S-Seipel/ArgentineTelegramExpenses/actions/workflows/ci.yml/badge.svg)](https://github.com/S-Seipel/ArgentineTelegramExpenses/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Bot personal de Telegram para registrar y consultar gastos en lenguaje natural, usando un LLM local (Ollama) y PostgreSQL.
 
 ```
