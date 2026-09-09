@@ -673,10 +673,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .fx-actions {
       display: flex;
-      gap: 10px;
+      gap: 12px;
       flex-wrap: wrap;
       align-items: center;
-      margin-top: 8px;
+      margin-top: 10px;
+    }
+    .fx-actions > * + * { margin-left: 0; }  /* gap handles this */
+    .fx-actions > input[type="number"] {
+      min-width: 130px;
+      flex: 0 0 auto;
     }
     .fx-skip-btn {
       background: rgba(255, 255, 255, 0.03);
@@ -792,7 +797,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div id="fixed-actions" style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap">
+      <div id="fixed-actions" style="margin-top:18px; padding-top:16px; border-top:1px solid rgba(255,255,255,0.05); display:flex; gap:8px; flex-wrap:wrap">
         <button id="fx-add-btn" class="fx-btn fx-btn-primary">+ Agregar gasto fijo</button>
         <div class="subtitle" style="margin-left:auto; align-self:center">
           ¿No tenés gastos fijos? Empezá agregando arriba.
