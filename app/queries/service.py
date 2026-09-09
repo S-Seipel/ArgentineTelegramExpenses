@@ -9,7 +9,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config.settings import get_settings
 from app.expenses.repository import ExpenseRepository
-from app.queries.intents import ExpenseRow, QueryResult, QuerySpec
+from app.queries.intents import (
+    CategoryDiff,
+    ComparisonRow,
+    ExpenseRow,
+    QueryResult,
+    QuerySpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +109,17 @@ class QueryService:
                 filters=filters,
             )
 
+        if spec.kind == "comparison":
+            comparison = self._build_comparison(user_id, spec)
+            return QueryResult(
+                total_by_currency={},
+                items=None,
+                largest=None,
+                comparison=comparison,
+                period_label=period_label,
+                filters=filters,
+            )
+
         total_by_currency = self._compute_total(user_id, spec, period)
         return QueryResult(
             total_by_currency=total_by_currency,
@@ -110,6 +127,115 @@ class QueryService:
             largest=None,
             period_label=period_label,
             filters=filters,
+        )
+
+    def _build_comparison(
+        self, user_id: int, spec: QuerySpec
+    ) -> ComparisonRow:
+        current = self._resolve_period(spec)
+        prev_label_for = {
+            "month": "Mes pasado",
+            "week": "Semana pasada",
+            "today": "Ayer",
+            "yesterday": "Anteayer",
+            "all": "Histórico previo",
+        }
+        previous = self._previous_period(spec, current)
+
+        def _by_cat(p: _Range) -> dict[str, Decimal]:
+            return self.repo.sum_by_category(
+                user_id,
+                start=p.start,
+                end=p.end,
+                currency=spec.currency,
+            )
+
+        cur_cats = _by_cat(current)
+        prev_cats = _by_cat(previous)
+        cur_total = sum(cur_cats.values(), Decimal("0"))
+        prev_total = sum(prev_cats.values(), Decimal("0"))
+
+        total_diff_pct: float | None
+        if prev_total > 0:
+            total_diff_pct = float(
+                (cur_total - prev_total) / prev_total * 100
+            )
+        else:
+            total_diff_pct = None
+
+        rows: list[CategoryDiff] = []
+        all_cats = set(cur_cats) | set(prev_cats)
+        for cat in sorted(
+            all_cats, key=lambda c: -cur_cats.get(c, Decimal("0"))
+        ):
+            c_amt = cur_cats.get(cat, Decimal("0"))
+            p_amt = prev_cats.get(cat, Decimal("0"))
+            d_pct: float | None
+            if p_amt > 0:
+                d_pct = float((c_amt - p_amt) / p_amt * 100)
+            else:
+                d_pct = None
+            rows.append(
+                CategoryDiff(
+                    category=cat,
+                    current=c_amt,
+                    previous=p_amt,
+                    diff_pct=d_pct,
+                )
+            )
+        return ComparisonRow(
+            current_label=current.label or spec.label or "Período actual",
+            previous_label=prev_label_for.get(
+                spec.period or "month", "Período anterior"
+            ),
+            current_total=cur_total,
+            previous_total=prev_total,
+            total_diff_pct=total_diff_pct,
+            by_category=rows,
+        )
+
+    def _previous_period(
+        self, spec: QuerySpec, current: _Range
+    ) -> _Range:
+        today = self.today()
+        if spec.period == "month" and current.start is not None:
+            if current.start.month == 1:
+                prev_year = current.start.year - 1
+                prev_month = 12
+            else:
+                prev_year = current.start.year
+                prev_month = current.start.month - 1
+            from calendar import monthrange
+
+            _, last = monthrange(prev_year, prev_month)
+            return _Range(
+                start=date(prev_year, prev_month, 1),
+                end=date(prev_year, prev_month, last),
+                label="Mes pasado",
+            )
+        if spec.period == "today" and current.start is not None:
+            y = current.start - timedelta(days=1)
+            return _Range(start=y, end=y, label="Ayer")
+        if spec.period == "week" and current.start is not None:
+            return _Range(
+                start=current.start - timedelta(days=7),
+                end=current.end - timedelta(days=7),
+                label="Semana pasada",
+            )
+        # Default: same length immediately preceding
+        if current.start is not None and current.end is not None:
+            length = (current.end - current.start).days
+            prev_end = current.start - timedelta(days=1)
+            prev_start = prev_end - timedelta(days=length)
+            return _Range(
+                start=prev_start, end=prev_end, label="Período anterior"
+            )
+        return _Range(
+            start=date(today.year, 1, 1) if today.month > 1 else None,
+            end=today.replace(year=today.year - 1, month=12, day=31)
+            if today.month == 1
+            else today.replace(month=today.month - 1, day=1),
+            label="Período anterior",
         )
 
     def _compute_total(

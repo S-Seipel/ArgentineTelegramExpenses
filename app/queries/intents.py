@@ -12,7 +12,8 @@ SortOrder = Literal["amount_desc", "amount_asc", "date_desc", "date_asc"]
 @dataclass
 class QuerySpec:
     kind: Literal[
-        "total", "category_total", "category_breakdown", "list", "largest"
+        "total", "category_total", "category_breakdown",
+        "list", "largest", "comparison",
     ]
     period: Period | None = None
     days: int | None = None
@@ -29,8 +30,27 @@ class QueryResult:
     items: list["ExpenseRow"] | None = None
     largest: "ExpenseRow | None" = None
     category_totals: dict[str, "Decimal"] | None = None
+    comparison: "ComparisonRow | None" = None
     period_label: str = ""
     filters: str = ""
+
+
+@dataclass
+class CategoryDiff:
+    category: str
+    current: Decimal
+    previous: Decimal
+    diff_pct: float | None  # None when previous was 0
+
+
+@dataclass
+class ComparisonRow:
+    current_label: str
+    previous_label: str
+    current_total: Decimal
+    previous_total: Decimal
+    total_diff_pct: float | None
+    by_category: list[CategoryDiff]
 
 
 @dataclass
@@ -125,6 +145,28 @@ def make_category_breakdown_spec(
         )
     return QuerySpec(
         kind="category_breakdown",
+        period=period if period != "all" else None,
+        label=label,
+    )
+
+
+def make_comparison_spec(
+    *, period: Period | None = "month", label: str | None = None
+) -> QuerySpec:
+    """Build a QuerySpec that compares the given period against the previous one."""
+    label_for: dict[str, str] = {
+        "today": "Hoy",
+        "yesterday": "Ayer",
+        "week": "Esta semana",
+        "month": "Este mes",
+        "all": "Histórico",
+    }
+    if label is None:
+        label = (
+            f"Comparativa {label_for.get(period or '', 'Histórico').lower()}"
+        )
+    return QuerySpec(
+        kind="comparison",
         period=period if period != "all" else None,
         label=label,
     )

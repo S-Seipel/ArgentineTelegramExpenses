@@ -37,6 +37,8 @@ def system_prompt(today_iso: str, timezone_name: str) -> str:
         "type='register_recurring' y completá 'recurring'.\n"
         "- Borrar/editar/eliminar NO son intents: el bot los maneja por "
         "comando.\n"
+        "- Si pide comparar ('vs mes pasado', 'comparado con el mes anterior', "
+        "'cuánto más que el mes pasado'), devolvé query con period='month'.\n"
         "- NUNCA generes SQL. NUNCA inventes montos."
     )
 

@@ -152,6 +152,18 @@ async def _process_message_async(
             confirmation = f"{confirmation}\n\n{budget_warning}"
         return confirmation
 
+    if intent_type == "query" and _user_wants_comparison(cleaned):
+        from app.queries.intents import make_comparison_spec
+        spec = make_comparison_spec(period="month")
+        try:
+            with session_scope() as session:
+                qservice = QueryService(ExpenseRepository(session))
+                result = qservice.run(user_id=user_id, spec=spec)
+        except Exception:
+            logger.exception("DB error while running comparison")
+            return "⚠️ No pude correr la comparación porque la base de datos no responde. Probá más tarde."
+        return _format_query(result)
+
     if intent_type == "register_recurring":
         if parsed.recurring is None:
             return "🤔 No pude identificar el gasto recurrente. Intentá reformularlo."
@@ -331,6 +343,30 @@ def _clarification_message(extracted) -> str:
     return f"🤔 {bullets}"
 
 
+_COMPARISON_PATTERNS = (
+    "vs mes pasado",
+    "vs el mes pasado",
+    "vs mes anterior",
+    "vs el mes anterior",
+    "comparado",
+    "compará",
+    "comparacion",
+    "comparación",
+    "mas que el mes pasado",
+    "más que el mes pasado",
+    "menos que el mes pasado",
+    "más que el mes anterior",
+    "diferencia con el mes",
+)
+
+
+def _user_wants_comparison(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(p in lowered for p in _COMPARISON_PATTERNS)
+
+
 def _check_budget_alerts(
     *, user_id: int, outcome, today
 ) -> str | None:
@@ -432,6 +468,50 @@ def _expense_confirmation(saved) -> str:
     return "\n".join(lines)
 
 
+def _format_comparison(comparison) -> str:
+    cur = comparison.current_total
+    prev = comparison.previous_total
+    pct = comparison.total_diff_pct
+    if prev > 0 and pct is not None:
+        arrow = "↑" if pct > 0 else ("↓" if pct < 0 else "·")
+        sign = "+" if pct > 0 else ""
+        total_line = (
+            f"{arrow} {sign}{pct:.1f}% vs {comparison.previous_label.lower()}\n"
+            f"({format_amount(cur)} ahora vs {format_amount(prev)} antes)"
+        )
+    elif prev == 0 and cur > 0:
+        total_line = (
+            f"🆕 Gastaste {format_amount(cur)} este período "
+            f"(sin gastos {comparison.previous_label.lower()})"
+        )
+    else:
+        total_line = "Sin variación"
+
+    lines = [
+        f"📊 *{comparison.current_label} vs {comparison.previous_label}*",
+        "",
+        total_line,
+        "",
+    ]
+    if comparison.by_category:
+        rows = comparison.by_category[:8]
+        lines.append("Por categoría:")
+        for r in rows:
+            if r.diff_pct is None:
+                delta_text = "nuevo"
+            else:
+                arrow = "↑" if r.diff_pct > 0 else (
+                    "↓" if r.diff_pct < 0 else "·"
+                )
+                sign = "+" if r.diff_pct > 0 else ""
+                delta_text = f"{arrow} {sign}{r.diff_pct:.1f}%"
+            lines.append(
+                f"  *{r.category}*: {format_amount(r.current)} "
+                f"(antes {format_amount(r.previous)}) · {delta_text}"
+            )
+    return "\n".join(lines)
+
+
 def _format_query(result: QueryResult) -> str:
     if result.items is not None:
         if not result.items:
@@ -472,6 +552,9 @@ def _format_query(result: QueryResult) -> str:
             icon = icon_for(cat) or CATEGORY_ICONS.get(cat, "🧾")
             lines.append(f"{icon} *{cat}*: {format_amount(amount)}")
         return "\n".join(lines)
+
+    if result.comparison is not None:
+        return _format_comparison(result.comparison)
 
     if not result.total_by_currency:
         suffix = (
