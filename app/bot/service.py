@@ -307,6 +307,7 @@ def _help_text() -> str:
         "/hoy /semana /mes — totales rápidos\n"
         "/gastos — últimos 10 gastos\n"
         "/desglose — desglose por categoría del mes\n"
+        "/buscar <texto> — buscar gastos por nombre\n"
         "/borrar_ultimo /borrar <id> — borrar gasto\n"
         "/editar_ultimo <monto> — corregir último gasto\n"
         "/exportar — CSV del mes\n"

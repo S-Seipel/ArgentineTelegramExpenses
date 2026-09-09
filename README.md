@@ -194,6 +194,7 @@ Acepta jerga argentina: `10k`, `10 lucas`, `10 mil`, `$10.000`, `10,000`, `20 d�
 - `/recurrentes` — lista los recurrentes activos
 - `/recurrente_off <id>` / `/recurrente_on <id>` — pausa / reanuda
 - `/recurrente_del <id>` — elimina un recurrente
+- `/buscar <texto>` — busca gastos por nombre (ej: `/buscar starbucks`)
 - `/presupuesto <categoría> <monto> [moneda]` — límite mensual por categoría (avisa al 80% y al 100%)
 - `/presupuestos` — lista presupuestos activos
 - `/presupuesto_del <id>` / `/presupuesto_off <id>` / `/presupuesto_on <id>` — gestión

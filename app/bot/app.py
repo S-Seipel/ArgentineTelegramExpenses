@@ -100,6 +100,9 @@ def build_application(
         )
     )
     application.add_handler(
+        CommandHandler(["buscar"], _command_handler)
+    )
+    application.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO, _voice_handler
         )

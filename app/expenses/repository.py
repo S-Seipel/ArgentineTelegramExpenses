@@ -65,6 +65,33 @@ class ExpenseRepository:
         rows = self.session.execute(stmt).scalars().all()
         return [self._to_summary(r) for r in rows]
 
+    def search_by_name(
+        self,
+        user_id: int,
+        query: str,
+        limit: int = 20,
+    ) -> list[ExpenseSummary]:
+        """Return expenses whose name matches ``query`` (case-insensitive).
+
+        Uses ILIKE for Postgres and LIKE for SQLite. The query is
+        surrounded by wildcards so 'star' matches 'Starbucks'.
+        """
+        if not query or not query.strip():
+            return []
+        pattern = f"%{query.strip()}%"
+        stmt: Select = (
+            select(Expense)
+            .options(joinedload(Expense.category))
+            .where(
+                Expense.telegram_user_id == user_id,
+                Expense.name.ilike(pattern),
+            )
+            .order_by(Expense.expense_date.desc(), Expense.id.desc())
+            .limit(limit)
+        )
+        rows = self.session.execute(stmt).scalars().all()
+        return [self._to_summary(r) for r in rows]
+
     def list_in_range(
         self,
         user_id: int,

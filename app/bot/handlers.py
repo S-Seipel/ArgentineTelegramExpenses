@@ -121,6 +121,22 @@ async def handle_command(
         await update.effective_message.reply_text(reply)
         return
 
+    if command == "/buscar":
+        if not args:
+            await update.effective_message.reply_text(
+                "❓ Decime qué buscar. Ej: `/buscar starbucks`"
+            )
+            return
+        query = " ".join(args).strip()
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        with session_scope() as session:
+            repo = ExpenseRepository(session)
+            results = repo.search_by_name(user_id, query, limit=20)
+        await update.effective_message.reply_text(
+            _format_search_results(query, results)
+        )
+        return
+
     if command in ("/start", "/help", "/ayuda"):
         await update.effective_message.reply_text(_help_text())
         return
@@ -344,6 +360,21 @@ def _format_expense_brief(exp) -> str:
         f"*{exp.name}* — {format_currency_amount(exp.amount, exp.currency)} "
         f"({format_date_short(exp.expense_date)})"
     )
+
+
+def _format_search_results(query: str, results) -> str:
+    if not results:
+        return f"🔍 No encontré gastos con *{query}*."
+    lines = [f"🔍 Resultados para *{query}* ({len(results)}):", ""]
+    for r in results:
+        lines.append(
+            f"`#{r.id}` {r.name} — "
+            f"{format_currency_amount(r.amount, r.currency)}\n"
+            f"      📂 {r.category_name} · 📅 {format_date_short(r.expense_date)}"
+        )
+    lines.append("")
+    lines.append("Usá `/borrar <id>` o `/editar <id> <monto>` para modificar.")
+    return "\n".join(lines)
 
 
 async def _handle_delete_command(
