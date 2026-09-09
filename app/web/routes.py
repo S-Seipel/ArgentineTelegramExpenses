@@ -92,6 +92,40 @@ async def api_recent(
         return {"items": recent_expenses(s, user_id, limit)}
 
 
+@router.get("/api/expenses")
+async def api_expenses(
+    period: str = Query("month"),
+    custom_start: Optional[date] = None,
+    custom_end: Optional[date] = None,
+    limit: int = Query(500, ge=1, le=2000),
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Return ALL expenses for the period (default: current month).
+
+    Used by the dashboard's 'Todos los gastos del mes' panel.
+    """
+    window = resolve_period(
+        period, today, custom_start=custom_start, custom_end=custom_end
+    )
+    with session_scope() as s:
+        items = recent_expenses(
+            s,
+            user_id,
+            limit,
+            start=window.start,
+            end=window.end,
+        )
+    return {
+        "period_label": window.label,
+        "start": window.start.isoformat(),
+        "end": window.end.isoformat(),
+        "count": len(items),
+        "total": sum(i["amount"] for i in items),
+        "items": items,
+    }
+
+
 @router.get("/api/budgets")
 async def api_budgets(
     period: str = Query("month"),
@@ -778,7 +812,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="panel">
-      <h2 id="recent-title">Últimos gastos</h2>
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:14px; flex-wrap:wrap; gap:10px">
+        <div>
+          <h2 id="all-title" style="margin-bottom:2px">Todos los gastos</h2>
+          <div class="subtitle" id="all-subtitle">Cargando…</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          <div style="text-align:right">
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Total listado</div>
+            <div class="big" id="all-total" style="font-size:22px">—</div>
+          </div>
+          <select id="all-sort" class="fx-input" style="width:auto; padding:6px 8px; font-size:12px">
+            <option value="date_desc">Más recientes</option>
+            <option value="date_asc">Más antiguos</option>
+            <option value="amount_desc">Mayor monto</option>
+            <option value="amount_asc">Menor monto</option>
+          </select>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th style="cursor:pointer" onclick="allSort('date')">Fecha</th>
+            <th>Nombre</th>
+            <th>Categoría</th>
+            <th style="cursor:pointer; text-align:right" onclick="allSort('amount')">Monto</th>
+          </tr></thead>
+          <tbody id="all-tbody"></tbody>
+        </table>
+      </div>
+      <div id="all-footer" class="subtitle" style="margin-top:10px; text-align:right; display:none"></div>
+    </div>
+
+    <div class="panel" style="margin-top:18px">
+      <h2 id="recent-title">Últimos 10 gastos</h2>
       <table>
         <thead><tr><th>Fecha</th><th>Nombre</th><th>Categoría</th>
                    <th style="text-align:right">Monto</th></tr></thead>
@@ -862,9 +929,9 @@ async function refresh() {
   subtitle.classList.add('refreshing');
 
   const periodParam = '?period=' + currentPeriod;
-  let summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum;
+  let summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all;
   try {
-    [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum] =
+    [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all] =
       await Promise.all([
         getJSON('/api/summary' + periodParam),
         getJSON('/api/trend' + periodParam),
@@ -875,6 +942,7 @@ async function refresh() {
         getJSON('/api/projection' + periodParam),
         getJSON('/api/fixed-expenses'),
         getJSON('/api/month-summary'),
+        getJSON('/api/expenses' + periodParam),
       ]);
   } catch (err) {
     subtitle.classList.remove('refreshing');
@@ -1119,7 +1187,7 @@ async function refresh() {
       </div>`;
   }
 
-  // Recent expenses table
+  // Recent expenses table (last 10)
   document.getElementById('recent-tbody').innerHTML = recent.items.map(e => `
     <tr>
       <td>${e.date}</td>
@@ -1130,6 +1198,9 @@ async function refresh() {
 
   // Fixed expenses section
   renderFixedExpenses(fixed, monthSum);
+
+  // All-expenses panel
+  renderAllExpenses(all);
 }
 
 function renderFixedExpenses(fixed, monthSum) {
@@ -1214,6 +1285,9 @@ function renderFixedExpenses(fixed, monthSum) {
                     style="${pillBg}">
                 ${statusLabel[b.status] || b.status}
               </span>
+              ${b.status === 'paid_exact' || b.status === 'paid_more' || b.status === 'paid_less'
+                ? '<span class="pill" style="background:rgba(96,165,250,0.18); color:#60a5fa; margin-left:6px">📊 en totales</span>'
+                : ''}
             </div>
             <div class="subtitle">$${fmt.format(b.expected_amount)} ${b.currency} · ${method} · día ${b.due_day_of_month}${actualStr}</div>
             ${actionsHTML}
@@ -1221,6 +1295,52 @@ function renderFixedExpenses(fixed, monthSum) {
         </div>
       </div>`;
   }).join('');
+}
+
+function allSort(column) {
+  const sel = document.getElementById('all-sort');
+  if (sel.value.startsWith(column)) {
+    // Toggle direction if same column.
+    sel.value = sel.value.endsWith('_asc')
+      ? column + '_desc'
+      : column + '_asc';
+  } else {
+    sel.value = column + '_desc';
+  }
+  renderAllExpenses(currentAllData);
+}
+
+let currentAllData = null;
+
+function renderAllExpenses(data) {
+  currentAllData = data;
+  const items = data.items || [];
+  const sortKey = document.getElementById('all-sort').value;
+  const sorted = [...items].sort((a, b) => {
+    if (sortKey === 'date_desc') return b.date.localeCompare(a.date) || b.id - a.id;
+    if (sortKey === 'date_asc')  return a.date.localeCompare(b.date) || a.id - b.id;
+    if (sortKey === 'amount_desc') return b.amount - a.amount;
+    if (sortKey === 'amount_asc')  return a.amount - b.amount;
+    return 0;
+  });
+  document.getElementById('all-subtitle').textContent =
+    `${data.count} gastos · ${data.start} → ${data.end}`;
+  const totalEl = document.getElementById('all-total');
+  totalEl.textContent = '$' + fmt.format(data.total || 0);
+  document.getElementById('all-tbody').innerHTML = sorted.map(e => `
+    <tr>
+      <td>${e.date}</td>
+      <td>${escapeHTML(e.name)}</td>
+      <td>${escapeHTML(e.category)}</td>
+      <td class="amount">$${fmt.format(e.amount)} ${e.currency}</td>
+    </tr>`).join('');
+  const footer = document.getElementById('all-footer');
+  if (data.count >= 500) {
+    footer.textContent = `Mostrando los primeros 500. Exportá para ver todos (/exportar).`;
+    footer.style.display = 'block';
+  } else {
+    footer.style.display = 'none';
+  }
 }
 
 async function fxCreate() {
@@ -1386,6 +1506,9 @@ document.getElementById('fx-name').addEventListener('keydown', (e) => {
 });
 document.getElementById('fx-amount').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') fxCreate();
+});
+document.getElementById('all-sort').addEventListener('change', () => {
+  if (currentAllData) renderAllExpenses(currentAllData);
 });
 </script>
 </body>

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config.settings import Settings
 from app.database.database import session_scope
+from app.database.database import session_scope
 from app.expenses.repository import ExpenseRepository
 from app.expenses.service import ExpenseDraft, ExpenseService
 from app.budgets.repository import BudgetRepository
@@ -339,6 +340,111 @@ def test_api_full_flow_via_dashboard(in_memory_db, client):
     assert summary["total_fixed_paid"] == 160000.0
     # Liberado = 1100000 + 75000 - 160000 = 1015000
     assert summary["liberado"] == 1015000.0
+
+
+def test_api_expenses_default_period(in_memory_db, client):
+    from app.expenses.repository import ExpenseRepository
+    from app.expenses.service import ExpenseService
+    from app.expenses.service import ExpenseDraft
+
+    today = today_in_tz("UTC")
+    # Seed one expense in current month, one 3 months ago
+    with session_scope() as s:
+        svc = ExpenseService(ExpenseRepository(s))
+        svc.register_many(
+            user_id=123456,
+            drafts=[ExpenseDraft(
+                name="current", amount=Decimal("100"),
+                currency="ARS", category="Café",
+                expense_date=today, confidence=Decimal("1"),
+            )],
+            original_message="seed",
+        )
+        svc.register_many(
+            user_id=123456,
+            drafts=[ExpenseDraft(
+                name="old", amount=Decimal("200"),
+                currency="ARS", category="Otros",
+                expense_date=today.replace(month=max(1, today.month - 3)),
+                confidence=Decimal("1"),
+            )],
+            original_message="seed",
+        )
+    r = client.get("/api/expenses?period=month")
+    assert r.status_code == 200
+    data = r.json()
+    names = {item["name"] for item in data["items"]}
+    assert "current" in names
+    assert "old" not in names
+    assert data["count"] == 1
+    assert data["total"] == 100.0
+
+
+def test_api_expenses_filter_by_today(in_memory_db, client):
+    from app.expenses.repository import ExpenseRepository
+    from app.expenses.service import ExpenseService
+    from app.expenses.service import ExpenseDraft
+
+    today = today_in_tz("UTC")
+    yesterday = today.replace(day=max(1, today.day - 1))
+    with session_scope() as s:
+        svc = ExpenseService(ExpenseRepository(s))
+        for label, d in [("today_one", today), ("yesterday_one", yesterday)]:
+            svc.register_many(
+                user_id=123456,
+                drafts=[ExpenseDraft(
+                    name=label, amount=Decimal("100"),
+                    currency="ARS", category="Café",
+                    expense_date=d, confidence=Decimal("1"),
+                )],
+                original_message="seed",
+            )
+    r = client.get("/api/expenses?period=today")
+    names = {item["name"] for item in r.json()["items"]}
+    assert "today_one" in names
+    assert "yesterday_one" not in names
+
+
+def test_api_expenses_default_sort_is_by_date(in_memory_db, client):
+    """API returns expenses sorted by date desc; sorting by amount happens
+    on the frontend after fetching all the data."""
+    from app.expenses.repository import ExpenseRepository
+    from app.expenses.service import ExpenseService
+    from app.expenses.service import ExpenseDraft
+
+    today = today_in_tz("UTC")
+    with session_scope() as s:
+        svc = ExpenseService(ExpenseRepository(s))
+        for name, day, amount in [
+            ("alpha", 5, 100),
+            ("beta", 25, 999),
+            ("gamma", 15, 50),
+        ]:
+            svc.register_many(
+                user_id=123456,
+                drafts=[ExpenseDraft(
+                    name=name, amount=Decimal(amount),
+                    currency="ARS", category="Café",
+                    expense_date=today.replace(day=day),
+                    confidence=Decimal("1"),
+                )],
+                original_message="seed",
+            )
+    r = client.get("/api/expenses?period=month")
+    items = r.json()["items"]
+    # Server returns most recent (day 25) first
+    assert items[0]["name"] == "beta"
+    assert items[1]["name"] == "gamma"
+    assert items[2]["name"] == "alpha"
+
+
+def test_dashboard_contains_all_expenses_panel(in_memory_db, client):
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert 'id="all-tbody"' in r.text
+    assert 'id="all-sort"' in r.text
+    assert 'id="all-total"' in r.text
+    assert "Todos los gastos" in r.text
 
 
 def test_api_budgets(in_memory_db):

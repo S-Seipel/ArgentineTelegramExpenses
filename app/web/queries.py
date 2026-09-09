@@ -231,8 +231,11 @@ def recent_expenses(
     session: Session,
     user_id: int,
     limit: int,
+    *,
+    start: date | None = None,
+    end: date | None = None,
 ) -> list[dict]:
-    rows = session.execute(
+    stmt = (
         select(
             Expense.id,
             Expense.name,
@@ -245,7 +248,12 @@ def recent_expenses(
         .where(Expense.telegram_user_id == user_id)
         .order_by(Expense.expense_date.desc(), Expense.id.desc())
         .limit(limit)
-    ).all()
+    )
+    if start is not None:
+        stmt = stmt.where(Expense.expense_date >= start)
+    if end is not None:
+        stmt = stmt.where(Expense.expense_date <= end)
+    rows = session.execute(stmt).all()
     return [
         {
             "id": rid,
