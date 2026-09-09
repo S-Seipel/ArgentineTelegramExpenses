@@ -1,0 +1,15 @@
+fastapi==0.141.1
+uvicorn[standard]==0.32.1
+pydantic>=2.10,<3
+pydantic-settings>=2.7,<3
+python-telegram-bot==21.10
+SQLAlchemy==2.0.52
+psycopg[binary]>=3.2.10,<3.4
+httpx==0.28.1
+python-dateutil==2.9.0.post0
+alembic==1.14.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-mock==3.14.0
+faster-whisper==1.0.3
+requests>=2.32
