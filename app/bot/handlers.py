@@ -26,6 +26,13 @@ from app.recurring.service import (
 from app.recurring.schemas import RecurringOut
 from app.budgets.repository import BudgetRepository
 from app.budgets.service import BudgetDraft, BudgetService, BudgetValidationError
+from app.fixed_expenses.repository import FixedExpenseRepository
+from app.fixed_expenses.service import (
+    FixedExpenseDraft,
+    FixedExpenseService,
+    FixedExpenseValidationError,
+    current_month_year,
+)
 from app.utils.amounts import _normalize_decimal, find_thousand_amounts
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
@@ -135,6 +142,23 @@ async def handle_command(
         await update.effective_message.reply_text(
             _format_search_results(query, results)
         )
+        return
+
+    if command in (
+        "/gastosfijos", "/gastofijo_add", "/gastofijo_del",
+        "/gastofijo_off", "/gastofijo_on",
+        "/pague", "/salte", "/liberado",
+        "/ingreso", "/extra",
+    ):
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        with session_scope() as session:
+            repo = FixedExpenseRepository(session)
+            service = FixedExpenseService(repo)
+            reply = _handle_fixed_expense_command(
+                command, args, service, user_id,
+                today=today_in_tz(deps.runtime.settings.timezone),
+            )
+        await update.effective_message.reply_text(reply)
         return
 
     if command in ("/start", "/help", "/ayuda"):
@@ -816,3 +840,242 @@ def _handle_budget_command(
         return f"💰 Presupuesto #{budget_id} {action}."
 
     return "Comando no reconocido."
+
+
+def _handle_fixed_expense_command(
+    command: str,
+    args: list[str],
+    service: FixedExpenseService,
+    user_id: int,
+    today,
+) -> str:
+    month_year = current_month_year(today)
+
+    if command == "/gastosfijos":
+        return _format_fixed_expenses_month(service, user_id, month_year)
+
+    if command == "/gastofijo_add":
+        if len(args) < 2:
+            return (
+                "❓ Uso: `/gastofijo_add <nombre> <monto> [día] [método]`\n"
+                "Ej: `/gastofijo_add CASA 90000 10 transferencia`"
+            )
+        name = args[0]
+        amount = _parse_user_amount(args[1])
+        if amount is None:
+            return f"❓ No pude interpretar el monto `{args[1]}`."
+        due_day = 1
+        method = None
+        for extra in args[2:]:
+            try:
+                due_day = int(extra)
+                continue
+            except ValueError:
+                method = extra.upper()
+        if method and method not in {
+            "TRANSFERENCIA", "EFECTIVO", "DEBITO", "TARJETA",
+            "CREDITO", "MERCADO PAGO", "APP", "OTRO",
+        }:
+            method = "OTRO"
+        draft = FixedExpenseDraft(
+            name=name,
+            expected_amount=amount,
+            currency=None,
+            payment_method=method,
+            due_day_of_month=due_day,
+        )
+        try:
+            obj = service.add(user_id, draft)
+        except FixedExpenseValidationError as exc:
+            return f"🤔 {exc}"
+        return (
+            f"💸 Gasto fijo agregado:\n"
+            f"*{obj.name}* — ${obj.expected_amount} {obj.currency}\n"
+            f"📅 Día {obj.due_day_of_month} · 💳 {obj.payment_method or '—'}\n\n"
+            f"Lo gestionás con `/gastosfijos` o lo borrás con "
+            f"`/gastofijo_del {obj.id}`."
+        )
+
+    if command in ("/gastofijo_del", "/gastofijo_off", "/gastofijo_on"):
+        if not args:
+            return (
+                "❓ Decime el ID. Ej: `/gastofijo_del 3`. "
+                "Usá `/gastosfijos` para ver los IDs."
+            )
+        try:
+            fid = int(args[0])
+        except ValueError:
+            return "❓ El ID tiene que ser un número entero."
+        if command == "/gastofijo_del":
+            service.repo.delete_payment_by_fixed_id = None  # noqa
+            obj = service.repo.get_by_id(user_id, fid)
+            if obj is None:
+                return f"🤷 No encontré el gasto fijo #{fid}."
+            service.repo.session.delete(obj)
+            service.repo.session.commit()
+            action = "eliminado"
+        elif command == "/gastofijo_off":
+            obj = service.set_active(user_id, fid, is_active=False)
+            if obj is None:
+                return f"🤷 No encontré el gasto fijo #{fid}."
+            action = "pausado"
+        else:
+            obj = service.set_active(user_id, fid, is_active=True)
+            if obj is None:
+                return f"🤷 No encontré el gasto fijo #{fid}."
+            action = "reanudado"
+        return f"💸 Gasto fijo #{fid} {action}: *{obj.name}*."
+
+    if command in ("/pague", "/salte"):
+        if not args:
+            name = None
+        else:
+            name = args[0]
+            # Optionally: second arg can be the actual amount.
+        amount_paid: object = None
+        if command == "/pague" and len(args) >= 2:
+            amount_paid = _parse_user_amount(args[1])
+            if amount_paid is None:
+                return f"❓ No pude interpretar el monto `{args[1]}`."
+        if name is None:
+            return (
+                "❓ Decime cuál pagaste. Ej: `/pague CASA` o "
+                "`/pague CASA 92000` si pagaste un poco más."
+            )
+        bill = service.find_by_name(user_id, name)
+        if bill is None:
+            matches = [
+                b for b in service.list_active(user_id)
+                if name.lower() in b.name.lower()
+            ]
+            if len(matches) == 1:
+                bill = matches[0]
+            elif matches:
+                names = ", ".join(f"`{m.name}`" for m in matches[:5])
+                return f"🤔 Encontré varios: {names}. Decime el exacto."
+            else:
+                return (
+                    f"🤷 No encontré un gasto fijo llamado *{name}*. "
+                    f"Usá `/gastosfijos` para verlos."
+                )
+        if command == "/pague":
+            obj, _ = service.mark_paid(
+                user_id, bill.id, month_year, actual_amount=amount_paid,
+            )
+            if obj is None:
+                return f"🤷 Error pagando *{bill.name}*."
+            paid_amt = amount_paid if amount_paid else bill.expected_amount
+            if amount_paid and amount_paid != bill.expected_amount:
+                diff = amount_paid - bill.expected_amount
+                sign = "+" if diff > 0 else ""
+                return (
+                    f"✅ *{bill.name}* pagado: ${paid_amt} "
+                    f"(esperado ${bill.expected_amount}, {sign}{diff})"
+                )
+            return f"✅ *{bill.name}* pagado: ${paid_amt}"
+        else:
+            obj, _ = service.mark_skipped(user_id, bill.id, month_year)
+            if obj is None:
+                return f"🤷 Error salteando *{bill.name}*."
+            return f"⏭️ *{bill.name}* salteado este mes."
+
+    if command == "/liberado":
+        return _format_month_summary(service, user_id, month_year)
+
+    if command == "/ingreso":
+        if not args:
+            return "❓ Decime el monto. Ej: `/ingreso 1100000`."
+        amount = _parse_user_amount(args[0])
+        if amount is None:
+            return f"❓ No pude interpretar el monto `{args[0]}`."
+        if amount < 0:
+            return "🤔 El ingreso no puede ser negativo."
+        service.set_budget(user_id, month_year, income=amount)
+        return f"💸 Ingreso de {month_year}: ${amount}"
+
+    if command == "/extra":
+        if not args:
+            return "❓ Decime el monto. Ej: `/extra 75000`."
+        amount = _parse_user_amount(args[0])
+        if amount is None:
+            return f"❓ No pude interpretar el monto `{args[0]}`."
+        service.set_budget(user_id, month_year, extra=amount)
+        return f"💸 Extra de {month_year}: ${amount}"
+
+    return "Comando no reconocido."
+
+
+def _format_fixed_expenses_month(
+    service: FixedExpenseService, user_id: int, month_year: str
+) -> str:
+    bills = service.with_status_for_month(user_id, month_year)
+    if not bills:
+        return (
+            "🤷 No tenés gastos fijos. Creá uno con "
+            "`/gastofijo_add CASA 90000 10 transferencia`."
+        )
+    paid = [b for b in bills if b.paid]
+    pending = [b for b in bills if not b.paid and not b.skipped]
+    skipped = [b for b in bills if b.skipped]
+    lines = [
+        f"💸 *Gastos fijos — {month_year}*",
+        f"📊 Progreso: {len(paid)}/{len(bills)} pagados",
+        "",
+    ]
+    for b in bills:
+        icon = (
+            "✅" if b.paid
+            else ("⏭️" if b.skipped else "⏳")
+        )
+        method = b.payment_method or "—"
+        amount_str = format_currency_amount(b.expected_amount, b.currency)
+        actual_str = ""
+        if b.actual_amount is not None and b.actual_amount != b.expected_amount:
+            diff = b.actual_amount - b.expected_amount
+            sign = "+" if diff > 0 else ""
+            actual_str = f" → ${b.actual_amount} ({sign}{diff})"
+        day_str = f"día {b.due_day_of_month}"
+        lines.append(
+            f"{icon} `{b.id}` *{b.name}* — {amount_str}{actual_str} "
+            f"({method}, {day_str})"
+        )
+    if skipped:
+        lines.append(f"\n⏭️ {len(skipped)} salteado(s) este mes")
+    if pending:
+        names = ", ".join(f"`{b.name}`" for b in pending[:5])
+        lines.append(
+            f"\nPendientes: {names}. Marcá con `/pague <nombre>` "
+            f"(/pague <nombre> <monto_real> si pagaste distinto)."
+        )
+    lines.append(
+        f"\n💰 Ingreso + extra → `/ingreso 1100000`, `/extra 75000`"
+    )
+    lines.append(f"📊 Resumen → `/liberado`")
+    return "\n".join(lines)
+
+
+def _format_month_summary(
+    service: FixedExpenseService, user_id: int, month_year: str
+) -> str:
+    summary = service.month_summary(user_id, month_year)
+    bills = service.with_status_for_month(user_id, month_year)
+    paid_count = sum(1 for b in bills if b.paid)
+    total_count = len(bills)
+    lines = [
+        f"📊 *Resumen del mes {month_year}*",
+        "",
+        f"💵 Ingreso:    ${fmt_money(summary.income)}",
+        f"➕ Extra:       ${fmt_money(summary.extra)}",
+        f"📉 Gastos fijos: ${fmt_money(summary.total_fixed_paid)}",
+        f"   _(esperado ${fmt_money(summary.total_fixed_expected)})_",
+        "",
+        f"💰 *Liberado:   ${fmt_money(summary.liberado)}*",
+        "",
+        f"Pagados: {paid_count}/{total_count}",
+    ]
+    return "\n".join(lines)
+
+
+def fmt_money(n) -> str:
+    from app.utils.formatting import format_amount
+    return format_amount(n)

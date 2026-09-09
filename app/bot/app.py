@@ -103,6 +103,17 @@ def build_application(
         CommandHandler(["buscar"], _command_handler)
     )
     application.add_handler(
+        CommandHandler(
+            [
+                "gastosfijos", "gastofijo_add", "gastofijo_del",
+                "gastofijo_off", "gastofijo_on",
+                "pague", "salte", "liberado",
+                "ingreso", "extra",
+            ],
+            _command_handler,
+        )
+    )
+    application.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO, _voice_handler
         )

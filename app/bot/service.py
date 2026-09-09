@@ -327,7 +327,15 @@ def _help_text() -> str:
         "/recurrente_add_anual <nombre> <monto> <mes> <día> — anual\n"
         "/recurrentes — listar recurrentes\n"
         "/presupuesto <categoría> <monto> — límite mensual\n"
-        "/presupuestos — listar presupuestos"
+        "/presupuestos — listar presupuestos\n"
+        "*Gastos fijos:*\n"
+        "/gastosfijos — ver lista del mes con estado\n"
+        "/gastofijo_add <nombre> <monto> [día] [método]\n"
+        "/pague <nombre> [monto_real] — marcar pagado\n"
+        "/salte <nombre> — saltar este mes\n"
+        "/ingreso <monto> — setear ingreso del mes\n"
+        "/extra <monto> — setear extra del mes\n"
+        "/liberado — resumen del mes (income - fijos)"
     )
 
 

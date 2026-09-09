@@ -18,6 +18,8 @@ from app.web.queries import (
     budget_status,
     comparison,
     daily_trend,
+    fixed_expenses_current_month,
+    month_summary_dashboard,
     projection,
     recent_expenses,
     recurring_upcoming,
@@ -146,6 +148,25 @@ async def api_recurring_upcoming(
 ):
     with session_scope() as s:
         return {"items": recurring_upcoming(s, user_id, today)}
+
+
+@router.get("/api/fixed-expenses")
+async def api_fixed_expenses(
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    with session_scope() as s:
+        bills = fixed_expenses_current_month(s, user_id, today)
+    return {"items": bills}
+
+
+@router.get("/api/month-summary")
+async def api_month_summary(
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    with session_scope() as s:
+        return month_summary_dashboard(s, user_id, today)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -473,6 +494,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="panel" id="fixed-panel">
+      <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:14px; flex-wrap:wrap; gap:10px">
+        <div>
+          <h2 id="fixed-title" style="margin-bottom:2px">Gastos fijos</h2>
+          <div class="subtitle" id="fixed-subtitle">Cargando…</div>
+        </div>
+        <div style="display:flex; gap:18px; align-items:flex-end; flex-wrap:wrap">
+          <div style="text-align:right">
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Ingreso</div>
+            <div class="big" id="fixed-income" style="font-size:22px">—</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Extra</div>
+            <div class="big" id="fixed-extra" style="font-size:22px">—</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Pagado</div>
+            <div class="big" id="fixed-paid" style="font-size:22px">—</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Liberado</div>
+            <div class="big" id="fixed-liberado" style="font-size:24px">—</div>
+          </div>
+        </div>
+      </div>
+      <div id="fixed-list"></div>
+    </div>
+
     <div class="row">
       <div class="panel">
         <h2 id="comparison-title">Comparativa</h2>
@@ -571,7 +620,7 @@ async function refresh() {
   const periodParam = '?period=' + currentPeriod;
   let summary, trend, recent, budgets, recurring, comparison, projection;
   try {
-    [summary, trend, recent, budgets, recurring, comparison, projection] =
+    const [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum] =
       await Promise.all([
         getJSON('/api/summary' + periodParam),
         getJSON('/api/trend' + periodParam),
@@ -580,6 +629,8 @@ async function refresh() {
         getJSON('/api/recurring/upcoming'),
         getJSON('/api/comparison' + periodParam),
         getJSON('/api/projection' + periodParam),
+        getJSON('/api/fixed-expenses'),
+        getJSON('/api/month-summary'),
       ]);
   } catch (err) {
     subtitle.classList.remove('refreshing');
@@ -825,6 +876,70 @@ async function refresh() {
       <td>${escapeHTML(e.category)}</td>
       <td class="amount">$${fmt.format(e.amount)} ${e.currency}</td>
     </tr>`).join('');
+
+  // Fixed expenses section
+  renderFixedExpenses(fixed, monthSum);
+}
+
+function renderFixedExpenses(fixed, monthSum) {
+  const libEl = document.getElementById('fixed-liberado');
+  if (libEl) {
+    const prev = parseFloat(libEl.dataset.value || '0');
+    animateNumber(libEl, monthSum.liberado, 700);
+  }
+  document.getElementById('fixed-income').textContent = '$' + fmt.format(monthSum.income);
+  document.getElementById('fixed-extra').textContent = '$' + fmt.format(monthSum.extra);
+  document.getElementById('fixed-paid').textContent = '$' + fmt.format(monthSum.total_fixed_paid);
+
+  const libColor = monthSum.liberado >= 0 ? '#34d399' : '#f87171';
+  if (libEl) {
+    libEl.style.background = `linear-gradient(180deg, ${libColor} 0%, ${libColor}99 100%)`;
+    libEl.style.webkitBackgroundClip = 'text';
+    libEl.style.backgroundClip = 'text';
+    libEl.style.webkitTextFillColor = 'transparent';
+  }
+
+  const sub = document.getElementById('fixed-subtitle');
+  const items = fixed.items || [];
+  if (items.length === 0) {
+    sub.textContent = 'No tenés gastos fijos. Cargalos desde Telegram: /gastofijo_add CASA 90000 10 transferencia';
+    document.getElementById('fixed-list').innerHTML = '';
+    return;
+  }
+  const paid = items.filter(i => i.status === 'paid_exact' || i.status === 'paid_more' || i.status === 'paid_less').length;
+  sub.textContent = `${paid}/${items.length} pagados · Mes ${monthSum.month_year}`;
+
+  const STATUS_ICON = {
+    pending: '⏳', paid_exact: '✅', paid_more: '💰', paid_less: '⚠️', skipped: '⏭️',
+  };
+  document.getElementById('fixed-list').innerHTML = items.map(b => {
+    const icon = STATUS_ICON[b.status] || '⏳';
+    const method = b.payment_method || '—';
+    let actualStr = '';
+    let actualColor = '';
+    if (b.actual_amount != null && b.actual_amount !== b.expected_amount) {
+      const diff = b.actual_amount - b.expected_amount;
+      const sign = diff > 0 ? '+' : '';
+      const cls = diff > 0 ? 'paid-more' : 'paid-less';
+      actualStr = ` <span class="${cls}">→ $${fmt.format(b.actual_amount)} (${sign}${fmt.format(Math.abs(diff))})</span>`;
+      actualColor = diff > 0 ? '#fbbf24' : '#f87171';
+    }
+    return `
+      <div class="budget-row">
+        <div style="display:flex; align-items:center; gap:10px">
+          <span style="font-size:18px; line-height:1">${icon}</span>
+          <div style="flex:1">
+            <div><strong>${escapeHTML(b.name)}</strong>
+              <span class="pill ${b.status === 'paid_exact' ? 'ok' : b.status === 'paid_more' ? 'warn' : b.status === 'paid_less' ? 'warn' : b.status === 'skipped' ? '' : 'bad'}"
+                    style="${b.status === 'skipped' ? 'background:rgba(255,255,255,0.06); color:#94a3b8' : ''}">
+                ${b.status === 'pending' ? 'pendiente' : b.status === 'paid_exact' ? 'pagado' : b.status === 'paid_more' ? 'pagado +' : b.status === 'paid_less' ? 'pagado -' : 'salteado'}
+              </span>
+            </div>
+            <div class="subtitle">$${fmt.format(b.expected_amount)} ${b.currency} · ${method} · día ${b.due_day_of_month}${actualStr}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 function palette(n) {

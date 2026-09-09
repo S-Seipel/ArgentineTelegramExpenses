@@ -120,6 +120,55 @@ def test_api_recent_limit_validation(client):
     assert r.status_code == 422
 
 
+def test_api_fixed_expenses_empty(client):
+    r = client.get("/api/fixed-expenses")
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+def test_api_fixed_expenses_returns_status(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        casa = svc.add(user_id=123456, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000"),
+            payment_method="TRANSFERENCIA", due_day_of_month=10))
+        svc.mark_paid(user_id=123456, fixed_id=casa.id,
+                      month_year=today_in_tz("UTC").strftime("%Y-%m"))
+    r = client.get("/api/fixed-expenses")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 1
+    assert items[0]["name"] == "CASA"
+    assert items[0]["status"] == "paid_exact"
+
+
+def test_api_month_summary_no_budget(client):
+    r = client.get("/api/month-summary")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["month_year"] == today_in_tz("UTC").strftime("%Y-%m")
+    assert data["income"] == 0.0
+    assert data["liberado"] == 0.0
+
+
+def test_api_month_summary_with_income(in_memory_db, client):
+    from app.fixed_expenses.service import FixedExpenseDraft
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService
+    my = today_in_tz("UTC").strftime("%Y-%m")
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        svc.set_budget(123456, my, income=Decimal("1000000"),
+                       extra=Decimal("50000"))
+    r = client.get("/api/month-summary")
+    data = r.json()
+    assert data["income"] == 1000000.0
+    assert data["extra"] == 50000.0
+
+
 def test_api_budgets(in_memory_db):
     today = today_in_tz("UTC")
     with session_scope() as s:

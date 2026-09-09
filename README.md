@@ -199,6 +199,55 @@ Acepta jerga argentina: `10k`, `10 lucas`, `10 mil`, `$10.000`, `10,000`, `20 d�
 - `/presupuestos` — lista presupuestos activos
 - `/presupuesto_del <id>` / `/presupuesto_off <id>` / `/presupuesto_on <id>` — gestión
 
+### Gastos fijos mensuales
+
+Tu Excel de gastos fijos vive ahora en el bot. Cargas tus gastos mensuales
+y los vas tildando a medida que los pagás.
+
+```
+/gastofijo_add CASA 90000 10 transferencia
+/gastofijo_add GYM 60000 15 efectivo
+/gastofijo_add NETFLIX 5000 5 tarjeta
+```
+
+**Ver el estado del mes:**
+```
+/gastosfijos
+→ 💸 Gastos fijos — 2026-09
+  📊 Progreso: 5/12 pagados
+
+  ✅ `1` CASA — $ 90.000 ARS (TRANSFERENCIA, día 10)
+  💰 `2` GYM — $ 60.000 ARS → $ 65.000 (+5.000) (EFECTIVO, día 15)
+  ⏳ `3` NETFLIX — $ 5.000 ARS (TARJETA, día 5)
+```
+
+**Marcar como pagado:**
+```
+/pague CASA              # al monto esperado
+/pague GYM 65000         # si pagaste distinto
+/salte NETFLIX           # este mes no lo pagás
+```
+
+**Income / Extra del mes:**
+```
+/ingreso 1100000
+/extra 75000
+```
+
+**Resumen del mes:**
+```
+/liberado
+→ 📊 Resumen del mes 2026-09
+  💵 Ingreso:    $ 1.100.000
+  ➕ Extra:       $ 75.000
+  📉 Gastos fijos: $ 145.000
+     (esperado $ 150.000)
+  💰 Liberado:   $ 1.030.000
+```
+
+El dashboard tiene una sección "Gastos fijos" con KPI cards de Ingreso,
+Extra, Pagado y **Liberado** en vivo.
+
 ### Gastos recurrentes
 
 ### Audios (voice notes)

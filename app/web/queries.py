@@ -435,6 +435,65 @@ def projection(
     }
 
 
+def fixed_expenses_current_month(
+    session: Session,
+    user_id: int,
+    today: date,
+) -> list[dict]:
+    """Return fixed expenses with payment status for the current month."""
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import (
+        FixedExpenseService,
+        current_month_year,
+    )
+    repo = FixedExpenseRepository(session)
+    service = FixedExpenseService(repo)
+    my = current_month_year(today)
+    bills = service.with_status_for_month(user_id, my)
+    return [
+        {
+            "id": b.id,
+            "name": b.name,
+            "expected_amount": float(b.expected_amount),
+            "currency": b.currency,
+            "payment_method": b.payment_method,
+            "due_day_of_month": b.due_day_of_month,
+            "category_name": b.category_name,
+            "status": b.status,
+            "actual_amount": (
+                float(b.actual_amount) if b.actual_amount is not None else None
+            ),
+            "diff": float(b.diff) if b.diff is not None else None,
+        }
+        for b in bills
+    ]
+
+
+def month_summary_dashboard(
+    session: Session,
+    user_id: int,
+    today: date,
+) -> dict:
+    """Income + extra + fixed totals + liberado for the current month."""
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import (
+        FixedExpenseService,
+        current_month_year,
+    )
+    repo = FixedExpenseRepository(session)
+    service = FixedExpenseService(repo)
+    my = current_month_year(today)
+    summary = service.month_summary(user_id, my)
+    return {
+        "month_year": my,
+        "income": float(summary.income),
+        "extra": float(summary.extra),
+        "total_fixed_expected": float(summary.total_fixed_expected),
+        "total_fixed_paid": float(summary.total_fixed_paid),
+        "liberado": float(summary.liberado),
+    }
+
+
 def recurring_upcoming(
     session: Session,
     user_id: int,
