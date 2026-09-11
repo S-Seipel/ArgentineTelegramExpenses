@@ -21,6 +21,8 @@ from app.web.queries import (
     daily_trend,
     fixed_expenses_current_month,
     month_summary_dashboard,
+    period_count,
+    period_total_by_currency,
     projection,
     recent_expenses,
     recurring_upcoming,
@@ -101,9 +103,15 @@ async def api_expenses(
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
 ):
-    """Return ALL expenses for the period (default: current month).
+    """Return expenses for the period (default: current month).
 
-    Used by the dashboard's 'Todos los gastos del mes' panel.
+    The ``items`` list is bounded by ``limit`` for transport size, but
+    ``count`` and ``total`` describe the FULL period so the dashboard
+    total is independent of how many rows the client fetched.
+
+    Currency correctness: the legacy scalar ``total`` is only emitted
+    when a single currency is present. With multiple currencies it's
+    ``null`` and ``total_by_currency`` carries the per-currency map.
     """
     window = resolve_period(
         period, today, custom_start=custom_start, custom_end=custom_end
@@ -116,12 +124,31 @@ async def api_expenses(
             start=window.start,
             end=window.end,
         )
+        total_by_currency = period_total_by_currency(
+            s, user_id, start=window.start, end=window.end
+        )
+        count = period_count(
+            s, user_id, start=window.start, end=window.end
+        )
+    single_total = (
+        next(iter(total_by_currency.values()))
+        if len(total_by_currency) == 1
+        else None
+    )
     return {
         "period_label": window.label,
         "start": window.start.isoformat(),
         "end": window.end.isoformat(),
-        "count": len(items),
-        "total": sum(i["amount"] for i in items),
+        "count": count,
+        "total": (
+            float(single_total.quantize(Decimal("0.01")))
+            if single_total is not None
+            else None
+        ),
+        "total_by_currency": {
+            k: float(v.quantize(Decimal("0.01")))
+            for k, v in total_by_currency.items()
+        },
         "items": items,
     }
 

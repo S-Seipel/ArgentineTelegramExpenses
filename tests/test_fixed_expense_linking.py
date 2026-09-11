@@ -73,7 +73,13 @@ def test_mark_paid_twice_updates_same_expense(in_memory_db):
         assert expenses[0].amount == Decimal("95000.00")
 
 
-def test_unmark_removes_linked_expense(in_memory_db):
+def test_unmark_soft_deletes_linked_expense(in_memory_db):
+    """Unpay keeps the payment row (cleared) and soft-deletes the mirror.
+
+    The historical link (``expense_id``) is preserved so a re-``mark_paid``
+    can restore the same row.
+    """
+    from app.expenses.models import Expense
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
         bill = _add_one(service)
@@ -83,10 +89,18 @@ def test_unmark_removes_linked_expense(in_memory_db):
         service.unmark(123, bill.id, my)
 
     with session_scope() as s:
-        # Payment gone
-        assert FixedExpenseRepository(s).get_payment(bill.id, my) is None
-        # Expense gone
+        repo = FixedExpenseRepository(s)
+        # Payment row is preserved with paid_at cleared.
+        payment = repo.get_payment(bill.id, my)
+        assert payment is not None
+        assert payment.paid_at is None
+        assert payment.actual_amount is None
+        # Expense is soft-deleted, not removed.
         assert ExpenseRepository(s).search_by_name(123, "CASA") == []
+        # The underlying row is still there with deleted_at populated.
+        row = s.query(Expense).filter(Expense.source_key.like("fixed-payment:%")).one()
+        assert row.deleted_at is not None
+        assert row.revision >= 2
 
 
 def test_skip_does_not_create_expense(in_memory_db):
@@ -101,8 +115,9 @@ def test_skip_does_not_create_expense(in_memory_db):
         assert ExpenseRepository(s).search_by_name(123, "CASA") == []
 
 
-def test_skip_after_pay_removes_expense(in_memory_db):
-    """Mark paid → expense exists. Then mark skipped → expense removed."""
+def test_skip_after_pay_soft_deletes_expense(in_memory_db):
+    """Mark paid → expense exists. Then mark skipped → expense soft-deleted."""
+    from app.expenses.models import Expense
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
         bill = _add_one(service)
@@ -113,22 +128,38 @@ def test_skip_after_pay_removes_expense(in_memory_db):
 
     with session_scope() as s:
         assert ExpenseRepository(s).search_by_name(123, "CASA") == []
+        # The row is still around for audit purposes.
+        assert s.query(Expense).count() == 1
+        row = s.query(Expense).one()
+        assert row.deleted_at is not None
 
 
-def test_paid_then_skipped_then_paid_recreates_expense(in_memory_db):
+def test_paid_then_skipped_then_paid_restores_same_expense(in_memory_db):
+    """Pay → skip → pay must restore the same mirror, not duplicate it."""
+    from app.expenses.models import Expense
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
         bill = _add_one(service)
         today = date.today()
         my = today.strftime("%Y-%m")
         service.mark_paid(123, bill.id, my)
+        first_id = (
+            s.query(Expense).filter(Expense.source_key.like("fixed-payment:%")).one().id
+        )
         service.mark_skipped(123, bill.id, my)
         service.mark_paid(123, bill.id, my, actual_amount=Decimal("88000"))
 
     with session_scope() as s:
-        expenses = ExpenseRepository(s).search_by_name(123, "CASA")
+        expenses = s.query(Expense).all()
+        # Same physical row, restored (deleted_at cleared) and updated amount.
         assert len(expenses) == 1
+        assert expenses[0].id == first_id
         assert expenses[0].amount == Decimal("88000.00")
+        assert expenses[0].deleted_at is None
+        assert expenses[0].revision >= 3
+        # Visible reads see it again.
+        live = ExpenseRepository(s).search_by_name(123, "CASA")
+        assert len(live) == 1
 
 
 def test_dashboard_total_includes_paid_fixed_expenses(in_memory_db):

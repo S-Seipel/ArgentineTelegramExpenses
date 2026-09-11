@@ -77,16 +77,9 @@ def session_scope() -> Iterator[Session]:
 
 
 def init_db() -> None:
-    from app.categories.models import Category  # noqa: F401
-    from app.expenses.models import Expense  # noqa: F401
-    from app.recurring.models import RecurringExpense  # noqa: F401
-    from app.budgets.models import Budget  # noqa: F401
-    from app.fixed_expenses.models import (  # noqa: F401
-        FixedExpense,
-        FixedExpensePayment,
-        MonthlyBudget,
-    )
+    from app.models_registry import register_all_models
 
+    register_all_models()
     Base.metadata.create_all(bind=get_engine())
 
 

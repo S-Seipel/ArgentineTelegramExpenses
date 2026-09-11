@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date as _date
 from decimal import Decimal, InvalidOperation
-from typing import Sequence
+from typing import Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 class ExpenseValidationError(ValueError):
     """Raised when an extracted expense is unsafe to persist as-is."""
+
+
+class LinkedFixedPaymentError(RuntimeError):
+    """Raised when an operation tries to mutate an Expense that is owned
+    by a fixed-expense payment. The reversal must happen through the
+    fixed-expense domain, not via the generic Expense CRUD."""
 
 
 @dataclass
@@ -54,6 +60,12 @@ class ExpenseService:
         user_id: int,
         drafts: Sequence[ExpenseDraft],
         original_message: str,
+        *,
+        source_type: str = "telegram",
+        source_key: Optional[str] = None,
+        telegram_chat_id: Optional[int] = None,
+        telegram_message_id: Optional[int] = None,
+        commit: bool = True,
     ) -> PersistOutcome:
         questions: list[str] = []
         valid: list[ExpenseCreate] = []
@@ -76,6 +88,11 @@ class ExpenseService:
                     expense_date=draft.expense_date,
                     original_message=original_message,
                     ai_confidence=draft.confidence,
+                    source_type=source_type,
+                    source_key=source_key,
+                    telegram_chat_id=telegram_chat_id,
+                    telegram_message_id=telegram_message_id,
+                    revision=1,
                 )
             )
 
@@ -86,7 +103,7 @@ class ExpenseService:
 
         saved: list[Expense] = []
         if valid:
-            saved = self.repo.create_many(valid)
+            saved = self.repo.create_many(valid, commit=commit)
         return PersistOutcome(
             needs_clarification=False, questions=[], saved=saved
         )
@@ -97,21 +114,93 @@ class ExpenseService:
         name: str,
         cache: dict[str, int],
     ) -> int:
+        """Resolve a category NAME to a ``categories.id``.
+
+        Categories are stored as a tree; identity is the pair
+        ``(parent_id, name)``, NOT ``name`` alone. The seed has
+        ``Café`` under ``Comida`` and ``Otros`` as a top-level
+        parent, so a naive ``WHERE name = ?`` can return multiple
+        rows after a future migration or a manual ``INSERT`` and
+        trip ``MultipleResultsFound`` at registration time.
+
+        Resolution strategy:
+
+        1. The DB is the source of truth for "does this category
+           exist". Find all rows matching ``name`` exactly.
+        2. Zero rows → fall back to ``DEFAULT_CATEGORY`` (Other).
+        3. Exactly one row → use it (covers the common case, plus
+           categories added at runtime that the in-memory registry
+           hasn't picked up yet).
+        4. Multiple rows → use the registry's ``(parent_id, name)``
+           to disambiguate. The seed tree is the canonical mapping.
+           If the registry doesn't help, raise rather than guess.
+
+        The result is cached by the *input* name so repeated lookups
+        within the same ``register_many`` call stay fast.
+        """
         if name in cache:
             return cache[name]
-        row = (
-            session.query(Category)
-            .filter(Category.name == name)
-            .one_or_none()
+
+        from app.categories.categories import (
+            DEFAULT_CATEGORY,
+            get_parent_of,
         )
-        if row is None:
-            row = (
-                session.query(Category)
-                .filter(Category.name == "Otros")
-                .one()
+
+        category_id = ExpenseService._pick_category_id(
+            session, name, get_parent_of
+        )
+        if category_id is None:
+            category_id = ExpenseService._pick_category_id(
+                session, DEFAULT_CATEGORY, get_parent_of
             )
-        cache[name] = row.id
-        return row.id
+        if category_id is None:
+            raise RuntimeError(
+                f"Cannot resolve category {name!r} (default "
+                f"{DEFAULT_CATEGORY!r} also missing). Check that the "
+                "categories seed (migration 0003) ran."
+            )
+        cache[name] = category_id
+        return category_id
+
+    @staticmethod
+    def _pick_category_id(
+        session: Session,
+        name: str,
+        get_parent_of_fn,
+    ) -> int | None:
+        """Pick a single ``categories.id`` for ``name``, disambiguating
+        multiple same-named rows using ``(parent_id, name)``.
+
+        Returns ``None`` when no row matches the (possibly
+        parent-qualified) lookup, so the caller can try the default.
+        """
+        candidates: list[Category] = (
+            session.query(Category).filter(Category.name == name).all()
+        )
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0].id
+
+        # Multiple rows share this name. The canonical identity is
+        # ``(parent_id, name)``; use the registry's parent mapping to
+        # pick the right one.
+        parent_name = get_parent_of_fn(name)
+        if parent_name is None:
+            # Registry doesn't know this name (or it's a top-level
+            # parent). Don't silently pick — let the caller decide.
+            return None
+        parent_row = (
+            session.query(Category)
+            .filter(Category.name == parent_name)
+            .first()
+        )
+        if parent_row is None:
+            return None
+        for cand in candidates:
+            if cand.parent_id == parent_row.id:
+                return cand.id
+        return None
 
     @staticmethod
     def _validate_draft(draft: ExpenseDraft) -> str | None:

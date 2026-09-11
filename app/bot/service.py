@@ -555,10 +555,21 @@ def _format_query(result: QueryResult) -> str:
         from app.categories.categories import icon_for
 
         lines = [f"📊 *Desglose por categoría ({result.period_label})*", ""]
-        grand: dict[str, Decimal] = {}
-        for cat, amount in result.category_totals.items():
+        for cat, by_currency in result.category_totals.items():
+            from app.utils.formatting import format_currency_amount
+
             icon = icon_for(cat) or CATEGORY_ICONS.get(cat, "🧾")
-            lines.append(f"{icon} *{cat}*: {format_amount(amount)}")
+            if len(by_currency) == 1:
+                cur, amount = next(iter(by_currency.items()))
+                lines.append(
+                    f"{icon} *{cat}*: {format_currency_amount(amount, cur)}"
+                )
+            else:
+                lines.append(f"{icon} *{cat}*:")
+                for cur, amount in by_currency.items():
+                    lines.append(
+                        f"  • {format_currency_amount(amount, cur)}"
+                    )
         return "\n".join(lines)
 
     if result.comparison is not None:

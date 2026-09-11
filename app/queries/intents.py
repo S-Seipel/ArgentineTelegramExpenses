@@ -29,7 +29,7 @@ class QueryResult:
     total_by_currency: dict[str, Decimal]
     items: list["ExpenseRow"] | None = None
     largest: "ExpenseRow | None" = None
-    category_totals: dict[str, "Decimal"] | None = None
+    category_totals: dict[str, "dict[str, Decimal]"] | None = None
     comparison: "ComparisonRow | None" = None
     period_label: str = ""
     filters: str = ""

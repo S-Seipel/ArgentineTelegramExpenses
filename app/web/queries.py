@@ -2,6 +2,24 @@
 
 Kept separate from ``routes.py`` so they can be unit-tested independently
 of HTTP plumbing.
+
+Currency correctness (Phase 0):
+
+- Every aggregate is grouped by currency in the SQL itself.
+- The legacy scalar fields (``by_category``, ``points``, ``spent`` …)
+  are still emitted when only ONE currency is present, so the existing
+  dashboard keeps rendering without changes.
+- When MULTIPLE currencies are present, the legacy scalars that would
+  otherwise mix currencies are replaced with ``null`` (omitting them
+  would risk breaking frontend assumptions) and per-currency
+  counterparts (``by_category_by_currency``, ``points_by_currency`` …)
+  are added.
+
+Soft delete:
+
+- Every read filters ``expenses.deleted_at IS NULL`` so a soft-deleted
+  row (e.g. one produced by a fixed payment that was then un-paid)
+  never reaches the dashboard or any aggregate.
 """
 from __future__ import annotations
 
@@ -10,13 +28,37 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.budgets.models import Budget
 from app.categories.models import Category
 from app.expenses.models import Expense
 from app.recurring.models import RecurringExpense
+
+
+_NOT_DELETED = Expense.deleted_at.is_(None)
+
+
+def _money(value: Decimal) -> float:
+    """Render Decimal money as a fixed-precision float for the JSON API.
+
+    ``quantize`` keeps it at 2 decimals before the cast so the float
+    doesn't introduce spurious digits. Aggregations are done in Decimal
+    end-to-end — this conversion only happens at the serialization
+    boundary, where the dashboard's chart libs expect numbers.
+    """
+    return float(value.quantize(Decimal("0.01")))
+
+
+def _scalar_for_single_currency(
+    per_currency: dict[str, Decimal],
+) -> Decimal | None:
+    """Return the single currency's value, or ``None`` if there are
+    multiple currencies (mixing them would be a financial lie)."""
+    if len(per_currency) == 1:
+        return next(iter(per_currency.values()))
+    return None
 
 
 @dataclass
@@ -161,23 +203,60 @@ def summary_for_period(
             Expense.telegram_user_id == user_id,
             Expense.expense_date >= window.start,
             Expense.expense_date <= window.end,
+            _NOT_DELETED,
         )
     ).all()
 
-    by_category: dict[str, Decimal] = {}
+    # Per-category-per-currency: keep currencies separated.
+    cat_per_currency: dict[str, dict[str, Decimal]] = {}
+    # Flat per-currency totals (USD and ARS stay separate).
     total_by_currency: dict[str, Decimal] = {}
     for cat_name, currency, amount in by_cat_rows:
-        by_category[cat_name] = by_category.get(cat_name, Decimal("0")) + (
-            Decimal(amount or 0)
+        cur = currency or "ARS"
+        cat_per_currency.setdefault(cat_name, {})
+        cat_per_currency[cat_name][cur] = (
+            cat_per_currency[cat_name].get(cur, Decimal("0"))
+            + Decimal(amount or 0)
         )
-        total_by_currency[currency or "ARS"] = total_by_currency.get(
-            currency or "ARS", Decimal("0")
+        total_by_currency[cur] = total_by_currency.get(
+            cur, Decimal("0")
         ) + Decimal(amount or 0)
 
-    # Sort categories by amount descending; keep top 10 for the pie chart.
-    sorted_cats = sorted(
-        by_category.items(), key=lambda kv: kv[1], reverse=True
-    )
+    # Top categories by amount (per-currency). Keeps the dashboard's
+    # "top 10" cap while being currency-safe.
+    by_category_by_currency: dict[str, list[dict]] = {}
+    for cur in total_by_currency:
+        rows = [
+            (name, per[cur])
+            for name, per in cat_per_currency.items()
+            if per.get(cur)
+        ]
+        rows.sort(key=lambda kv: kv[1], reverse=True)
+        by_category_by_currency[cur] = [
+            {"name": name, "amount": _money(amt)} for name, amt in rows[:10]
+        ]
+
+    single_total = _scalar_for_single_currency(total_by_currency)
+
+    # Legacy field. When there's one currency, keep the existing shape
+    # so the dashboard JS doesn't change. When there are multiple
+    # currencies, the scalar would mix them, which is a financial lie,
+    # so we return ``None`` (rendered as JSON null).
+    if single_total is None:
+        by_category_legacy = None
+    else:
+        cur = next(iter(total_by_currency))
+        rows = [
+            (name, per[cur])
+            for name, per in cat_per_currency.items()
+            if per.get(cur)
+        ]
+        rows.sort(key=lambda kv: kv[1], reverse=True)
+        by_category_legacy = [
+            {"name": name, "amount": float(amt)}
+            for name, amt in rows[:10]
+        ]
+
     return {
         "period_label": window.label,
         "start": window.start.isoformat(),
@@ -185,13 +264,17 @@ def summary_for_period(
         "days_elapsed": window.days_elapsed,
         "days_in_period": window.days_in_period,
         "is_full_period": window.is_full_period,
+        # Always present, currency-aware.
         "total_by_currency": {
-            k: float(v) for k, v in total_by_currency.items()
+            k: _money(v) for k, v in total_by_currency.items()
         },
-        "by_category": [
-            {"name": name, "amount": float(amt)}
-            for name, amt in sorted_cats[:10]
-        ],
+        "by_category_by_currency": by_category_by_currency,
+        # Legacy: single currency → list, multi-currency → null.
+        "by_category": by_category_legacy,
+        # New: legacy "Total" (kept for the main number) is a Decimal
+        # for the single-currency case, null otherwise. (The dashboard
+        # reads the per-currency version above.)
+        "total": _money(single_total) if single_total is not None else None,
     }
 
 
@@ -201,7 +284,12 @@ def daily_trend(
     end: date,
     days: int,
 ) -> dict:
-    """Return ``days`` trailing daily totals ending at ``end`` (inclusive)."""
+    """Return ``days`` trailing daily totals ending at ``end`` (inclusive).
+
+    Single currency → ``points`` array (legacy). Multi-currency →
+    ``points_by_currency`` map; ``points`` becomes ``null`` to avoid the
+    silent cross-currency sum.
+    """
     start = end - timedelta(days=days - 1)
     rows = session.execute(
         select(Expense.expense_date, Expense.amount, Expense.currency)
@@ -209,22 +297,63 @@ def daily_trend(
             Expense.telegram_user_id == user_id,
             Expense.expense_date >= start,
             Expense.expense_date <= end,
+            _NOT_DELETED,
         )
     ).all()
-    by_date: dict[date, Decimal] = {}
-    for d, amount, _currency in rows:
-        by_date[d] = by_date.get(d, Decimal("0")) + Decimal(amount or 0)
-    points = []
+    by_date_per_currency: dict[date, dict[str, Decimal]] = {}
+    totals_per_currency: dict[str, Decimal] = {}
+    for d, amount, currency in rows:
+        cur = currency or "ARS"
+        by_date_per_currency.setdefault(d, {})
+        by_date_per_currency[d][cur] = by_date_per_currency[d].get(
+            cur, Decimal("0")
+        ) + Decimal(amount or 0)
+        totals_per_currency[cur] = totals_per_currency.get(
+            cur, Decimal("0")
+        ) + Decimal(amount or 0)
+
+    # Per-currency series, aligned to the same date axis.
+    points_by_currency: dict[str, list[dict]] = {
+        cur: [] for cur in totals_per_currency
+    }
     cursor = start
     while cursor <= end:
-        points.append(
-            {
-                "date": cursor.isoformat(),
-                "amount": float(by_date.get(cursor, Decimal("0"))),
-            }
-        )
+        per = by_date_per_currency.get(cursor, {})
+        for cur in points_by_currency:
+            points_by_currency[cur].append(
+                {
+                    "date": cursor.isoformat(),
+                    "amount": _money(per.get(cur, Decimal("0"))),
+                }
+            )
         cursor += timedelta(days=1)
-    return {"start": start.isoformat(), "end": end.isoformat(), "points": points}
+
+    single_currency = _scalar_for_single_currency(totals_per_currency)
+    if single_currency is None and totals_per_currency:
+        # Multiple currencies — mixing them would be a financial lie.
+        points: list[dict] | None = None
+    elif totals_per_currency:
+        cur = next(iter(totals_per_currency))
+        points = points_by_currency[cur]
+    else:
+        # No expenses at all in the window: still emit the date skeleton
+        # so the chart can render the timeline.
+        points = [
+            {
+                "date": (start + timedelta(days=i)).isoformat(),
+                "amount": 0.0,
+            }
+            for i in range((end - start).days + 1)
+        ]
+
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "points": points,
+        "points_by_currency": {
+            k: v for k, v in points_by_currency.items()
+        },
+    }
 
 
 def recent_expenses(
@@ -245,7 +374,10 @@ def recent_expenses(
             Category.name,
         )
         .join(Category, Category.id == Expense.category_id)
-        .where(Expense.telegram_user_id == user_id)
+        .where(
+            Expense.telegram_user_id == user_id,
+            _NOT_DELETED,
+        )
         .order_by(Expense.expense_date.desc(), Expense.id.desc())
         .limit(limit)
     )
@@ -258,13 +390,62 @@ def recent_expenses(
         {
             "id": rid,
             "name": name,
-            "amount": float(amount),
+            "amount": _money(amount),
             "currency": currency,
             "category": cat_name,
             "date": d.isoformat(),
         }
         for rid, name, amount, currency, d, cat_name in rows
     ]
+
+
+def period_total_by_currency(
+    session: Session,
+    user_id: int,
+    *,
+    start: date,
+    end: date,
+) -> dict[str, Decimal]:
+    """Financial total for the period grouped by currency.
+
+    Independent of the ``limit`` used by ``recent_expenses`` — this is
+    the fix for the audit-found bug where the dashboard's ``total`` was
+    just ``sum(items.amount)`` and changed as the user scrolled.
+    """
+    rows = session.execute(
+        select(
+            Expense.currency, func.coalesce(func.sum(Expense.amount), 0)
+        )
+        .where(
+            Expense.telegram_user_id == user_id,
+            Expense.expense_date >= start,
+            Expense.expense_date <= end,
+            _NOT_DELETED,
+        )
+        .group_by(Expense.currency)
+    ).all()
+    return {cur or "ARS": Decimal(total or 0) for cur, total in rows}
+
+
+def period_count(
+    session: Session,
+    user_id: int,
+    *,
+    start: date,
+    end: date,
+) -> int:
+    """Number of expenses (any currency) in the period.
+
+    Used by ``/api/expenses`` so the ``count`` field reflects the full
+    set, not the paginated page.
+    """
+    stmt = select(func.count(Expense.id)).where(
+        Expense.telegram_user_id == user_id,
+        Expense.expense_date >= start,
+        Expense.expense_date <= end,
+        _NOT_DELETED,
+    )
+    return int(session.execute(stmt).scalar_one() or 0)
 
 
 def budget_status(
@@ -294,12 +475,11 @@ def budget_status(
                 Expense.expense_date >= window.start,
                 Expense.expense_date <= window.end,
                 Expense.currency == b.currency,
+                _NOT_DELETED,
             )
         ).all()
         spent = sum((Decimal(a or 0) for (a,) in total_row), Decimal("0"))
         limit_d = Decimal(b.monthly_limit)
-        # For month-ish periods, use the budget limit as-is. For shorter
-        # or longer periods, scale linearly so the bar makes sense.
         if is_month_period:
             effective_limit = limit_d
         else:
@@ -318,9 +498,9 @@ def budget_status(
             {
                 "id": b.id,
                 "category": cat_name,
-                "limit": float(limit_d),
-                "effective_limit": float(effective_limit),
-                "spent": float(spent),
+                "limit": _money(limit_d),
+                "effective_limit": _money(effective_limit),
+                "spent": _money(spent),
                 "currency": b.currency,
                 "percent": round(percent, 1),
                 "level": level,
@@ -336,60 +516,121 @@ def comparison(
     current: PeriodWindow,
     previous: PeriodWindow,
 ) -> dict:
-    """Side-by-side totals between two windows."""
-    def _by_cat(window: PeriodWindow) -> dict[str, Decimal]:
+    """Side-by-side totals between two windows.
+
+    Currency correctness: ``by_category`` and the legacy
+    ``current.total`` / ``previous.total`` scalars are only emitted when
+    a single currency is present. With multiple currencies the legacy
+    fields are ``null`` and the per-currency counterparts carry the
+    data.
+    """
+    def _by_cat_per_currency(
+        window: PeriodWindow,
+    ) -> dict[str, dict[str, Decimal]]:
         rows = session.execute(
-            select(Category.name, Expense.amount)
+            select(Category.name, Expense.currency, Expense.amount)
             .join(Category, Category.id == Expense.category_id)
             .where(
                 Expense.telegram_user_id == user_id,
                 Expense.expense_date >= window.start,
                 Expense.expense_date <= window.end,
+                _NOT_DELETED,
             )
         ).all()
-        out: dict[str, Decimal] = {}
-        for name, amount in rows:
-            out[name] = out.get(name, Decimal("0")) + Decimal(amount or 0)
-        return out
+        cat_per_cur: dict[str, dict[str, Decimal]] = {}
+        totals: dict[str, Decimal] = {}
+        for name, currency, amount in rows:
+            cur = currency or "ARS"
+            cat_per_cur.setdefault(name, {})
+            cat_per_cur[name][cur] = cat_per_cur[name].get(
+                cur, Decimal("0")
+            ) + Decimal(amount or 0)
+            totals[cur] = totals.get(cur, Decimal("0")) + Decimal(
+                amount or 0
+            )
+        return cat_per_cur, totals
 
-    cur = _by_cat(current)
-    prev = _by_cat(previous)
-    cur_total = sum(cur.values(), Decimal("0"))
-    prev_total = sum(prev.values(), Decimal("0"))
+    cur_cat, cur_totals = _by_cat_per_currency(current)
+    prev_cat, prev_totals = _by_cat_per_currency(previous)
+
+    all_currencies = set(cur_totals) | set(prev_totals)
+
+    # Per-currency diff for each category present in either window.
+    by_category_by_currency: dict[str, list[dict]] = {}
+    for cur in all_currencies:
+        rows: list[dict] = []
+        all_cats = {
+            name
+            for name, per in cur_cat.items()
+            if per.get(cur)
+        } | {
+            name
+            for name, per in prev_cat.items()
+            if per.get(cur)
+        }
+        for cat in sorted(
+            all_cats,
+            key=lambda c: -cur_cat.get(c, {}).get(cur, Decimal("0")),
+        ):
+            c_amt = cur_cat.get(cat, {}).get(cur, Decimal("0"))
+            p_amt = prev_cat.get(cat, {}).get(cur, Decimal("0"))
+            d_pct: float | None
+            if p_amt > 0:
+                d_pct = float((c_amt - p_amt) / p_amt * 100)
+            else:
+                d_pct = None
+            rows.append(
+                {
+                    "category": cat,
+                    "current": _money(c_amt),
+                    "previous": _money(p_amt),
+                    "diff_pct": round(d_pct, 1) if d_pct is not None else None,
+                }
+            )
+        by_category_by_currency[cur] = rows
+
+    # Aggregate per-currency totals.
+    cur_total = sum(cur_totals.values(), Decimal("0"))
+    prev_total = sum(prev_totals.values(), Decimal("0"))
     delta_pct: float | None
     if prev_total > 0:
         delta_pct = float((cur_total - prev_total) / prev_total * 100)
     else:
         delta_pct = None
 
-    rows = []
-    all_cats = set(cur) | set(prev)
-    for cat in sorted(all_cats, key=lambda c: -(cur.get(c, Decimal("0")))):
-        c_amt = cur.get(cat, Decimal("0"))
-        p_amt = prev.get(cat, Decimal("0"))
-        if p_amt > 0:
-            d_pct = float((c_amt - p_amt) / p_amt * 100)
-        else:
-            d_pct = None
-        rows.append(
-            {
-                "category": cat,
-                "current": float(c_amt),
-                "previous": float(p_amt),
-                "diff_pct": round(d_pct, 1) if d_pct is not None else None,
-            }
-        )
+    single_cur_total_cur = _scalar_for_single_currency(cur_totals)
+    single_cur_total_prev = _scalar_for_single_currency(prev_totals)
+
     return {
         "current": {
             "label": current.label,
-            "total": float(cur_total),
+            "total": (
+                _money(single_cur_total_cur)
+                if single_cur_total_cur is not None
+                else None
+            ),
         },
         "previous": {
             "label": previous.label,
-            "total": float(prev_total),
+            "total": (
+                _money(single_cur_total_prev)
+                if single_cur_total_prev is not None
+                else None
+            ),
         },
         "delta_pct": round(delta_pct, 1) if delta_pct is not None else None,
-        "by_category": rows,
+        "current_total_by_currency": {
+            k: _money(v) for k, v in cur_totals.items()
+        },
+        "previous_total_by_currency": {
+            k: _money(v) for k, v in prev_totals.items()
+        },
+        "by_category": (
+            by_category_by_currency[next(iter(cur_totals))]
+            if single_cur_total_cur is not None
+            else None
+        ),
+        "by_category_by_currency": by_category_by_currency,
     }
 
 
@@ -399,47 +640,94 @@ def projection(
     window: PeriodWindow,
     previous: PeriodWindow,
 ) -> dict:
-    """Linear projection of month-end spending vs prior period total."""
+    """Linear projection of month-end spending vs prior period total.
+
+    Multi-currency safe: spent / projected / previous totals are
+    per-currency maps; the legacy scalars are only emitted when one
+    currency is present.
+    """
     rows = session.execute(
-        select(Expense.amount)
+        select(Expense.currency, Expense.amount)
         .where(
             Expense.telegram_user_id == user_id,
             Expense.expense_date >= window.start,
             Expense.expense_date <= window.end,
+            _NOT_DELETED,
         )
     ).all()
-    spent = sum((Decimal(a or 0) for (a,) in rows), Decimal("0"))
+    spent_by_currency: dict[str, Decimal] = {}
+    for currency, amount in rows:
+        cur = currency or "ARS"
+        spent_by_currency[cur] = spent_by_currency.get(
+            cur, Decimal("0")
+        ) + Decimal(amount or 0)
+
     if window.days_elapsed <= 0 or window.days_in_period <= 0:
-        projected = spent
+        projected_by_currency = dict(spent_by_currency)
     else:
-        projected = spent * Decimal(window.days_in_period) / Decimal(
-            window.days_elapsed
-        )
+        factor = Decimal(window.days_in_period) / Decimal(window.days_elapsed)
+        projected_by_currency = {
+            cur: (amt * factor) for cur, amt in spent_by_currency.items()
+        }
 
     prev_rows = session.execute(
-        select(Expense.amount)
+        select(Expense.currency, Expense.amount)
         .where(
             Expense.telegram_user_id == user_id,
             Expense.expense_date >= previous.start,
             Expense.expense_date <= previous.end,
+            _NOT_DELETED,
         )
     ).all()
-    prev_total = sum(
-        (Decimal(a or 0) for (a,) in prev_rows), Decimal("0")
-    )
-    if prev_total > 0:
-        delta_vs_prev = float((projected - prev_total) / prev_total * 100)
-    else:
-        delta_vs_prev = None
+    previous_total_by_currency: dict[str, Decimal] = {}
+    for currency, amount in prev_rows:
+        cur = currency or "ARS"
+        previous_total_by_currency[cur] = previous_total_by_currency.get(
+            cur, Decimal("0")
+        ) + Decimal(amount or 0)
+
+    # delta vs prev per currency (and a flat fallback when single cur).
+    delta_by_currency: dict[str, float | None] = {}
+    for cur in set(projected_by_currency) | set(previous_total_by_currency):
+        proj = projected_by_currency.get(cur, Decimal("0"))
+        prev = previous_total_by_currency.get(cur, Decimal("0"))
+        if prev > 0:
+            delta_by_currency[cur] = float((proj - prev) / prev * 100)
+        else:
+            delta_by_currency[cur] = None
+
+    single_spent = _scalar_for_single_currency(spent_by_currency)
+    single_projected = _scalar_for_single_currency(projected_by_currency)
+    single_prev = _scalar_for_single_currency(previous_total_by_currency)
+
     return {
-        "spent": float(spent),
-        "projected_total": float(projected),
+        "spent": _money(single_spent) if single_spent is not None else None,
+        "projected_total": (
+            _money(single_projected) if single_projected is not None else None
+        ),
         "days_elapsed": window.days_elapsed,
         "days_in_period": window.days_in_period,
-        "previous_total": float(prev_total),
-        "delta_vs_previous_pct": (
-            round(delta_vs_prev, 1) if delta_vs_prev is not None else None
+        "previous_total": (
+            _money(single_prev) if single_prev is not None else None
         ),
+        "delta_vs_previous_pct": (
+            delta_by_currency[next(iter(spent_by_currency))]
+            if single_spent is not None and spent_by_currency
+            else None
+        ),
+        "spent_by_currency": {
+            k: _money(v) for k, v in spent_by_currency.items()
+        },
+        "projected_total_by_currency": {
+            k: _money(v) for k, v in projected_by_currency.items()
+        },
+        "previous_total_by_currency": {
+            k: _money(v) for k, v in previous_total_by_currency.items()
+        },
+        "delta_vs_previous_pct_by_currency": {
+            k: (round(v, 1) if v is not None else None)
+            for k, v in delta_by_currency.items()
+        },
     }
 
 

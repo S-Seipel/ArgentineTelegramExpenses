@@ -3,16 +3,35 @@
 Combines the template (``FixedExpense``) with the monthly payment record
 (``FixedExpensePayment``) to produce a single view object per bill per
 month, suitable for rendering in chat or the dashboard.
+
+Phase 0 of the project (correctness foundation) tightens the persistence
+model here:
+
+- ``mark_paid`` runs as a single transaction guarded by ``SELECT ... FOR
+  UPDATE`` on the template row, with a partial unique key
+  ``(fixed_id, month_year)`` and a stable ``source_key`` on the linked
+  ``expenses`` row as second defense against duplicates.
+- ``unmark`` and ``mark_skipped`` soft-delete the linked expense
+  (``deleted_at IS NOT NULL``) instead of removing it; the payment row
+  keeps ``expense_id`` so the historical link survives.
+- A re-``mark_paid`` after an unpay restores the previous mirror via the
+  ``source_key`` lookup rather than creating a new row.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date as _date
+from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
+from typing import Iterable, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.categories.models import Category
+from app.expenses.models import Expense
+from app.expenses.repository import ExpenseRepository
+from app.expenses.service import ExpenseDraft, ExpenseService
 from app.fixed_expenses.models import FixedExpense, FixedExpensePayment, MonthlyBudget
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.schemas import (
@@ -20,6 +39,7 @@ from app.fixed_expenses.schemas import (
     FixedExpenseWithStatus,
     MonthlyBudgetOut,
 )
+from app.utils.now import business_now, business_today
 
 
 class FixedExpenseValidationError(ValueError):
@@ -46,32 +66,67 @@ class FixedExpenseDraft:
     confidence: float = 1.0
 
 
-def current_month_year(today=None) -> str:
-    """Return 'YYYY-MM' for the given (or current) date."""
-    from datetime import date as _date
-    if today is None:
-        today = _date.today()
-    return f"{today.year:04d}-{today.month:02d}"
+def current_month_year(today: _date | None = None) -> str:
+    """Return 'YYYY-MM' for the given (or current) business date."""
+    d = today or business_today()
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def fixed_payment_source_key(fixed_id: int, month_year: str) -> str:
+    """Stable identity of the expense mirror for a (bill, month) occurrence."""
+    return f"fixed-payment:{fixed_id}:{month_year}"
 
 
 def _resolve_category_id(
     session: Session, name: str | None
 ) -> int | None:
+    """Resolve a category NAME for a ``FixedExpense`` template.
+
+    Categories are stored as a tree; identity is ``(parent_id, name)``.
+    A naive ``WHERE name = ?`` returns multiple rows when the same name
+    appears under different parents (the canonical ``Café`` lives
+    under ``Comida`` and the seed tree maps ``Café`` to that parent).
+    The hierarchy-aware picker below is the same one
+    ``ExpenseService._pick_category_id`` uses — we keep a tiny local
+    copy here so the fixed-expense flow stays independent of the
+    expenses module.
+    """
     if not name:
         return None
-    row = (
+    from app.categories.categories import get_parent_of
+
+    candidates = (
         session.query(Category)
         .filter(Category.name == name.strip())
-        .one_or_none()
+        .all()
     )
-    if row is not None:
-        return row.id
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0].id
+    parent_name = get_parent_of(name.strip())
+    if parent_name is None:
+        return None
+    parent_row = (
+        session.query(Category)
+        .filter(Category.name == parent_name)
+        .first()
+    )
+    if parent_row is None:
+        return None
+    for cand in candidates:
+        if cand.parent_id == parent_row.id:
+            return cand.id
     return None
 
 
 class FixedExpenseService:
     def __init__(self, repo: FixedExpenseRepository) -> None:
         self.repo = repo
+
+    # ------------------------------------------------------------------
+    # template CRUD
+    # ------------------------------------------------------------------
 
     def add(self, user_id: int, draft: FixedExpenseDraft) -> FixedExpense:
         if not draft.name or not draft.name.strip():
@@ -123,6 +178,10 @@ class FixedExpenseService:
             return None
         return self.repo.set_active(obj, is_active)
 
+    # ------------------------------------------------------------------
+    # payments (atomic, source-keyed)
+    # ------------------------------------------------------------------
+
     def mark_paid(
         self,
         user_id: int,
@@ -130,53 +189,86 @@ class FixedExpenseService:
         month_year: str,
         actual_amount: Decimal | None = None,
         note: str | None = None,
-        paid_on: "date | None" = None,
-    ) -> tuple[FixedExpense | None, FixedExpensePayment | None]:
-        """Mark a fixed expense as paid for the given month.
+        paid_on: Optional[_date] = None,
+    ) -> tuple[Optional[FixedExpense], Optional[FixedExpensePayment]]:
+        """Mark a fixed expense as paid for the given month, atomically.
 
-        Also creates or updates a real ``expenses`` row so the
-        dashboard's totals (which read from ``expenses``) stay in sync
-        with the user's checkmarks.
+        Single transaction:
+
+        1. ``SELECT ... FOR UPDATE`` on the ``fixed_expenses`` row so a
+           concurrent caller waits on the same template.
+        2. Lock / create the matching ``fixed_expense_payments`` row. The
+           ``uq_payment_per_month`` unique constraint is the ultimate DB
+           defense if two sessions bypass the lock (e.g. direct SQL).
+        3. Resolve the linked expense by ``source_key`` (this is the
+           *second* defense — even if the payment row is somehow
+           recreated, the source key keeps the linked expense unique).
+           Restore the row if it had been soft-deleted.
+        4. Persist payment fields and return.
+
+        No intermediate commits: the caller (``session_scope`` or the
+        FastAPI handler) decides when to commit.
         """
-        from datetime import date as _date
-        obj = self.repo.get_by_id(user_id, fixed_id)
+        obj = self.repo.get_by_id_for_update(user_id, fixed_id)
         if obj is None:
             return None, None
 
-        amount = actual_amount if actual_amount is not None else obj.expected_amount
-        paid_on_date = paid_on or _date.today()
-
-        # Look up existing payment for this (fixed, month) pair.
-        existing_payment = self.repo.get_payment(fixed_id, month_year)
-        existing_expense_id = (
-            existing_payment.expense_id if existing_payment else None
+        amount = (
+            actual_amount if actual_amount is not None else obj.expected_amount
         )
+        paid_on_date = paid_on or business_today()
+        source_key = fixed_payment_source_key(obj.id, month_year)
 
-        # Create or update the real expense row.
-        expense_id = _upsert_expense_for_payment(
-            session=self.repo.session,
+        payment = self.repo.get_payment_for_update(fixed_id, month_year)
+        if payment is None:
+            payment = FixedExpensePayment(
+                fixed_expense_id=fixed_id,
+                month_year=month_year,
+                skipped=False,
+            )
+            self.repo.session.add(payment)
+            try:
+                self.repo.session.flush()
+            except IntegrityError:
+                # Lost the race against another session that committed
+                # a payment for the same ``(fixed_expense_id, month_year)``
+                # before us. The DB still has an open transaction in a
+                # failed state — ``session.rollback()`` clears it so we
+                # can re-query without ``InvalidRequestError``.
+                self.repo.session.rollback()
+                # Refetch the row that won, with the lock still held
+                # by the original transaction (which is now empty).
+                # The outer ``session_scope`` (or test commit) will
+                # commit our mutations at the end.
+                payment = self.repo.get_payment_for_update(
+                    fixed_id, month_year
+                )
+                if payment is None:
+                    # Defensive: another session rolled back between
+                    # the IntegrityError and our refetch. Surface the
+                    # original error rather than guessing.
+                    raise
+
+        expense = self._resolve_or_create_expense(
             user_id=user_id,
             amount=amount,
             currency=obj.currency,
             name=obj.name,
             category_id=obj.category_id,
             paid_on=paid_on_date,
-            existing_expense_id=existing_expense_id,
+            source_key=source_key,
             original_message=(
                 f"[gastofijo #{obj.id}] {obj.name} "
                 f"({obj.payment_method or 's/método'})"
             ),
         )
 
-        payment = self.repo.upsert_payment(
-            fixed_id,
-            month_year,
-            paid_at=datetime_now(),
-            actual_amount=actual_amount,
-            note=note,
-            skipped=False,
-            expense_id=expense_id,
-        )
+        payment.paid_at = business_now()
+        payment.actual_amount = actual_amount
+        payment.note = note
+        payment.skipped = False
+        payment.expense_id = expense.id
+
         return obj, payment
 
     def mark_skipped(
@@ -184,25 +276,38 @@ class FixedExpenseService:
         user_id: int,
         fixed_id: int,
         month_year: str,
-    ) -> tuple[FixedExpense | None, FixedExpensePayment | None]:
-        """Mark as skipped: no payment, no expense. Pure status flag."""
-        obj = self.repo.get_by_id(user_id, fixed_id)
+    ) -> tuple[Optional[FixedExpense], Optional[FixedExpensePayment]]:
+        """Mark the occurrence as skipped: status flag only.
+
+        If a previous ``mark_paid`` had produced an expense mirror, it is
+        soft-deleted so it stops counting. The ``expense_id`` link is kept
+        so a later re-``mark_paid`` can find and restore the original row
+        by ``source_key`` (and via the FK).
+        """
+        obj = self.repo.get_by_id_for_update(user_id, fixed_id)
         if obj is None:
             return None, None
-        # Remove a previously-linked expense if any (so the dashboard
-        # doesn't count a skipped bill).
-        existing = self.repo.get_payment(fixed_id, month_year)
-        if existing and existing.expense_id:
-            _delete_expense(self.repo.session, existing.expense_id)
-        payment = self.repo.upsert_payment(
-            fixed_id,
-            month_year,
-            paid_at=None,
-            actual_amount=None,
-            note=None,
-            skipped=True,
-            expense_id=None,
-        )
+
+        payment = self.repo.get_payment_for_update(fixed_id, month_year)
+        if payment is None:
+            payment = FixedExpensePayment(
+                fixed_expense_id=fixed_id,
+                month_year=month_year,
+                skipped=True,
+            )
+            self.repo.session.add(payment)
+            self.repo.session.flush()
+
+        # Soft-delete any mirror that an earlier pay produced.
+        if payment.expense_id:
+            self._soft_delete_expense(user_id, payment.expense_id)
+
+        payment.paid_at = None
+        payment.actual_amount = None
+        payment.note = None
+        payment.skipped = True
+        # Keep payment.expense_id so the historical link survives.
+
         return obj, payment
 
     def unmark(
@@ -211,19 +316,114 @@ class FixedExpenseService:
         fixed_id: int,
         month_year: str,
     ) -> bool:
-        """Undo a previous mark. Also removes the linked expense."""
-        obj = self.repo.get_by_id(user_id, fixed_id)
+        """Revert a previous ``mark_paid`` while keeping the audit trail.
+
+        The payment row is updated to the pending state (paid_at=None,
+        actual_amount=None, skipped=False) and its mirror expense is
+        soft-deleted. ``expense_id`` is preserved on the payment row so a
+        future re-``mark_paid`` can recover the mirror via the
+        ``source_key`` second-defense lookup.
+        """
+        obj = self.repo.get_by_id_for_update(user_id, fixed_id)
         if obj is None:
             return False
-        existing = self.repo.get_payment(fixed_id, month_year)
-        if existing and existing.expense_id:
-            _delete_expense(self.repo.session, existing.expense_id)
-        return self.repo.delete_payment(fixed_id, month_year)
+
+        payment = self.repo.get_payment_for_update(fixed_id, month_year)
+        if payment is None:
+            return False
+
+        if payment.expense_id:
+            self._soft_delete_expense(user_id, payment.expense_id)
+
+        payment.paid_at = None
+        payment.actual_amount = None
+        payment.note = None
+        payment.skipped = False
+        # payment.expense_id is preserved on purpose: see docstring.
+
+        return True
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
 
     def find_by_name(
         self, user_id: int, name: str
     ) -> FixedExpense | None:
         return self.repo.get_by_name(user_id, name)
+
+    def _resolve_or_create_expense(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal,
+        currency: str,
+        name: str,
+        category_id: Optional[int],
+        paid_on: _date,
+        source_key: str,
+        original_message: str,
+    ) -> Expense:
+        """Find the mirror expense by source_key (including soft-deleted)
+        or create a new one. Idempotent under concurrency: the unique
+        partial index on ``(telegram_user_id, source_key)`` keeps a single
+        row per occurrence."""
+        expense_repo = ExpenseRepository(self.repo.session)
+        existing = expense_repo.get_by_source_key(
+            user_id, source_key, include_deleted=True
+        )
+        if existing is not None:
+            existing.amount = amount
+            existing.currency = currency
+            existing.expense_date = paid_on
+            if category_id is not None:
+                existing.category_id = category_id
+            existing.deleted_at = None
+            existing.source_type = "fixed_payment"
+            existing.revision = (existing.revision or 1) + 1
+            self.repo.session.flush()
+            return existing
+
+        category_name = _resolve_category_name(self.repo.session, category_id)
+        draft = ExpenseDraft(
+            name=name[:255],
+            amount=amount,
+            currency=currency,
+            category=category_name,
+            expense_date=paid_on,
+            confidence=Decimal("1"),
+        )
+        service = ExpenseService(expense_repo)
+        # ``commit=False``: the mark_paid flow is a single transaction.
+        # Letting the inner ``register_many`` commit would let the new
+        # payment row leak out even if a later step raises, defeating
+        # the atomicity guarantee.
+        outcome = service.register_many(
+            user_id=user_id,
+            drafts=[draft],
+            original_message=original_message,
+            source_type="fixed_payment",
+            source_key=source_key,
+            commit=False,
+        )
+        if not outcome.saved:
+            raise RuntimeError(
+                "Failed to create linked expense for fixed payment"
+            )
+        # Stamp source_type / source_key because ExpenseService writes
+        # the row before knowing the caller's intent.
+        row = outcome.saved[0]
+        row.source_type = "fixed_payment"
+        row.source_key = source_key
+        row.revision = 1
+        self.repo.session.flush()
+        return row
+
+    def _soft_delete_expense(
+        self, user_id: int, expense_id: int
+    ) -> None:
+        expense_repo = ExpenseRepository(self.repo.session)
+        expense_repo.soft_delete(user_id, expense_id)
 
     def with_status_for_month(
         self,
@@ -306,93 +506,19 @@ class FixedExpenseService:
         )
 
 
-def datetime_now():
-    from datetime import datetime
-    return datetime.utcnow()
-
-
 # ---------------------------------------------------------------------------
-# Helpers: keep the real ``expenses`` table in sync with fixed payments.
+# private helpers
 # ---------------------------------------------------------------------------
 
-def _upsert_expense_for_payment(
-    *,
-    session,
-    user_id: int,
-    amount: Decimal,
-    currency: str,
-    name: str,
-    category_id: int | None,
-    paid_on: "date",
-    existing_expense_id: int | None,
-    original_message: str,
-) -> int:
-    """Create or update the real ``expenses`` row for a fixed payment.
 
-    Returns the ``expenses.id`` of the row.
-    """
-    from datetime import datetime as _dt
-    from app.expenses.models import Expense
-    from app.expenses.service import ExpenseService
-    from app.expenses.repository import ExpenseRepository
-
-    if existing_expense_id is not None:
-        existing = (
-            session.query(Expense)
-            .filter(Expense.id == existing_expense_id)
-            .one_or_none()
-        )
-        if existing is not None:
-            existing.amount = amount
-            existing.currency = currency
-            existing.expense_date = paid_on
-            if category_id is not None:
-                existing.category_id = category_id
-            session.commit()
-            session.refresh(existing)
-            return existing.id
-
-    # Create new.
-    expense_repo = ExpenseRepository(session)
-    expense_service = ExpenseService(expense_repo)
-    from app.expenses.service import ExpenseDraft
-    draft = ExpenseDraft(
-        name=name[:255],
-        amount=amount,
-        currency=currency,
-        category=_resolve_category_name(session, category_id),
-        expense_date=paid_on,
-        confidence=Decimal("1"),
-    )
-    outcome = expense_service.register_many(
-        user_id=user_id,
-        drafts=[draft],
-        original_message=original_message,
-    )
-    if outcome.saved:
-        return outcome.saved[0].id
-    raise RuntimeError("Failed to create linked expense for fixed payment")
-
-
-def _delete_expense(session, expense_id: int) -> None:
-    from app.expenses.models import Expense
-
-    row = (
-        session.query(Expense).filter(Expense.id == expense_id).one_or_none()
-    )
-    if row is None:
-        return
-    session.delete(row)
-    session.commit()
-
-
-def _resolve_category_name(session, category_id: int | None) -> str:
+def _resolve_category_name(session: Session, category_id: int | None) -> str:
     """Reverse-resolve a category_id back to a name for ExpenseDraft."""
     if category_id is None:
         return "Otros"
-    from app.categories.models import Category
     row = (
-        session.query(Category).filter(Category.id == category_id).one_or_none()
+        session.query(Category)
+        .filter(Category.id == category_id)
+        .one_or_none()
     )
     if row is None:
         return "Otros"

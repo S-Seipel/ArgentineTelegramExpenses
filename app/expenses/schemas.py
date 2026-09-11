@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Optional
 
 
 @dataclass
@@ -15,6 +16,11 @@ class ExpenseCreate:
     expense_date: date
     original_message: str
     ai_confidence: Decimal
+    source_type: str = "telegram"
+    source_key: Optional[str] = None
+    telegram_chat_id: Optional[int] = None
+    telegram_message_id: Optional[int] = None
+    revision: int = 1
 
 
 @dataclass
@@ -29,6 +35,10 @@ class ExpenseSummary:
     ai_confidence: Decimal
     created_at: datetime
     original_message: str = ""
+    source_type: str = "legacy"
+    source_key: Optional[str] = None
+    deleted_at: Optional[datetime] = None
+    revision: int = 1
 
 
 class ExpenseOut:

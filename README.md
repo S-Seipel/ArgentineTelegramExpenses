@@ -320,7 +320,31 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-Los tests **no necesitan Ollama corriendo** ni PostgreSQL: usan SQLite en memoria y un `StubAIService` que devuelve respuestas guionadas.
+Los tests **no necesitan Ollama corriendo** ni PostgreSQL: usan SQLite en memoria y un `StubAIService` que devuelve respuestas guionadas. La suite actual corre 344 tests en segundos.
+
+### Suite de integración contra PostgreSQL real
+
+Hay además `tests_postgres/`, una suite separada y opt-in que necesita
+una base PostgreSQL real para verificar lo que SQLite no puede probar:
+
+- la migración Alembic desde cero y su downgrade + re-upgrade (con la
+  ausencia de server default sobre `source_type`);
+- el índice único parcial sobre `(telegram_user_id, source_key)`;
+- la semántica de `SELECT FOR UPDATE` y la concurrencia de `mark_paid`
+  entre dos transacciones;
+- el comportamiento de las claves foráneas;
+- precisión numérica / Decimal;
+- la resolución de categorías cuando existen duplicados jerárquicos.
+
+```bash
+TGE_PG_INTEGRATION=1 \
+DATABASE_URL=postgresql+psycopg://expenses:expenses@localhost:5432/expenses \
+.venv/bin/pytest tests_postgres -q
+```
+
+La CI tiene un job dedicado (`.github/workflows/ci-postgres.yml`) que
+lo corre contra un service container de `postgres:15-alpine`. La suite
+tiene 11 tests y tarda ~6 segundos.
 
 ---
 

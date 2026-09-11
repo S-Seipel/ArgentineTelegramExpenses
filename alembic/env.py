@@ -9,6 +9,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config.settings import get_settings
 from app.database.database import Base
+from app.models_registry import register_all_models
 
 config = context.config
 
@@ -18,6 +19,11 @@ if config.config_file_name is not None:
 settings = get_settings()
 config.set_main_option("sqlalchemy.url", settings.database_url)
 
+# Make sure every mapped class is attached to ``Base.metadata`` before
+# Alembic reads target_metadata — otherwise autogenerate (and any
+# hand-written migration that introspects the schema) would silently miss
+# tables.
+register_all_models()
 target_metadata = Base.metadata
 
 

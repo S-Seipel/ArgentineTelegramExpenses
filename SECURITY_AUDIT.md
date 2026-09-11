@@ -83,4 +83,7 @@ are ignored by git. No remote is configured yet.
    `node_modules`.
 4. `pip-audit` → "No known vulnerabilities found".
 5. `.venv/` and `__pycache__/` are not staged (covered by `.gitignore`).
-6. Run the test suite: `.venv/bin/pytest` → 185 passed.
+6. Run the test suite: `.venv/bin/pytest` → 344 unit tests + the
+   opt-in PostgreSQL integration suite in `tests_postgres/`
+   (11 tests against a real Postgres, gated by
+   `TGE_PG_INTEGRATION=1`).

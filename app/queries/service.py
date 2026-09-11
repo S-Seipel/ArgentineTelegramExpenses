@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-from app.config.settings import get_settings
 from app.expenses.repository import ExpenseRepository
 from app.queries.intents import (
     CategoryDiff,
@@ -16,6 +13,7 @@ from app.queries.intents import (
     QueryResult,
     QuerySpec,
 )
+from app.utils.now import business_today
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +36,7 @@ class QueryService:
         self.repo = repo
 
     def today(self) -> date:
-        return self._today_in_tz()
+        return business_today()
 
     def run(self, user_id: int, spec: QuerySpec) -> QueryResult:
         period = self._resolve_period(spec)
@@ -94,11 +92,12 @@ class QueryService:
             )
 
         if spec.kind == "category_breakdown":
-            category_totals = self.repo.sum_by_category(
+            # Currency-safe: returns {category: {currency: total}} so the
+            # caller can render per-currency without mixing currencies.
+            category_totals = self.repo.sum_by_category_per_currency(
                 user_id,
                 start=period.start,
                 end=period.end,
-                currency=spec.currency,
             )
             return QueryResult(
                 total_by_currency={},
@@ -241,45 +240,63 @@ class QueryService:
     def _compute_total(
         self, user_id: int, spec: QuerySpec, period: _Range
     ) -> dict[str, Decimal]:
-        category_name = spec.category
-        category_id = None
-        if category_name is not None:
+        # Resolve category name → id once, used by every branch.
+        category_id: int | None = None
+        if spec.category is not None:
             from app.categories.models import Category
 
             row = (
                 self.repo.session.query(Category)
-                .filter(Category.name == category_name)
+                .filter(Category.name == spec.category)
                 .one_or_none()
             )
             if row is not None:
                 category_id = row.id
 
-        if (category_name is not None or category_id is not None) and (
-            period.start is None and period.end is None
-        ):
-            amount = self.repo.sum_total(
-                user_id,
-                start=None,
-                end=None,
-                category_id=category_id,
-                category_name=None if category_id is not None else category_name,
-            )
-            return {spec.currency or "ARS": Decimal(amount)}
+        has_period = period.start is not None or period.end is not None
+        has_category = category_id is not None
 
-        if period.start is None and period.end is None:
-            amount = self.repo.sum_total(
+        # Period + category present: must apply BOTH filters AND group by
+        # currency. The previous implementation forgot to apply the
+        # category filter whenever a period was supplied, so category
+        # totals silently drifted to "all categories, this period".
+        if has_period and has_category:
+            return self._sum_by_period_and_category(
                 user_id,
+                spec=spec,
+                period=period,
                 category_id=category_id,
-                category_name=None if category_id is not None else category_name,
             )
-            return {spec.currency or "ARS": Decimal(amount)}
+        if has_period:
+            return {
+                currency: Decimal(total)
+                for currency, total in self.repo.sum_by_period(
+                    user_id, period.start, period.end
+                ).items()
+            }
+        # No period: sum_total across all history (optionally filtered by
+        # category) and group by currency.
+        if has_category:
+            return self.repo.sum_by_period_for_category(
+                user_id, category_id=category_id
+            )
+        return self.repo.sum_by_period(user_id, None, None)
 
-        return {
-            currency: Decimal(total)
-            for currency, total in self.repo.sum_by_period(
-                user_id, period.start, period.end
-            ).items()
-        }
+    def _sum_by_period_and_category(
+        self,
+        user_id: int,
+        *,
+        spec: QuerySpec,
+        period: _Range,
+        category_id: int,
+    ) -> dict[str, Decimal]:
+        return self.repo.sum_by_period_and_category(
+            user_id,
+            start=period.start,
+            end=period.end,
+            category_id=category_id,
+            currency=spec.currency,
+        )
 
     def _resolve_period(self, spec: QuerySpec) -> _Range:
         today = self.today()
@@ -311,12 +328,3 @@ class QueryService:
         if spec.currency and spec.currency.upper() != "ARS":
             bits.append(f"moneda: {spec.currency}")
         return ", ".join(bits)
-
-    def _today_in_tz(self) -> date:
-        tz_name = get_settings().timezone
-        try:
-            tz = ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError:
-            logger.warning("Unknown timezone %s, falling back to UTC", tz_name)
-            tz = ZoneInfo("UTC")
-        return datetime.now(tz).date()

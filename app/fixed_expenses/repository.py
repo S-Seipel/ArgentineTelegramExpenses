@@ -60,9 +60,40 @@ class FixedExpenseRepository:
     def get_by_id_for_update(
         self, user_id: int, fixed_id: int
     ) -> FixedExpense | None:
-        stmt = select(FixedExpense).where(
-            FixedExpense.telegram_user_id == user_id,
-            FixedExpense.id == fixed_id,
+        """Lock the template row for the rest of the transaction.
+
+        Postgres issues a real ``SELECT ... FOR UPDATE``; SQLite silently
+        ignores the clause (it serializes writes anyway), which is enough
+        for unit tests. The lock is released when the surrounding
+        transaction commits or rolls back.
+        """
+        stmt = (
+            select(FixedExpense)
+            .where(
+                FixedExpense.telegram_user_id == user_id,
+                FixedExpense.id == fixed_id,
+            )
+            # The ``FixedExpense.category`` relationship is
+            # ``lazy="joined"``, which would make SQLAlchemy emit a
+            # LEFT OUTER JOIN. Postgres rejects ``FOR UPDATE`` on the
+            # nullable side of an outer join, so we lock only the
+            # ``fixed_expenses`` columns we actually care about.
+            .with_for_update(of=FixedExpense)
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def get_payment_for_update(
+        self, fixed_id: int, month_year: str
+    ) -> FixedExpensePayment | None:
+        """Lock the per-month payment row. Same caveat as
+        ``get_by_id_for_update`` for SQLite."""
+        stmt = (
+            select(FixedExpensePayment)
+            .where(
+                FixedExpensePayment.fixed_expense_id == fixed_id,
+                FixedExpensePayment.month_year == month_year,
+            )
+            .with_for_update(of=FixedExpensePayment)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
