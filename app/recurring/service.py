@@ -72,6 +72,10 @@ def postpone_due_date(current: date) -> date:
     return current + timedelta(days=1)
 
 
+def recurring_occurrence_source_key(recurring_id: int, occurrence_date: date) -> str:
+    return f"recurring:{recurring_id}:{occurrence_date.isoformat()}"
+
+
 def first_occurrence(
     today: date, frequency: str, day_of_month: int, month_of_year: int | None
 ) -> date:
@@ -180,25 +184,32 @@ class RecurringService:
         return self.repo.get_by_id(user_id, recurring_id)
 
     def set_active(
-        self, user_id: int, recurring_id: int, is_active: bool
+        self,
+        user_id: int,
+        recurring_id: int,
+        is_active: bool,
+        *,
+        commit: bool = True,
     ) -> RecurringExpense | None:
         obj = self.repo.get_by_id_for_update(user_id, recurring_id)
         if obj is None:
             return None
-        return self.repo.set_active(obj, is_active)
+        return self.repo.set_active(obj, is_active, commit=commit)
 
     def register_occurrence(
         self,
         user_id: int,
         recurring_id: int,
         today: date,
+        occurrence_date: date | None = None,
+        commit: bool = True,
     ) -> tuple[RecurringExpense | None, RecurringExpense | None]:
         """Register today's expense and advance the template.
 
         Returns ``(template_after_advance, saved_expense)``.
         """
-        from app.expenses.service import ExpenseService
-        from app.expenses.schemas import ExpenseCreate as ExpenseCreateDTO
+        from app.expenses.repository import ExpenseRepository
+        from app.expenses.service import ExpenseDraft, ExpenseService
 
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
         if template_obj is None or not template_obj.is_active:
@@ -207,21 +218,41 @@ class RecurringService:
         original_message = (
             f"[recurrente #{template_obj.id}] {template_obj.name}"
         )
-        expense_payload = ExpenseCreateDTO(
-            telegram_user_id=user_id,
-            name=template_obj.name,
-            amount=template_obj.amount,
-            currency=template_obj.currency,
-            category_id=template_obj.category_id,
-            expense_date=today,
+        occurrence_date = occurrence_date or today
+        source_key = recurring_occurrence_source_key(
+            recurring_id, occurrence_date
+        )
+        expense_repo = ExpenseRepository(self.repo.session)
+        existing = expense_repo.get_by_source_key(
+            user_id, source_key, include_deleted=True
+        )
+        if existing is not None:
+            updated = template_obj
+            return updated, existing
+
+        expense_service = ExpenseService(expense_repo)
+        outcome = expense_service.register_many(
+            user_id=user_id,
+            drafts=[
+                ExpenseDraft(
+                    name=template_obj.name,
+                    amount=template_obj.amount,
+                    currency=template_obj.currency,
+                    category=_category_name(
+                        self.repo.session, template_obj.category_id
+                    ),
+                    expense_date=today,
+                    confidence=Decimal("1"),
+                )
+            ],
             original_message=original_message,
-            ai_confidence=Decimal("1"),
+            source_type="recurring",
+            source_key=source_key,
+            commit=False,
         )
-        expense_repo_module = __import__(
-            "app.expenses.repository", fromlist=["ExpenseRepository"]
-        )
-        expense_service = ExpenseService(expense_repo_module.ExpenseRepository(self.repo.session))
-        saved = [expense_service.repo.create(expense_payload)]
+        if not outcome.saved:
+            return template_obj, None
+        saved = outcome.saved[0]
 
         next_due = advance_due_date(
             today,
@@ -230,12 +261,17 @@ class RecurringService:
             month_of_year=template_obj.month_of_year,
         )
         updated = self.repo.update_next_due(
-            template_obj, next_due, notified=True
+            template_obj, next_due, notified=True, commit=commit
         )
-        return updated, saved[0]
+        return updated, saved
 
     def skip_occurrence(
-        self, user_id: int, recurring_id: int, today: date
+        self,
+        user_id: int,
+        recurring_id: int,
+        today: date,
+        *,
+        commit: bool = True,
     ) -> RecurringExpense | None:
         """Advance to next period without registering."""
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
@@ -248,18 +284,23 @@ class RecurringService:
             month_of_year=template_obj.month_of_year,
         )
         return self.repo.update_next_due(
-            template_obj, next_due, notified=True
+            template_obj, next_due, notified=True, commit=commit
         )
 
     def postpone_occurrence(
-        self, user_id: int, recurring_id: int
+        self,
+        user_id: int,
+        recurring_id: int,
+        *,
+        commit: bool = True,
     ) -> RecurringExpense | None:
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
         if template_obj is None or not template_obj.is_active:
             return None
         new_due = postpone_due_date(template_obj.next_due_date)
         template_obj.next_due_date = new_due
-        self.session_commit()
+        if commit:
+            self.session_commit()
         return template_obj
 
     def session_commit(self) -> None:
@@ -276,3 +317,8 @@ class RecurringService:
             session.query(Category).filter(Category.name == "Otros").one()
         )
         return fallback.id
+
+
+def _category_name(session: Session, category_id: int) -> str:
+    row = session.query(Category).filter(Category.id == category_id).one()
+    return row.name
