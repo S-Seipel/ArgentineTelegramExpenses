@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Sequence
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.recurring.models import RecurringExpense
+from app.recurring.models import RecurringExpense, RecurringReminder
 from app.recurring.schemas import RecurringCreate, RecurringOut
+
+
+REMINDER_CLAIM_TIMEOUT = timedelta(minutes=10)
 
 
 class RecurringRepository:
@@ -86,22 +89,120 @@ class RecurringRepository:
         return self.session.execute(stmt).scalars().all()
 
     def update_next_due(
-        self, obj: RecurringExpense, next_due: date, *, notified: bool = True
+        self,
+        obj: RecurringExpense,
+        next_due: date,
+        *,
+        notified: bool = True,
+        commit: bool = True,
     ) -> RecurringExpense:
         obj.next_due_date = next_due
         if notified:
             obj.last_notified_at = datetime.utcnow()
-        self.session.commit()
-        self.session.refresh(obj)
+        if commit:
+            self.session.commit()
+            self.session.refresh(obj)
         return obj
 
     def set_active(
-        self, obj: RecurringExpense, is_active: bool
+        self, obj: RecurringExpense, is_active: bool, *, commit: bool = True
     ) -> RecurringExpense:
         obj.is_active = is_active
-        self.session.commit()
-        self.session.refresh(obj)
+        if commit:
+            self.session.commit()
+            self.session.refresh(obj)
         return obj
+
+    def pending_reminders(
+        self, user_id: int, *, message_id: int | None = None
+    ) -> list[RecurringReminder]:
+        stmt = select(RecurringReminder).where(
+            RecurringReminder.telegram_user_id == user_id,
+            RecurringReminder.status == "pending",
+        )
+        if message_id is not None:
+            stmt = stmt.where(
+                RecurringReminder.telegram_message_id == message_id
+            )
+        return list(
+            self.session.execute(
+                stmt.order_by(RecurringReminder.id.asc())
+            ).scalars().all()
+        )
+
+    def get_or_create_reminder(
+        self,
+        user_id: int,
+        recurring_id: int,
+        occurrence_date: date,
+    ) -> RecurringReminder:
+        row = self.get_reminder(user_id, recurring_id, occurrence_date)
+        if row is not None:
+            return row
+        row = RecurringReminder(
+            telegram_user_id=user_id,
+            recurring_id=recurring_id,
+            occurrence_date=occurrence_date,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def get_reminder(
+        self, user_id: int, recurring_id: int, occurrence_date: date
+    ) -> RecurringReminder | None:
+        return self.session.execute(
+            select(RecurringReminder).where(
+                RecurringReminder.telegram_user_id == user_id,
+                RecurringReminder.recurring_id == recurring_id,
+                RecurringReminder.occurrence_date == occurrence_date,
+            )
+        ).scalar_one_or_none()
+
+    def resolve_reminder(self, row: RecurringReminder) -> None:
+        row.status = "resolved"
+        row.resolved_at = datetime.utcnow()
+
+    def claim_reminder(
+        self,
+        row: RecurringReminder,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Claim a delivery, reclaiming only an expired in-flight lease."""
+        if row.delivery_status == "sent":
+            return False
+        now = now or datetime.now(timezone.utc)
+        last_attempt_at = row.last_attempt_at
+        if last_attempt_at is not None and last_attempt_at.tzinfo is None:
+            last_attempt_at = last_attempt_at.replace(tzinfo=timezone.utc)
+        if (
+            row.delivery_status == "sending"
+            and last_attempt_at is not None
+            and now - last_attempt_at < REMINDER_CLAIM_TIMEOUT
+        ):
+            return False
+        row.delivery_status = "sending"
+        row.last_attempt_at = now
+        row.attempt_count = (row.attempt_count or 0) + 1
+        self.session.flush()
+        return True
+
+    def mark_reminder_sent(
+        self,
+        row: RecurringReminder,
+        message_id: int,
+        *,
+        sent_at: datetime | None = None,
+    ) -> None:
+        row.delivery_status = "sent"
+        row.telegram_message_id = message_id
+        row.sent_at = sent_at or datetime.utcnow()
+
+    def mark_reminder_delivery_failed(self, row: RecurringReminder) -> None:
+        row.delivery_status = "pending"
+        row.telegram_message_id = None
+        row.sent_at = None
 
     @staticmethod
     def _to_out(row: RecurringExpense) -> RecurringOut:

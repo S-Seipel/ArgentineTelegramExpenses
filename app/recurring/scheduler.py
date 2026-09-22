@@ -112,20 +112,39 @@ async def _try_send_for_user(
 
     for template in due:
         try:
+            with session_scope() as session:
+                repo = RecurringRepository(session)
+                reminder = repo.get_reminder(
+                    user_id, template.id, template.next_due_date
+                )
+                if reminder is None:
+                    reminder = repo.get_or_create_reminder(
+                        user_id, template.id, template.next_due_date
+                    )
+                if not repo.claim_reminder(reminder):
+                    continue
             text = _format_reminder(template)
-            await bot_app.bot.send_message(chat_id=user_id, text=text)
-            runtime.pending_reminders[user_id] = {
-                "recurring_id": template.id,
-                "name": template.name,
-                "amount": template.amount,
-                "currency": template.currency,
-            }
+            message = await bot_app.bot.send_message(chat_id=user_id, text=text)
+            with session_scope() as session:
+                repo = RecurringRepository(session)
+                reminder = repo.get_reminder(
+                    user_id, template.id, template.next_due_date
+                )
+                if reminder is not None:
+                    repo.mark_reminder_sent(reminder, message.message_id)
         except Exception:
             logger.exception(
                 "Failed to send reminder for user %s, template %s",
                 user_id,
                 template.id,
             )
+            with session_scope() as session:
+                repo = RecurringRepository(session)
+                reminder = repo.get_reminder(
+                    user_id, template.id, template.next_due_date
+                )
+                if reminder is not None and reminder.delivery_status != "sent":
+                    repo.mark_reminder_delivery_failed(reminder)
 
     last_fired_for[user_id] = day_key
 

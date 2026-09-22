@@ -109,8 +109,7 @@ def resolve_query_spec(
         kind = "list"
 
     if (
-        category is None
-        and order_by in ("amount_desc",)
+        order_by in ("amount_desc",)
         and limit == 1
     ):
         kind = "largest"

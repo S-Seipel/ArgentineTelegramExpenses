@@ -7,6 +7,8 @@ produce exactly one expense mirror, not two.
 from __future__ import annotations
 
 import threading
+import asyncio
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -18,6 +20,13 @@ from app.fixed_expenses.models import FixedExpensePayment
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.service import FixedExpenseDraft, FixedExpenseService
 from app.models_registry import register_all_models
+from app.recurring.repository import RecurringRepository
+from app.recurring.service import (
+    RecurringDraft,
+    RecurringService,
+    recurring_occurrence_source_key,
+)
+from app.recurring.scheduler import _try_send_for_user
 from tests_postgres.conftest import run_alembic
 
 
@@ -93,6 +102,248 @@ def test_mark_paid_is_idempotent_under_repeat(fresh_db):
         # Exactly one payment row.
         assert len(payments) == 1
         assert payments[0].expense_id == expenses[0].id
+
+
+def test_recurring_occurrence_is_idempotent_on_postgres(fresh_db):
+    from app.database.database import session_scope
+
+    occurrence = date(2026, 9, 15)
+    with session_scope() as s:
+        service = RecurringService(RecurringRepository(s))
+        template = service.create_from_draft(
+            user_id=42,
+            draft=RecurringDraft(
+                name="Netflix",
+                amount=Decimal("30000"),
+                currency="ARS",
+                category="Suscripciones",
+                frequency="monthly",
+                day_of_month=15,
+                month_of_year=None,
+                confidence=1.0,
+            ),
+            today=occurrence,
+        )
+        recurring_id = template.id
+
+    with session_scope() as s:
+        service = RecurringService(RecurringRepository(s))
+        _, first = service.register_occurrence(42, recurring_id, occurrence)
+        _, second = service.register_occurrence(42, recurring_id, occurrence)
+        assert first.id == second.id
+        assert first.source_type == "recurring"
+        assert first.source_key == recurring_occurrence_source_key(
+            recurring_id, occurrence
+        )
+        assert s.query(Expense).filter(
+            Expense.source_key == first.source_key
+        ).count() == 1
+
+
+def test_scheduler_repeated_runs_persist_one_reminder(fresh_db):
+    from app.database.database import session_scope
+    from app.recurring.models import RecurringReminder
+
+    occurrence = date(2026, 9, 15)
+    with session_scope() as s:
+        template = RecurringService(RecurringRepository(s)).create_from_draft(
+            user_id=42,
+            draft=RecurringDraft(
+                name="Netflix",
+                amount=Decimal("30000"),
+                currency="ARS",
+                category="Suscripciones",
+                frequency="monthly",
+                day_of_month=15,
+                month_of_year=None,
+                confidence=1.0,
+            ),
+            today=occurrence,
+        )
+
+    class _Message:
+        message_id = 901
+
+    class _Bot:
+        def __init__(self):
+            self.sent = 0
+
+        async def send_message(self, *, chat_id, text):
+            self.sent += 1
+            return _Message()
+
+    class _App:
+        def __init__(self):
+            self.bot = _Bot()
+
+    app = _App()
+    asyncio.run(
+        _try_send_for_user(
+            app,
+            object(),
+            42,
+            occurrence,
+            occurrence.isoformat(),
+            {},
+        )
+    )
+    asyncio.run(
+        _try_send_for_user(
+            app,
+            object(),
+            42,
+            occurrence,
+            occurrence.isoformat(),
+            {},
+        )
+    )
+    asyncio.run(
+        _try_send_for_user(
+            app,
+            object(),
+            42,
+            occurrence,
+            occurrence.isoformat(),
+            {},
+        )
+    )
+
+    with session_scope() as s:
+        reminders = s.query(RecurringReminder).filter(
+            RecurringReminder.recurring_id == template.id,
+            RecurringReminder.occurrence_date == occurrence,
+        ).all()
+    assert app.bot.sent == 1
+    assert len(reminders) == 1
+    assert reminders[0].telegram_message_id == 901
+    assert reminders[0].delivery_status == "sent"
+    assert reminders[0].attempt_count == 1
+    assert reminders[0].sent_at is not None
+
+
+def test_scheduler_failure_then_retry_delivers_once(fresh_db):
+    from app.database.database import session_scope
+    from app.recurring.models import RecurringReminder
+
+    occurrence = date(2026, 9, 15)
+    with session_scope() as s:
+        template = RecurringService(RecurringRepository(s)).create_from_draft(
+            user_id=42,
+            draft=RecurringDraft(
+                name="Spotify",
+                amount=Decimal("5000"),
+                currency="ARS",
+                category="Suscripciones",
+                frequency="monthly",
+                day_of_month=15,
+                month_of_year=None,
+                confidence=1.0,
+            ),
+            today=occurrence,
+        )
+
+    class _Message:
+        message_id = 902
+
+    class _Bot:
+        def __init__(self):
+            self.attempts = 0
+            self.successes = 0
+
+        async def send_message(self, *, chat_id, text):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TimeoutError("telegram timeout")
+            self.successes += 1
+            return _Message()
+
+    class _App:
+        def __init__(self):
+            self.bot = _Bot()
+
+    app = _App()
+    for _ in range(3):
+        asyncio.run(
+            _try_send_for_user(
+                app,
+                object(),
+                42,
+                occurrence,
+                occurrence.isoformat(),
+                {},
+            )
+        )
+
+    with session_scope() as s:
+        reminder = s.query(RecurringReminder).filter(
+            RecurringReminder.recurring_id == template.id,
+            RecurringReminder.occurrence_date == occurrence,
+        ).one()
+    assert app.bot.attempts == 2
+    assert app.bot.successes == 1
+    assert reminder.delivery_status == "sent"
+    assert reminder.telegram_message_id == 902
+    assert reminder.attempt_count == 2
+
+
+def test_scheduler_reclaims_crashed_delivery_claim(fresh_db):
+    from app.database.database import session_scope
+    from app.recurring.models import RecurringReminder
+    from app.recurring.repository import REMINDER_CLAIM_TIMEOUT
+
+    occurrence = date(2026, 9, 15)
+    with session_scope() as s:
+        template = RecurringService(RecurringRepository(s)).create_from_draft(
+            user_id=42,
+            draft=RecurringDraft(
+                name="HBO", amount=Decimal("7000"), currency="ARS",
+                category="Suscripciones", frequency="monthly", day_of_month=15,
+                month_of_year=None, confidence=1.0,
+            ),
+            today=occurrence,
+        )
+        repo = RecurringRepository(s)
+        reminder = repo.get_or_create_reminder(42, template.id, occurrence)
+        assert repo.claim_reminder(
+            reminder,
+            now=datetime.utcnow() - REMINDER_CLAIM_TIMEOUT - timedelta(seconds=1),
+        )
+
+    class _Message:
+        message_id = 903
+
+    class _Bot:
+        def __init__(self):
+            self.attempts = 0
+
+        async def send_message(self, *, chat_id, text):
+            self.attempts += 1
+            return _Message()
+
+    class _App:
+        def __init__(self):
+            self.bot = _Bot()
+
+    app = _App()
+    asyncio.run(
+        _try_send_for_user(
+            app,
+            object(),
+            42,
+            occurrence,
+            occurrence.isoformat(),
+            {},
+        )
+    )
+
+    with session_scope() as s:
+        reminder = s.query(RecurringReminder).filter(
+            RecurringReminder.recurring_id == template.id,
+            RecurringReminder.occurrence_date == occurrence,
+        ).one()
+    assert app.bot.attempts == 1
+    assert reminder.delivery_status == "sent"
+    assert reminder.telegram_message_id == 903
 
 
 def test_concurrent_mark_paid_yields_one_mirror(fresh_db):

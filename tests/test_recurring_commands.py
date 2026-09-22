@@ -328,6 +328,53 @@ async def test_handle_text_eliminar_response_deactivates(runtime):
     assert items == []
 
 
+@pytest.mark.asyncio
+async def test_persistent_reminder_reply_targets_replied_message(runtime):
+    from app.expenses.models import Expense
+    from app.recurring.models import RecurringReminder
+    from app.recurring.service import RecurringDraft, RecurringService
+
+    with session_scope() as s:
+        service = RecurringService(RecurringRepository(s))
+        first = service.create_from_draft(
+            1,
+            RecurringDraft(
+                name="Netflix", amount=Decimal("30000"), currency="ARS",
+                category="Suscripciones", frequency="monthly", day_of_month=15,
+                month_of_year=None, confidence=1.0,
+            ),
+            today=date(2026, 8, 15),
+        )
+        second = service.create_from_draft(
+            1,
+            RecurringDraft(
+                name="Spotify", amount=Decimal("5000"), currency="ARS",
+                category="Suscripciones", frequency="monthly", day_of_month=16,
+                month_of_year=None, confidence=1.0,
+            ),
+            today=date(2026, 8, 15),
+        )
+        repo = RecurringRepository(s)
+        first_reminder = repo.get_or_create_reminder(1, first.id, first.next_due_date)
+        first_reminder.telegram_message_id = 701
+        repo.get_or_create_reminder(1, second.id, second.next_due_date)
+
+    message = MagicMock()
+    message.text = "sí"
+    message.reply_to_message = MagicMock(message_id=701)
+    message.reply_text = AsyncMock()
+    message.chat.send_action = AsyncMock()
+    await handle_text(_make_update(1, message), None, BotDependencies(runtime=runtime))
+
+    with session_scope() as s:
+        expenses = s.query(Expense).all()
+        reminders = s.query(RecurringReminder).order_by(RecurringReminder.id).all()
+    assert len(expenses) == 1
+    assert expenses[0].name == "Netflix"
+    assert reminders[0].status == "resolved"
+    assert reminders[1].status == "pending"
+
+
 def asyncio_run(coro):
     import asyncio
     try:

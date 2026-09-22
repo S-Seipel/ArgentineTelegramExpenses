@@ -185,7 +185,7 @@ class OllamaAIService:
         if not message or not message.strip():
             raise AIError("Empty message")
 
-        today = today_str()
+        today = today_str(self.cfg.timezone)
         system_msg = system_prompt(today, self.cfg.timezone)
         user_msg = user_instructions(today, self.cfg.timezone)
         if user_context:

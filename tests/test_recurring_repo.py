@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from app.database.database import session_scope
 from app.recurring.repository import RecurringRepository
+from app.recurring.models import RecurringReminder
 from app.recurring.schemas import RecurringCreate
 from app.recurring.service import (
     advance_due_date,
@@ -195,3 +196,24 @@ def test_update_next_due(in_memory_db):
         updated = repo.update_next_due(obj, date(2026, 9, 15), notified=True)
     assert updated.next_due_date == date(2026, 9, 15)
     assert updated.last_notified_at is not None
+
+
+def test_pending_reminders_are_persistent_and_selectable_by_message(in_memory_db):
+    cat_id = _get_cat_id("Suscripciones")
+    first = _create(category_id=cat_id, next_due_date=date(2026, 8, 15))
+    second = _create(
+        category_id=cat_id, name="Spotify", next_due_date=date(2026, 8, 16)
+    )
+    with session_scope() as s:
+        repo = RecurringRepository(s)
+        first_row = repo.get_or_create_reminder(1, first, date(2026, 8, 15))
+        first_row.telegram_message_id = 101
+        repo.get_or_create_reminder(1, second, date(2026, 8, 16))
+
+    with session_scope() as s:
+        repo = RecurringRepository(s)
+        assert len(repo.pending_reminders(1)) == 2
+        selected = repo.pending_reminders(1, message_id=101)
+        assert len(selected) == 1
+        assert selected[0].recurring_id == first
+        assert s.query(RecurringReminder).count() == 2

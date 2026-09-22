@@ -9,9 +9,8 @@ date resolution, category hygiene, JSON-only output).
 """
 from __future__ import annotations
 
-from datetime import date
-
 from app.categories.categories import list_categories_text, DEFAULT_CATEGORY
+from app.utils.dates import today_in_tz
 
 
 def system_prompt(today_iso: str, timezone_name: str) -> str:
@@ -66,5 +65,9 @@ def user_instructions(today_iso: str, timezone_name: str) -> str:
     )
 
 
-def today_str() -> str:
-    return date.today().isoformat()
+def today_str(timezone_name: str | None = None) -> str:
+    if timezone_name is None:
+        from app.config.settings import get_settings
+
+        timezone_name = get_settings().timezone
+    return today_in_tz(timezone_name).isoformat()

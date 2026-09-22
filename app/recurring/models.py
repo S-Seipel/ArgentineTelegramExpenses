@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -78,3 +79,58 @@ class RecurringExpense(Base):
             f"amount={self.amount} {self.currency} freq={self.frequency} "
             f"next={self.next_due_date}>"
         )
+
+
+class RecurringReminder(Base):
+    """Persistent delivery state for one recurring occurrence."""
+
+    __tablename__ = "recurring_reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    recurring_id: Mapped[int] = mapped_column(
+        ForeignKey("recurring_expenses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    occurrence_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    # Delivery is separate from response state: a reminder can be sent while
+    # still waiting for the user's response.
+    delivery_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    telegram_message_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "recurring_id",
+            "occurrence_date",
+            name="uq_recurring_reminder_occurrence",
+        ),
+        Index(
+            "ix_recurring_reminder_pending_user",
+            "telegram_user_id",
+            "status",
+        ),
+    )

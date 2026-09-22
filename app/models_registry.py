@@ -13,7 +13,10 @@ def register_all_models() -> None:
     # ``Base.metadata`` on import.
     from app.categories.models import Category  # noqa: F401, F811
     from app.expenses.models import Expense  # noqa: F401, F811
-    from app.recurring.models import RecurringExpense  # noqa: F401, F811
+    from app.recurring.models import (  # noqa: F401, F811
+        RecurringExpense,
+        RecurringReminder,
+    )
     from app.budgets.models import Budget  # noqa: F401, F811
     from app.fixed_expenses.models import (  # noqa: F401, F811
         FixedExpense,

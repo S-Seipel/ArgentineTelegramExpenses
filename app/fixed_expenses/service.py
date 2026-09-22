@@ -178,6 +178,20 @@ class FixedExpenseService:
             return None
         return self.repo.set_active(obj, is_active)
 
+    def delete(self, user_id: int, fixed_id: int) -> FixedExpense | None:
+        """Delete a template while retaining linked expense history."""
+        obj = self.repo.get_by_id_for_update(user_id, fixed_id)
+        if obj is None:
+            return None
+        for payment in self.repo.payments_for_fixed(fixed_id):
+            if payment.expense_id:
+                self._soft_delete_expense(
+                    user_id, payment.expense_id, commit=False
+                )
+            self.repo.session.delete(payment)
+        self.repo.session.delete(obj)
+        return obj
+
     # ------------------------------------------------------------------
     # payments (atomic, source-keyed)
     # ------------------------------------------------------------------
@@ -300,7 +314,9 @@ class FixedExpenseService:
 
         # Soft-delete any mirror that an earlier pay produced.
         if payment.expense_id:
-            self._soft_delete_expense(user_id, payment.expense_id)
+            self._soft_delete_expense(
+                user_id, payment.expense_id, commit=False
+            )
 
         payment.paid_at = None
         payment.actual_amount = None
@@ -333,7 +349,9 @@ class FixedExpenseService:
             return False
 
         if payment.expense_id:
-            self._soft_delete_expense(user_id, payment.expense_id)
+            self._soft_delete_expense(
+                user_id, payment.expense_id, commit=False
+            )
 
         payment.paid_at = None
         payment.actual_amount = None
@@ -420,10 +438,10 @@ class FixedExpenseService:
         return row
 
     def _soft_delete_expense(
-        self, user_id: int, expense_id: int
+        self, user_id: int, expense_id: int, *, commit: bool = True
     ) -> None:
         expense_repo = ExpenseRepository(self.repo.session)
-        expense_repo.soft_delete(user_id, expense_id)
+        expense_repo.soft_delete(user_id, expense_id, commit=commit)
 
     def with_status_for_month(
         self,

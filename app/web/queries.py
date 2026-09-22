@@ -589,36 +589,45 @@ def comparison(
             )
         by_category_by_currency[cur] = rows
 
-    # Aggregate per-currency totals.
-    cur_total = sum(cur_totals.values(), Decimal("0"))
-    prev_total = sum(prev_totals.values(), Decimal("0"))
-    delta_pct: float | None
-    if prev_total > 0:
-        delta_pct = float((cur_total - prev_total) / prev_total * 100)
-    else:
-        delta_pct = None
+    # A global percentage is valid only when both periods use the same
+    # currency. Per-currency percentages remain available otherwise.
+    delta_pct_by_currency: dict[str, float | None] = {}
+    for cur in all_currencies:
+        current_amount = cur_totals.get(cur, Decimal("0"))
+        previous_amount = prev_totals.get(cur, Decimal("0"))
+        delta_pct_by_currency[cur] = (
+            float((current_amount - previous_amount) / previous_amount * 100)
+            if previous_amount > 0
+            else None
+        )
 
-    single_cur_total_cur = _scalar_for_single_currency(cur_totals)
-    single_cur_total_prev = _scalar_for_single_currency(prev_totals)
+    one_currency = next(iter(all_currencies)) if len(all_currencies) == 1 else None
+    cur_total = cur_totals.get(one_currency, Decimal("0")) if one_currency else None
+    prev_total = prev_totals.get(one_currency, Decimal("0")) if one_currency else None
+    delta_pct = delta_pct_by_currency.get(one_currency) if one_currency else None
 
     return {
         "current": {
             "label": current.label,
             "total": (
-                _money(single_cur_total_cur)
-                if single_cur_total_cur is not None
+                _money(cur_total)
+                if cur_total is not None
                 else None
             ),
         },
         "previous": {
             "label": previous.label,
             "total": (
-                _money(single_cur_total_prev)
-                if single_cur_total_prev is not None
+                _money(prev_total)
+                if prev_total is not None
                 else None
             ),
         },
         "delta_pct": round(delta_pct, 1) if delta_pct is not None else None,
+        "delta_pct_by_currency": {
+            k: (round(v, 1) if v is not None else None)
+            for k, v in delta_pct_by_currency.items()
+        },
         "current_total_by_currency": {
             k: _money(v) for k, v in cur_totals.items()
         },
@@ -626,8 +635,8 @@ def comparison(
             k: _money(v) for k, v in prev_totals.items()
         },
         "by_category": (
-            by_category_by_currency[next(iter(cur_totals))]
-            if single_cur_total_cur is not None
+            by_category_by_currency[one_currency]
+            if one_currency is not None
             else None
         ),
         "by_category_by_currency": by_category_by_currency,

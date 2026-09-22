@@ -7,11 +7,13 @@ import pytest
 
 from app.database.database import session_scope
 from app.expenses.repository import ExpenseRepository
+from app.expenses.models import Expense
 from app.recurring.repository import RecurringRepository
 from app.recurring.service import (
     RecurringDraft,
     RecurringService,
     RecurringValidationError,
+    recurring_occurrence_source_key,
 )
 
 
@@ -142,6 +144,26 @@ def test_register_occurrence_creates_expense_and_advances(in_memory_db):
         expenses = repo.list_in_range(1, start=today, end=today)
     assert len(expenses) == 1
     assert "[recurrente" in expenses[0].original_message
+    assert expenses[0].source_type == "recurring"
+    assert expenses[0].source_key == recurring_occurrence_source_key(rid, today)
+
+
+def test_register_occurrence_is_idempotent_for_same_occurrence(in_memory_db):
+    today = date(2026, 8, 15)
+    with session_scope() as s:
+        service = RecurringService(RecurringRepository(s))
+        template = service.create_from_draft(
+            user_id=1, draft=_draft(), today=date(2026, 7, 10)
+        )
+        rid = template.id
+
+    with session_scope() as s:
+        service = RecurringService(RecurringRepository(s))
+        first_template, first = service.register_occurrence(1, rid, today)
+        second_template, second = service.register_occurrence(1, rid, today)
+        assert first.id == second.id
+        assert first_template.next_due_date == second_template.next_due_date
+        assert s.query(Expense).filter(Expense.source_type == "recurring").count() == 1
 
 
 def test_skip_occurrence_advances_without_registering(in_memory_db):

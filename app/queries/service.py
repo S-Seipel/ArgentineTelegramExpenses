@@ -44,7 +44,13 @@ class QueryService:
         period_label = period.label or spec.label
 
         if spec.kind == "largest":
-            row = self.repo.largest(user_id, period.start, period.end)
+            row = self.repo.largest(
+                user_id,
+                period.start,
+                period.end,
+                category_name=spec.category,
+                currency=spec.currency,
+            )
             if row is None:
                 return QueryResult(
                     total_by_currency={},

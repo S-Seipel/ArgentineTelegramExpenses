@@ -218,7 +218,7 @@ def test_generic_delete_rejects_fixed_payment_mirror(in_memory_db):
             repo.delete(1, linked_expense_id)
 
 
-def test_generic_delete_still_works_for_normal_expense(in_memory_db):
+def test_generic_delete_soft_deletes_normal_expense(in_memory_db):
     today = today_in_tz("UTC")
     with session_scope() as s:
         svc = ExpenseService(ExpenseRepository(s))
@@ -236,6 +236,97 @@ def test_generic_delete_still_works_for_normal_expense(in_memory_db):
     with session_scope() as s:
         ExpenseRepository(s).delete(1, eid)
     with session_scope() as s:
+        row = s.query(Expense).filter(Expense.id == eid).one()
+        assert row.deleted_at is not None
+        assert ExpenseRepository(s).get_by_id(1, eid) is None
+        assert ExpenseRepository(s).restore(1, eid) is not None
+
+
+def test_fixed_template_delete_soft_deletes_paid_mirror(in_memory_db):
+    today = today_in_tz("UTC")
+    month = today.strftime("%Y-%m")
+    with session_scope() as s:
+        service = FixedExpenseService(FixedExpenseRepository(s))
+        bill = service.add(
+            user_id=1,
+            draft=FixedExpenseDraft(name="CASA", expected_amount=Decimal("90000")),
+        )
+        service.mark_paid(1, bill.id, month)
+        payment = s.query(FixedExpensePayment).one()
+        expense_id = payment.expense_id
+        service.delete(1, bill.id)
+
+    with session_scope() as s:
+        assert s.query(FixedExpensePayment).count() == 0
+        mirror = s.query(Expense).filter(Expense.id == expense_id).one()
+        assert mirror.deleted_at is not None
+
+
+def test_fixed_payment_mirror_lifecycle_has_no_orphans_or_duplicates(
+    in_memory_db,
+):
+    from app.integrity import run_full_audit
+
+    today = today_in_tz("UTC")
+    month = today.strftime("%Y-%m")
+    with session_scope() as s:
+        service = FixedExpenseService(FixedExpenseRepository(s))
+        bill = service.add(
+            user_id=1,
+            draft=FixedExpenseDraft(name="CASA", expected_amount=Decimal("90000")),
+        )
+        service.mark_paid(1, bill.id, month)
+        payment = s.query(FixedExpensePayment).one()
+        first_expense_id = payment.expense_id
+        assert payment.paid_at is not None
+        assert s.query(Expense).filter(Expense.deleted_at.is_(None)).count() == 1
+        s.flush()
+        assert run_full_audit(s).is_clean
+
+        assert service.unmark(1, bill.id, month) is True
+        payment = s.query(FixedExpensePayment).one()
+        assert payment.paid_at is None
+        s.flush()
+        assert ExpenseRepository(s).list_recent(1) == []
+        deleted = s.query(Expense).filter(Expense.id == first_expense_id).one()
+        assert deleted.deleted_at is not None
+        assert run_full_audit(s).is_clean
+
+        service.mark_paid(1, bill.id, month, actual_amount=Decimal("91000"))
+        payment = s.query(FixedExpensePayment).one()
+        live_mirrors = s.query(Expense).filter(Expense.deleted_at.is_(None)).all()
+        assert payment.expense_id == first_expense_id
+        assert len(live_mirrors) == 1
+        assert live_mirrors[0].id == first_expense_id
+        s.flush()
+        assert run_full_audit(s).is_clean
+
+
+def test_fixed_payment_rolls_back_payment_and_expense_together(
+    in_memory_db, monkeypatch
+):
+    with session_scope() as s:
+        service = FixedExpenseService(FixedExpenseRepository(s))
+        bill = service.add(
+            user_id=1,
+            draft=FixedExpenseDraft(name="CASA", expected_amount=Decimal("90000")),
+        )
+        fixed_id = bill.id
+
+    def fail_after_payment(*args, **kwargs):
+        raise RuntimeError("forced failure")
+
+    monkeypatch.setattr(
+        FixedExpenseService, "_resolve_or_create_expense", fail_after_payment
+    )
+    with pytest.raises(RuntimeError):
+        with session_scope() as s:
+            FixedExpenseService(FixedExpenseRepository(s)).mark_paid(
+                1, fixed_id, "2026-09"
+            )
+
+    with session_scope() as s:
+        assert s.query(FixedExpensePayment).count() == 0
         assert s.query(Expense).count() == 0
 
 
@@ -551,6 +642,34 @@ def test_summary_multi_currency_neutralizes_legacy_scalar(in_memory_db):
     assert data["by_category"] is None
     assert data["total"] is None
     assert data["total_by_currency"] == {"ARS": 1000.0, "USD": 5.0}
+
+
+def test_comparison_does_not_compute_cross_currency_percentage(in_memory_db):
+    from app.web.queries import PeriodWindow, comparison
+
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=1,
+            drafts=[
+                ExpenseDraft(
+                    name="ARS actual", amount=Decimal("1000"), currency="ARS",
+                    category="Café", expense_date=date(2026, 9, 5), confidence=Decimal("1"),
+                ),
+                ExpenseDraft(
+                    name="USD anterior", amount=Decimal("10"), currency="USD",
+                    category="Café", expense_date=date(2026, 8, 5), confidence=Decimal("1"),
+                ),
+            ],
+            original_message="seed",
+        )
+        current = PeriodWindow("actual", date(2026, 9, 1), date(2026, 9, 30), 5, 30, False)
+        previous = PeriodWindow("anterior", date(2026, 8, 1), date(2026, 8, 31), 31, 31, True)
+        result = comparison(s, 1, current, previous)
+
+    assert result["current"]["total"] is None
+    assert result["previous"]["total"] is None
+    assert result["delta_pct"] is None
+    assert result["delta_pct_by_currency"] == {"ARS": None, "USD": -100.0}
 
 
 def test_daily_trend_multi_currency_returns_per_currency(in_memory_db):
@@ -1170,6 +1289,22 @@ def test_fixed_month_resolution_uses_business_date(monkeypatch):
     today = business_today()
     assert current_month_year(today) == "2026-09"
     assert current_month_year(None) == "2026-09"
+
+
+def test_ai_prompt_uses_business_timezone_date(monkeypatch):
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    from app.ai.prompts import today_str
+
+    class _FakeDateTime(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            base = _dt(2026, 9, 2, 2, 0, 0, tzinfo=ZoneInfo("UTC"))
+            return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+    monkeypatch.setattr("app.utils.dates.datetime", _FakeDateTime)
+    assert today_str("America/Argentina/Buenos_Aires") == "2026-09-01"
 
 
 # ---------------------------------------------------------------------------

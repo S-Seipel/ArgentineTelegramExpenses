@@ -349,6 +349,8 @@ class ExpenseRepository:
         user_id: int,
         start: date | None = None,
         end: date | None = None,
+        category_name: str | None = None,
+        currency: str | None = None,
     ) -> ExpenseSummary | None:
         stmt = (
             select(Expense)
@@ -362,6 +364,10 @@ class ExpenseRepository:
             stmt = stmt.where(Expense.expense_date >= start)
         if end is not None:
             stmt = stmt.where(Expense.expense_date <= end)
+        if category_name is not None:
+            stmt = stmt.join(Category).where(Category.name == category_name)
+        if currency is not None:
+            stmt = stmt.where(Expense.currency == currency.upper())
         stmt = stmt.order_by(Expense.amount.desc(), Expense.id.desc()).limit(1)
         row = self.session.execute(stmt).scalar_one_or_none()
         if row is None:
@@ -448,7 +454,7 @@ class ExpenseRepository:
     # ------------------------------------------------------------------
 
     def delete(self, user_id: int, expense_id: int) -> ExpenseSummary | None:
-        """Hard-delete a live expense.
+        """Soft-delete a live expense.
 
         Raises ``LinkedFixedPaymentError`` when the row is referenced by a
         ``fixed_expense_payments.expense_id`` — fixed payments must be
@@ -465,7 +471,8 @@ class ExpenseRepository:
                 "Deshacelo desde /despague o el dashboard de gastos fijos."
             )
         summary = self._to_summary(row)
-        self.session.delete(row)
+        row.deleted_at = datetime.utcnow()
+        row.revision = (row.revision or 1) + 1
         self.session.commit()
         return summary
 
@@ -475,14 +482,16 @@ class ExpenseRepository:
         expense_id: int,
         *,
         when: datetime | None = None,
+        commit: bool = True,
     ) -> Expense | None:
         row = self.get_entity(user_id, expense_id)
         if row is None:
             return None
         row.deleted_at = when or datetime.utcnow()
         row.revision = (row.revision or 1) + 1
-        self.session.commit()
-        self.session.refresh(row)
+        if commit:
+            self.session.commit()
+            self.session.refresh(row)
         return row
 
     def restore(self, user_id: int, expense_id: int) -> Expense | None:
@@ -557,4 +566,8 @@ class ExpenseRepository:
             ai_confidence=row.ai_confidence,
             created_at=row.created_at,
             original_message=row.original_message or "",
+            source_type=row.source_type,
+            source_key=row.source_key,
+            deleted_at=row.deleted_at,
+            revision=row.revision,
         )

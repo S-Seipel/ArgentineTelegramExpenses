@@ -185,14 +185,16 @@ async def handle_text(
     user_id = update.effective_user.id
     today = today_in_tz(deps.runtime.settings.timezone)
 
-    pending = deps.runtime.pending_reminders.get(user_id)
-    if pending is not None:
-        handled = await _maybe_handle_reminder_reply(
-            deps, user_id, text, pending, today
-        )
-        if handled is not None:
-            await update.effective_message.reply_text(handled)
-            return
+    reply_to = getattr(update.effective_message, "reply_to_message", None)
+    reply_to_message_id = getattr(reply_to, "message_id", None)
+    if not isinstance(reply_to_message_id, int):
+        reply_to_message_id = None
+    handled = await _maybe_handle_reminder_reply(
+        deps, user_id, text, today, reply_to_message_id=reply_to_message_id
+    )
+    if handled is not None:
+        await update.effective_message.reply_text(handled)
+        return
 
     await update.effective_message.chat.send_action(ChatAction.TYPING)
     try:
@@ -292,8 +294,9 @@ async def _maybe_handle_reminder_reply(
     deps: BotDependencies,
     user_id: int,
     text: str,
-    pending: dict,
     today,
+    *,
+    reply_to_message_id: int | None = None,
 ) -> str | None:
     """Process sí/no/posponer/eliminar in response to a pending reminder.
 
@@ -310,12 +313,36 @@ async def _maybe_handle_reminder_reply(
     if normalized not in control_words:
         return None
 
-    recurring_id = pending["recurring_id"]
-    deps.runtime.pending_reminders.pop(user_id, None)
-
     with session_scope() as session:
         repo = RecurringRepository(session)
         service = RecurringService(repo)
+        pending_rows = repo.pending_reminders(
+            user_id, message_id=reply_to_message_id
+        )
+        reminder = None
+        if reply_to_message_id is not None:
+            if not pending_rows:
+                return "🤷 Ese recordatorio ya fue respondido o no existe."
+            reminder = pending_rows[0]
+        elif len(pending_rows) == 1:
+            reminder = pending_rows[0]
+        elif len(pending_rows) > 1:
+            return (
+                "🤔 Tenés varios recordatorios pendientes. Respondé usando "
+                "Responder sobre el mensaje correspondiente."
+            )
+        else:
+            # Compatibility for reminders created by older runtimes; new
+            # scheduler deliveries are always persisted in recurring_reminders.
+            legacy = deps.runtime.pending_reminders.get(user_id)
+            if not isinstance(legacy, dict):
+                return None
+            recurring_id = legacy["recurring_id"]
+            pending = legacy
+        if reminder is not None:
+            recurring_id = reminder.recurring_id
+            pending = reminder
+
         template_obj = repo.get_by_id_for_update(user_id, recurring_id)
         if template_obj is None or not template_obj.is_active:
             return "🤷 Ese recurrente ya no existe."
@@ -326,12 +353,24 @@ async def _maybe_handle_reminder_reply(
 
         if normalized in ("sí", "si", "dale", "ok", "listo", "confirmo"):
             template_after, saved = service.register_occurrence(
-                user_id=user_id, recurring_id=recurring_id, today=today
+                user_id=user_id,
+                recurring_id=recurring_id,
+                today=today,
+                occurrence_date=(
+                    pending.occurrence_date
+                    if reminder is not None
+                    else None
+                ),
+                commit=False,
             )
             if saved is None:
                 return "🤷 No pude registrar el gasto."
             from app.utils.formatting import format_currency_amount as fca
 
+            if reminder is not None:
+                repo.resolve_reminder(reminder)
+            else:
+                deps.runtime.pending_reminders.pop(user_id, None)
             return (
                 f"✅ Listo: *{name}* — {fca(amount, currency)} "
                 f"registrado para hoy. "
@@ -339,7 +378,13 @@ async def _maybe_handle_reminder_reply(
             )
 
         if normalized in ("posponer", "mañana", "manana"):
-            service.postpone_occurrence(user_id=user_id, recurring_id=recurring_id)
+            service.postpone_occurrence(
+                user_id=user_id, recurring_id=recurring_id, commit=False
+            )
+            if reminder is not None:
+                repo.resolve_reminder(reminder)
+            else:
+                deps.runtime.pending_reminders.pop(user_id, None)
             template_after = repo.get_by_id_for_update(user_id, recurring_id)
             return (
                 f"⏰ Dale, te aviso mañana. "
@@ -347,15 +392,28 @@ async def _maybe_handle_reminder_reply(
             )
 
         if normalized in ("eliminar", "borrar", "nunca más", "nunca mas", "quitar"):
-            service.set_active(user_id, recurring_id, is_active=False)
+            service.set_active(
+                user_id, recurring_id, is_active=False, commit=False
+            )
+            if reminder is not None:
+                repo.resolve_reminder(reminder)
+            else:
+                deps.runtime.pending_reminders.pop(user_id, None)
             return f"🗑️ Recurrente *{name}* eliminado."
 
         if normalized in ("no", "nope", "skip", "saltar"):
             template_after = service.skip_occurrence(
-                user_id=user_id, recurring_id=recurring_id, today=today
+                user_id=user_id,
+                recurring_id=recurring_id,
+                today=today,
+                commit=False,
             )
             if template_after is None:
                 return "🤷 No pude saltar este recordatorio."
+            if reminder is not None:
+                repo.resolve_reminder(reminder)
+            else:
+                deps.runtime.pending_reminders.pop(user_id, None)
             return (
                 f"👍 Saltado. "
                 f"Próximo aviso: {format_date_short(template_after.next_due_date)}"
@@ -907,24 +965,9 @@ def _handle_fixed_expense_command(
         except ValueError:
             return "❓ El ID tiene que ser un número entero."
         if command == "/gastofijo_del":
-            obj = service.repo.get_by_id(user_id, fid)
+            obj = service.delete(user_id, fid)
             if obj is None:
                 return f"🤷 No encontré el gasto fijo #{fid}."
-            # Cascade-clean: delete all linked payments + their expenses.
-            payments = service.repo.payments_for_fixed(fid)
-            for p in payments:
-                if p.expense_id:
-                    from app.fixed_expenses.service import _delete_expense
-                    _delete_expense(service.repo.session, p.expense_id)
-            # Then delete all payments and the template itself.
-            from app.fixed_expenses.models import FixedExpensePayment
-            (
-                service.repo.session.query(FixedExpensePayment)
-                .filter(FixedExpensePayment.fixed_expense_id == fid)
-                .delete()
-            )
-            service.repo.session.delete(obj)
-            service.repo.session.commit()
             action = "eliminado"
         elif command == "/gastofijo_off":
             obj = service.set_active(user_id, fid, is_active=False)

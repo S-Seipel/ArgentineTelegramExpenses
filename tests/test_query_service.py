@@ -96,3 +96,25 @@ def test_query_largest(in_memory_db):
         result = q.run(1, spec)
     assert result.largest is not None
     assert result.largest.name == "B"
+
+
+def test_query_largest_applies_category_and_currency_filters(in_memory_db):
+    _seed(
+        [
+            _draft(name="ARS café", amount=Decimal("900"), category="Café"),
+            _draft(name="USD café", amount=Decimal("50"), currency="USD", category="Café"),
+            _draft(name="ARS resto", amount=Decimal("5000"), category="Restaurante"),
+        ]
+    )
+    spec = QuerySpec(
+        kind="largest",
+        period="month",
+        category="Café",
+        currency="USD",
+    )
+    with session_scope() as s:
+        q = QueryService(ExpenseRepository(s))
+        q.today = lambda: date(2026, 1, 20)  # type: ignore[assignment]
+        result = q.run(1, spec)
+    assert result.largest is not None
+    assert result.largest.name == "USD café"
