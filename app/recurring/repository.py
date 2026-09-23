@@ -98,7 +98,7 @@ class RecurringRepository:
     ) -> RecurringExpense:
         obj.next_due_date = next_due
         if notified:
-            obj.last_notified_at = datetime.utcnow()
+            obj.last_notified_at = datetime.now(timezone.utc)
         if commit:
             self.session.commit()
             self.session.refresh(obj)
@@ -161,7 +161,7 @@ class RecurringRepository:
 
     def resolve_reminder(self, row: RecurringReminder) -> None:
         row.status = "resolved"
-        row.resolved_at = datetime.utcnow()
+        row.resolved_at = datetime.now(timezone.utc)
 
     def claim_reminder(
         self,
@@ -172,10 +172,23 @@ class RecurringRepository:
         """Claim a delivery, reclaiming only an expired in-flight lease."""
         if row.delivery_status == "sent":
             return False
-        now = now or datetime.now(timezone.utc)
+        # Normalize ``now`` to a tz-aware UTC value. ``datetime.utcnow()``
+        # is naive and PostgreSQL stores it according to the session
+        # timezone, which corrupts subsequent lease comparisons.
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        # PostgreSQL returns ``DateTime(timezone=True)`` columns tagged
+        # with the *session* timezone, not UTC. Convert back to UTC so
+        # the lease arithmetic below stays timezone-of-session
+        # independent.
         last_attempt_at = row.last_attempt_at
-        if last_attempt_at is not None and last_attempt_at.tzinfo is None:
-            last_attempt_at = last_attempt_at.replace(tzinfo=timezone.utc)
+        if last_attempt_at is not None:
+            if last_attempt_at.tzinfo is None:
+                last_attempt_at = last_attempt_at.replace(tzinfo=timezone.utc)
+            else:
+                last_attempt_at = last_attempt_at.astimezone(timezone.utc)
         if (
             row.delivery_status == "sending"
             and last_attempt_at is not None
@@ -197,7 +210,12 @@ class RecurringRepository:
     ) -> None:
         row.delivery_status = "sent"
         row.telegram_message_id = message_id
-        row.sent_at = sent_at or datetime.utcnow()
+        if sent_at is None:
+            row.sent_at = datetime.now(timezone.utc)
+        elif sent_at.tzinfo is None:
+            row.sent_at = sent_at.replace(tzinfo=timezone.utc)
+        else:
+            row.sent_at = sent_at
 
     def mark_reminder_delivery_failed(self, row: RecurringReminder) -> None:
         row.delivery_status = "pending"
