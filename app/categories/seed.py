@@ -25,6 +25,7 @@ CATEGORY_ICON_OVERRIDES: dict[str, str] = {
     "Viajes": "✈️",
     "Regalos": "🎁",
     "Servicios": "📑",
+    "Gastos fijos": "📌",
     "Otros": "🧾",
     "Café": "☕",
     "Supermercado": "🛒",
@@ -70,6 +71,7 @@ DEFAULT_CATEGORY_TREE: dict[str, list[str]] = {
     "Viajes": [],
     "Regalos": [],
     "Servicios": [],
+    "Gastos fijos": [],
     "Otros": [],
 }
 

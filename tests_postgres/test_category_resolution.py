@@ -48,39 +48,23 @@ def fresh_db(pg_database_url):
     yield pg_database_url
 
 
-def test_mark_paid_with_null_category_resolves_to_top_level_otros(
+def test_mark_paid_with_null_category_uses_fixed_mirror_category(
     fresh_db,
 ):
-    """A FixedExpense with ``category_id = NULL`` (its template carries
-    no category) must still produce a working mark_paid against
-    PostgreSQL — the migration-seeded top-level ``Otros`` row is the
-    canonical fallback and there is exactly one such row."""
-    from sqlalchemy import text
-    from sqlalchemy.exc import MultipleResultsFound
+    """Every fixed-payment mirror belongs to ``Gastos fijos``."""
+    from app.categories.models import Category
 
     with session_scope() as s:
-        # Verify there is exactly one top-level Otros row after the
-        # migration seed. This is the precondition the lookup relies
-        # on.
-        otros_rows = (
-            s.query(__import__(
-                "app.categories.models",
-                fromlist=["Category"],
-            ).Category)
+        fixed_rows = (
+            s.query(Category)
             .filter(
-                __import__(
-                    "app.categories.models",
-                    fromlist=["Category"],
-                ).Category.name == "Otros",
-                __import__(
-                    "app.categories.models",
-                    fromlist=["Category"],
-                ).Category.parent_id.is_(None),
+                Category.name == "Gastos fijos",
+                Category.parent_id.is_(None),
             )
             .all()
         )
-        assert len(otros_rows) == 1
-        otros_id = otros_rows[0].id
+        assert len(fixed_rows) == 1
+        fixed_category_id = fixed_rows[0].id
 
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
@@ -102,20 +86,22 @@ def test_mark_paid_with_null_category_resolves_to_top_level_otros(
             .filter(Expense.source_key.like("fixed-payment:%"))
             .one()
         )
-        assert mirror.category_id == otros_id
+        assert mirror.category_id == fixed_category_id
         assert mirror.source_type == "fixed_payment"
 
 
 def test_mark_paid_resolves_canonical_cafe_when_duplicate_exists(
     fresh_db,
 ):
-    """Inject a SECOND ``Café`` row under a different parent (``Hogar``).
+    """Template lookup remains hierarchy-aware, while its mirror uses the
+    dedicated fixed-payment category.
 
     The migration seed already has ``Café`` under ``Comida``. The
     registry says ``Café`` lives under ``Comida`` (the canonical
-    parent), so the lookup must pick the ``(parent_id=Comida,
-    name=Café)`` row and NOT the new ``(parent_id=Hogar, name=Café)``
-    one.
+    parent), so the template must pick the ``(parent_id=Comida,
+    name=Café)`` row and NOT the new ``(parent_id=Hogar, name=Café)`` one.
+    The resulting payment mirror is intentionally categorized as
+    ``Gastos fijos``.
 
     The old ``WHERE name = 'Café'`` lookup would have raised
     ``MultipleResultsFound`` on this fixture.
@@ -167,6 +153,7 @@ def test_mark_paid_resolves_canonical_cafe_when_duplicate_exists(
                     category="Café",
                 ),
             )
+            assert bill.category_id == canonical_cafe_id
             service.mark_paid(
                 43, bill.id, "2026-09", actual_amount=Decimal("1500")
             )
@@ -177,9 +164,18 @@ def test_mark_paid_resolves_canonical_cafe_when_duplicate_exists(
             )
 
     with session_scope() as s:
+        fixed_category_id = (
+            s.query(Category)
+            .filter(
+                Category.name == "Gastos fijos",
+                Category.parent_id.is_(None),
+            )
+            .one()
+            .id
+        )
         mirror = (
             s.query(Expense)
             .filter(Expense.source_key.like("fixed-payment:%"))
             .one()
         )
-        assert mirror.category_id == canonical_cafe_id
+        assert mirror.category_id == fixed_category_id

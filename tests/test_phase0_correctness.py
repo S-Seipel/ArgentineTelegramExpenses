@@ -947,24 +947,19 @@ def test_register_many_handles_duplicate_category_names_by_hierarchy(
     assert outcome.saved[0].category_id == original_cafe_id
 
 
-def test_fixed_expense_without_category_falls_back_to_otros(in_memory_db):
-    """When the FixedExpense template carries ``category_id = NULL``
-    AND the registry doesn't normalize "Otros" to anything more specific,
-    the mirror must land on the top-level ``Otros`` parent (no parent_id).
-    This was the scenario that surfaced the original
-    ``MultipleResultsFound`` in PostgreSQL integration."""
+def test_fixed_expense_without_category_uses_fixed_category(in_memory_db):
+    """A paid fixed-expense mirror belongs to ``Gastos fijos``."""
     from app.categories.models import Category
 
     today = today_in_tz("UTC")
     my = today.strftime("%Y-%m")
-    otros_row = None
     with session_scope() as s:
-        otros_row = (
+        fixed_row = (
             s.query(Category)
-            .filter(Category.name == "Otros", Category.parent_id.is_(None))
+            .filter(Category.name == "Gastos fijos", Category.parent_id.is_(None))
             .one()
         )
-        otros_id = otros_row.id
+        fixed_id = fixed_row.id
 
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
@@ -983,8 +978,7 @@ def test_fixed_expense_without_category_falls_back_to_otros(in_memory_db):
             .filter(Expense.source_key.like("fixed-payment:%"))
             .one()
         )
-        # Mirror lands on the top-level ``Otros`` (parent_id NULL).
-        assert mirror.category_id == otros_id
+        assert mirror.category_id == fixed_id
 
 
 def test_register_many_unknown_category_falls_back_to_otros(in_memory_db):

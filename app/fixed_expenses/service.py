@@ -385,8 +385,16 @@ class FixedExpenseService:
         """Find the mirror expense by source_key (including soft-deleted)
         or create a new one. Idempotent under concurrency: the unique
         partial index on ``(telegram_user_id, source_key)`` keeps a single
-        row per occurrence."""
+        row per occurrence. Fixed-payment mirrors always use the dedicated
+        top-level ``Gastos fijos`` category; the template category remains
+        independent and is used only when that category is unavailable."""
         expense_repo = ExpenseRepository(self.repo.session)
+        # Fixed-payment mirrors belong to their own reporting bucket even
+        # when the template was created without a category.
+        fixed_category_id = _resolve_category_id(
+            self.repo.session, "Gastos fijos"
+        )
+        category_id = fixed_category_id or category_id
         existing = expense_repo.get_by_source_key(
             user_id, source_key, include_deleted=True
         )
