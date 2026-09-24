@@ -33,6 +33,7 @@ from app.fixed_expenses.service import (
     FixedExpenseValidationError,
     current_month_year,
 )
+from app.money import UserSettingsService
 from app.utils.amounts import _normalize_decimal, find_thousand_amounts
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
@@ -158,6 +159,26 @@ async def handle_command(
                 command, args, service, user_id,
                 today=today_in_tz(deps.runtime.settings.timezone),
             )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/config_payday":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_config_payday_command(
+            args,
+            user_id=user_id,
+            timezone=deps.runtime.settings.timezone,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command in ("/cycle", "/disponible", "/gastar_diario"):
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_cycle_read_command(
+            command,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+        )
         await update.effective_message.reply_text(reply)
         return
 
@@ -1134,3 +1155,156 @@ def _format_month_summary(
 def fmt_money(n) -> str:
     from app.utils.formatting import format_amount
     return format_amount(n)
+
+
+def _handle_config_payday_command(
+    args: list[str],
+    *,
+    timezone: str,
+    user_id: int = 0,
+) -> str:
+    """Handle ``/config_payday <day>`` (R1).
+
+    Lazily creates the user_settings row, persisting ``payday_day`` (and
+    the global timezone as a fallback) on the first call.
+    """
+    if not args:
+        return (
+            "❓ Decime el día de cobro. Ej: `/config_payday 5`.\n"
+            "Valores válidos: 1-31."
+        )
+    try:
+        day = int(args[0])
+    except ValueError:
+        return "❓ El día tiene que ser un número entero entre 1 y 31."
+    try:
+        with session_scope() as session:
+            UserSettingsService(session).set_payday_day(
+                user_id=user_id, payday_day=day, timezone=timezone
+            )
+    except ValueError:
+        return "❓ El día tiene que estar entre 1 y 31."
+    return f"📅 Día de cobro configurado: día *{day}* del mes."
+
+
+def _handle_cycle_read_command(
+    command: str,
+    *,
+    user_id: int,
+    today,
+) -> str:
+    """R2 read commands: ``/cycle``, ``/disponible``, ``/gastar_diario``.
+
+    ``CycleService.ensure_current_cycle`` walks the rollover chain if
+    the open cycle is expired; ``MoneyEngine.get_cycle_summary`` is
+    the read-only source of truth inside the same session so the
+    numbers stay in lockstep with the API layer.
+    """
+    from app.money import CycleService, MoneyEngine
+
+    with session_scope() as session:
+        cycle_service = CycleService(session)
+        engine = MoneyEngine(session)
+        try:
+            cycle = cycle_service.ensure_current_cycle(user_id, today)
+        except Exception as exc:  # noqa: BLE001
+            return (
+                "⚠️ No pude resolver tu ciclo actual. "
+                f"Detalle: {exc}"
+            )
+        summary = engine.get_cycle_summary(
+            user_id, cycle.id, today=today
+        )
+
+    if command == "/cycle":
+        return _format_cycle_summary(summary)
+    if command == "/disponible":
+        return _format_available(summary)
+    if command == "/gastar_diario":
+        return _format_daily(summary)
+    return "Comando no reconocido."
+
+
+def _format_cycle_summary(summary) -> str:
+    from app.utils.formatting import format_currency_amount
+
+    label = (
+        f"📆 Ciclo #{summary.cycle_index} "
+        f"({summary.start_date.isoformat()} → "
+        f"{summary.end_date.isoformat()}) — {summary.status}"
+    )
+    lines: list[str] = [label, ""]
+
+    def line_for(title: str, mc) -> str:
+        if mc.is_empty():
+            return f"• {title}: —"
+        bits = ", ".join(
+            f"{format_currency_amount(amount)} {cur}"
+            for cur, amount in mc.items()
+        )
+        return f"• {title}: {bits}"
+
+    lines.append(line_for("Ingreso base", summary.base_income))
+    lines.append(line_for("Extras", summary.extra_income))
+    lines.append(line_for("Ingreso bruto", summary.gross_income))
+    lines.append(line_for("Ahorro target", summary.savings_target))
+    lines.append(line_for("Ahorro reservado", summary.savings_reserved))
+    lines.append(line_for("Ahorro realizado", summary.savings_realized))
+    lines.append(line_for("Comprometido", summary.savings_committed))
+    lines.append(line_for("Gastos realizados", summary.realized_expenses))
+    lines.append(
+        line_for("Pendientes fijos", summary.pending_fixed_obligations)
+    )
+    lines.append(line_for("Disponible", summary.available_to_spend))
+    if summary.carried_over_fixed:
+        bits = ", ".join(
+            f"{occ.name} {format_currency_amount(occ.expected_amount)}"
+            f" {occ.currency} ({occ.original_month_year})"
+            for occ in summary.carried_over_fixed
+        )
+        lines.append("")
+        lines.append(f"🔁 Llevado de ciclos previos: {bits}")
+    if summary.warnings:
+        lines.append("")
+        lines.append("⚠️ " + " · ".join(summary.warnings))
+    return "\n".join(lines)
+
+
+def _format_available(summary) -> str:
+    from app.utils.formatting import format_currency_amount
+
+    if summary.status == "closed":
+        return (
+            "🔒 El ciclo está cerrado. "
+            "Los números son los del snapshot; no cambian."
+        )
+    if summary.available_to_spend.is_empty():
+        return (
+            "💸 Aún no tengo datos suficientes para calcular tu "
+            "disponible. Cargá un ingreso o un gasto para empezar."
+        )
+    bits = ", ".join(
+        f"{format_currency_amount(amount)} {currency}"
+        for currency, amount in summary.available_to_spend.items()
+    )
+    return f"💰 Disponible en este ciclo: {bits}"
+
+
+def _format_daily(summary) -> str:
+    from app.utils.formatting import format_currency_amount
+
+    if summary.status == "closed":
+        return "🔒 Ciclo cerrado: no hay diario para mostrar."
+    if summary.daily_safe_to_spend is None:
+        return "📅 El ciclo ya cerró; no hay diario para hoy."
+    if summary.daily_safe_to_spend.is_empty():
+        return "💸 Sin ingresos registrados este ciclo."
+    bits = ", ".join(
+        f"{format_currency_amount(amount)} {currency}"
+        for currency, amount in summary.daily_safe_to_spend.items()
+    )
+    days = summary.remaining_days or 0
+    return (
+        f"📅 Podés gastar {bits} por día "
+        f"(quedan {days} día(s) en el ciclo)."
+    )

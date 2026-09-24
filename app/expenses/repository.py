@@ -459,17 +459,32 @@ class ExpenseRepository:
         Raises ``LinkedFixedPaymentError`` when the row is referenced by a
         ``fixed_expense_payments.expense_id`` — fixed payments must be
         reversed through the domain operation, not via the generic CRUD.
+        Raises ``SystemOwnedExpenseError`` when the row is owned by the
+        fixed-payment or recurring subsystems (``source_type`` in
+        ``{'fixed_payment', 'recurring'}``) but no FK link is left
+        behind. Those rows are created and maintained by their own
+        domain owner; the generic CRUD path refuses to touch them so a
+        ``/deshacer`` style command can't silently corrupt a payment
+        mirror.
         """
-        from app.expenses.service import LinkedFixedPaymentError
+        from app.expenses.service import (
+            LinkedFixedPaymentError,
+            SystemOwnedExpenseError,
+        )
 
         row = self.get_entity(user_id, expense_id)
         if row is None:
             return None
+        # Existing FK guard first: keeps backward-compat for callers
+        # that already catch ``LinkedFixedPaymentError`` when the link
+        # is intact. The generic system-owned guard catches the
+        # residual case (recurring mirrors, broken FKs) below.
         if self._is_linked_to_fixed_payment(row.id):
             raise LinkedFixedPaymentError(
                 "Este gasto pertenece a un pago fijo. "
                 "Deshacelo desde /despague o el dashboard de gastos fijos."
             )
+        self._assert_not_system_owned(row)
         summary = self._to_summary(row)
         row.deleted_at = datetime.utcnow()
         row.revision = (row.revision or 1) + 1
@@ -510,6 +525,7 @@ class ExpenseRepository:
         row = self.get_entity(user_id, expense_id)
         if row is None:
             return None
+        self._assert_not_system_owned(row)
         if new_amount <= 0:
             raise ValueError("amount must be positive")
         row.amount = new_amount
@@ -524,6 +540,7 @@ class ExpenseRepository:
         row = self.get_entity(user_id, expense_id)
         if row is None:
             return None
+        self._assert_not_system_owned(row)
         new_name = new_name.strip()
         if not new_name:
             raise ValueError("name cannot be empty")
@@ -550,6 +567,25 @@ class ExpenseRepository:
             FixedExpensePayment.expense_id == expense_id
         )
         return self.session.execute(stmt).first() is not None
+
+    @staticmethod
+    def _assert_not_system_owned(row: Expense) -> None:
+        """Refuse generic mutations on rows owned by the system.
+
+        ``source_type='fixed_payment'`` rows are mirrors produced by
+        ``FixedExpenseService.mark_paid``; ``'recurring'`` rows are
+        produced by ``RecurringService.register_occurrence``. They must
+        only be mutated through their owning domain so the linked
+        payment/reminder row stays in sync.
+        """
+        from app.expenses.service import SystemOwnedExpenseError
+
+        if row.source_type in ("fixed_payment", "recurring"):
+            raise SystemOwnedExpenseError(
+                f"Expense {row.id} pertenece a un pago de sistema "
+                f"(source_type={row.source_type!r}); modificá desde "
+                "el flujo correspondiente."
+            )
 
     @staticmethod
     def _to_summary(row: Expense) -> ExpenseSummary:

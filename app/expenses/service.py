@@ -26,6 +26,14 @@ class LinkedFixedPaymentError(RuntimeError):
     fixed-expense domain, not via the generic Expense CRUD."""
 
 
+class SystemOwnedExpenseError(RuntimeError):
+    """Raised when a generic Expense mutation targets a row owned by the
+    fixed-expense or recurring subsystems. The lifecycle of those rows
+    is owned by the domain that produced them; ``MoneyEngine`` would
+    otherwise observe a dangling payment mirror.
+    """
+
+
 @dataclass
 class PersistOutcome:
     needs_clarification: bool

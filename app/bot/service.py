@@ -335,7 +335,11 @@ def _help_text() -> str:
         "/salte <nombre> — saltar este mes\n"
         "/ingreso <monto> — setear ingreso del mes\n"
         "/extra <monto> — setear extra del mes\n"
-        "/liberado — resumen del mes (income - fijos)"
+        "/liberado — resumen del mes (income - fijos)\n"
+        "*Ciclo:*\n"
+        "/cycle — resumen completo del ciclo activo\n"
+        "/disponible — disponible para gastar este ciclo\n"
+        "/gastar_diario — gasto diario sugerido"
     )
 
 

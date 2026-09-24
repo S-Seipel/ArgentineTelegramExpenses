@@ -363,6 +363,248 @@ async def api_month_summary(
         return month_summary_dashboard(s, user_id, today)
 
 
+@router.get("/api/cycle/current")
+async def api_cycle_current(
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Return the open financial cycle that contains today, or null."""
+    from app.money import CycleService
+
+    with session_scope() as s:
+        view = CycleService(s).get_current_cycle(user_id, today)
+    if view is None:
+        return {"cycle": None}
+    return {
+        "cycle": {
+            "id": view.cycle_id,
+            "cycle_index": view.cycle_index,
+            "start_date": view.start_date.isoformat(),
+            "end_date": view.end_date.isoformat(),
+            "payday_day": view.payday_day,
+            "status": view.status,
+        }
+    }
+
+
+@router.post("/api/cycle/open")
+async def api_cycle_open(
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Open the initial cycle for the user.
+
+    Returns the cycle view on success, raises 409 when the user already
+    has history that requires rollover (R2 territory).
+    """
+    from app.money import CycleRolloverRequired, CycleService
+
+    try:
+        with session_scope() as s:
+            view = CycleService(s).open_initial_cycle(user_id, today)
+    except CycleRolloverRequired as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "cycle_rollover_required",
+                "message": (
+                    "El usuario ya tiene un ciclo cerrado. R2 implementa"
+                    " el rollover."
+                ),
+                "latest_cycle_index": exc.latest_cycle_index,
+            },
+        ) from exc
+    return {
+        "cycle": {
+            "id": view.cycle_id,
+            "cycle_index": view.cycle_index,
+            "start_date": view.start_date.isoformat(),
+            "end_date": view.end_date.isoformat(),
+            "payday_day": view.payday_day,
+            "status": view.status,
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# R2 — cycle-summary read + lifecycle endpoints (close / ensure)
+# ---------------------------------------------------------------------------
+
+
+def _summary_to_payload(
+    summary, *, with_cycle: bool = False
+) -> dict:
+    """Render a ``CycleSummary`` as JSON-safe primitives.
+
+    Monetary fields are emitted as ``dict[str, str]`` (Decimal strings)
+    so JSON consumers can re-parse them losslessly. ``daily_safe_to_spend``
+    is ``None`` when the cycle is closed or ``remaining_days <= 0``.
+    """
+    payload = {
+        "cycle_id": summary.cycle_id,
+        "cycle_index": summary.cycle_index,
+        "status": summary.status,
+        "start_date": summary.start_date.isoformat(),
+        "end_date": summary.end_date.isoformat(),
+        "payday_day": summary.payday_day,
+        "snapshot_version": summary.snapshot_version,
+        "money": {
+            "income": summary.base_income.to_dict(),
+            "extra": summary.extra_income.to_dict(),
+            "gross_income": summary.gross_income.to_dict(),
+            "savings_target": summary.savings_target.to_dict(),
+            "savings_reserved": summary.savings_reserved.to_dict(),
+            "savings_realized": summary.savings_realized.to_dict(),
+            "savings_committed": summary.savings_committed.to_dict(),
+            "realized_expenses": summary.realized_expenses.to_dict(),
+            "pending_fixed_obligations": (
+                summary.pending_fixed_obligations.to_dict()
+            ),
+            "pending_recurring_obligations": (
+                summary.pending_recurring_obligations.to_dict()
+            ),
+            "pending_reserved_obligations": (
+                summary.pending_reserved_obligations.to_dict()
+            ),
+            "available_to_spend": summary.available_to_spend.to_dict(),
+            "daily_safe_to_spend": (
+                summary.daily_safe_to_spend.to_dict()
+                if summary.daily_safe_to_spend is not None
+                else None
+            ),
+            "warnings": list(summary.warnings),
+        },
+        "remaining_days": summary.remaining_days,
+        "carried_over_fixed": [
+            {
+                "fixed_id": occ.fixed_id,
+                "name": occ.name,
+                "expected_amount": str(occ.expected_amount),
+                "currency": occ.currency,
+                "due_date": occ.due_date.isoformat(),
+                "original_month_year": occ.original_month_year,
+            }
+            for occ in summary.carried_over_fixed
+        ],
+    }
+    if with_cycle:
+        payload["cycle"] = {
+            "id": summary.cycle_id,
+            "cycle_index": summary.cycle_index,
+            "start_date": summary.start_date.isoformat(),
+            "end_date": summary.end_date.isoformat(),
+            "payday_day": summary.payday_day,
+            "status": summary.status,
+        }
+    return payload
+
+
+@router.get("/api/cycle-summary")
+async def api_cycle_summary(
+    user_id: int = Depends(_current_user_id),
+    cycle_id: int | None = Query(default=None),
+    today: date = Depends(_today),
+):
+    """Return the full R2 cycle summary for the current (or given) cycle.
+
+    When ``cycle_id`` is omitted the cycle service walks the rollover
+    chain if the open cycle is expired; the read model itself comes
+    from ``MoneyEngine`` inside the same session.
+    """
+    from app.money import (
+        CycleCatchUpLimitExceeded,
+        CycleService,
+        MoneyEngine,
+    )
+
+    with session_scope() as s:
+        cycle_service = CycleService(s)
+        engine = MoneyEngine(s)
+        if cycle_id is None:
+            try:
+                cycle = cycle_service.ensure_current_cycle(user_id, today)
+            except CycleCatchUpLimitExceeded as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "cycle_catch_up_limit_exceeded",
+                        "message": str(exc),
+                    },
+                ) from exc
+            cycle_id = cycle.id
+        summary = engine.get_cycle_summary(user_id, cycle_id, today=today)
+        return _summary_to_payload(summary)
+
+
+@router.post("/api/cycle/{cycle_id}/close")
+async def api_cycle_close(
+    cycle_id: int,
+    user_id: int = Depends(_current_user_id),
+    force: bool = Query(default=False),
+):
+    """Close a cycle. ``force=true`` allows closing with pending obligations."""
+    from app.money import (
+        CycleHasPendingError,
+        CycleService,
+        MoneyEngine,
+    )
+
+    with session_scope() as s:
+        cycle_service = CycleService(s)
+        engine = MoneyEngine(s)
+        try:
+            summary = cycle_service.close_cycle(
+                user_id, cycle_id, force=force, closed_by="manual"
+            )
+        except CycleHasPendingError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cycle_has_pending_obligations",
+                    "pending_by_currency": {
+                        k: str(v)
+                        for k, v in exc.pending_by_currency.items()
+                    },
+                },
+            ) from exc
+        return _summary_to_payload(summary)
+
+
+@router.post("/api/cycle/ensure")
+async def api_cycle_ensure(
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Run ``ensure_current_cycle(today)``. Idempotent."""
+    from app.money import (
+        CycleCatchUpLimitExceeded,
+        CycleService,
+    )
+
+    with session_scope() as s:
+        cycle_service = CycleService(s)
+        try:
+            cycle = cycle_service.ensure_current_cycle(user_id, today)
+        except CycleCatchUpLimitExceeded as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cycle_catch_up_limit_exceeded",
+                    "message": str(exc),
+                },
+            ) from exc
+    return {
+        "cycle": {
+            "id": cycle.id,
+            "cycle_index": cycle.cycle_index,
+            "start_date": cycle.start_date.isoformat(),
+            "end_date": cycle.end_date.isoformat(),
+            "payday_day": cycle.payday_day,
+            "status": cycle.status,
+        }
+    }
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>

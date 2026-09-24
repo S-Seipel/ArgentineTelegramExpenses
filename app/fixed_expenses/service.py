@@ -179,18 +179,136 @@ class FixedExpenseService:
         return self.repo.set_active(obj, is_active)
 
     def delete(self, user_id: int, fixed_id: int) -> FixedExpense | None:
-        """Delete a template while retaining linked expense history."""
+        """Delete a template while retaining linked expense history.
+
+        R2 hardens this path: deleting a template with outstanding debt
+        (any ``FixedExpensePayment`` without a paid or skipped status,
+        OR an unresolved carried-over obligation in any closed cycle
+        snapshot) is refused with ``FixedExpenseHasOutstandingDebtError``.
+        The caller must first settle, skip, or unlink the obligation
+        before the template can disappear. Historical occurrences
+        already represented in a previous cycle's ``carried_over_fixed``
+        block remain frozen regardless of whether the template still
+        exists.
+        """
         obj = self.repo.get_by_id_for_update(user_id, fixed_id)
         if obj is None:
             return None
         for payment in self.repo.payments_for_fixed(fixed_id):
+            if (
+                payment.paid_at is None
+                and not payment.skipped
+            ):
+                from app.money.engine import (
+                    FixedExpenseHasOutstandingDebtError,
+                )
+
+                raise FixedExpenseHasOutstandingDebtError(
+                    f"No se puede eliminar '{obj.name}' "
+                    f"(pago {payment.month_year} sin resolver). "
+                    "Marcá como pagado o salteado primero."
+                )
             if payment.expense_id:
                 self._soft_delete_expense(
                     user_id, payment.expense_id, commit=False
                 )
             self.repo.session.delete(payment)
+
+        # Carry-over chain: walk the closed cycles and refuse the
+        # delete if any unresolved historical obligation still exists
+        # for this template.
+        unresolved = self._unresolved_carry_over(user_id, fixed_id)
+        if unresolved:
+            from app.money.engine import (
+                FixedExpenseHasOutstandingDebtError,
+            )
+
+            raise FixedExpenseHasOutstandingDebtError(
+                f"No se puede eliminar '{obj.name}' "
+                f"(queda deuda sin resolver del ciclo "
+                f"{unresolved[0].original_month_year} y posiblemente "
+                f"otros). Marcá como pagado o salteado primero."
+            )
+
         self.repo.session.delete(obj)
         return obj
+
+    def _unresolved_carry_over(self, user_id: int, fixed_id: int):
+        """Return the list of unresolved carried-over obligations for
+        ``fixed_id`` across the user's closed cycle history.
+
+        An obligation is "unresolved" when it appears in some closed
+        cycle's ``carried_over_fixed`` block AND no
+        ``FixedExpensePayment`` exists for that
+        ``(fixed_id, original_month_year)`` pair with paid_at or
+        skipped.
+        """
+        from sqlalchemy import select
+
+        from app.money.models import FinancialCycle
+
+        # Find the closed cycles for this user (most recent first)
+        # and walk back. The list is bounded by the number of cycles
+        # the user actually has; defensive ``LIMIT`` cap so a bug
+        # can't iterate forever.
+        cycles = list(
+            self.repo.session.execute(
+                select(FinancialCycle)
+                .where(
+                    FinancialCycle.telegram_user_id == user_id,
+                    FinancialCycle.status == "closed",
+                )
+                .order_by(FinancialCycle.cycle_index.desc())
+                .limit(48)
+            ).scalars()
+        )
+        from app.money.dto import CarriedOverFixedOccurrence
+        from app.money.fixed_obligations import (
+            fixed_payment_source_key,
+        )
+
+        unresolved: list[CarriedOverFixedOccurrence] = []
+        seen_keys: set[tuple[int, str]] = set()
+        for cycle in cycles:
+            snap = cycle.closing_snapshot or {}
+            carried = snap.get("carried_over_fixed") or []
+            for entry in carried:
+                if int(entry.get("fixed_id", -1)) != fixed_id:
+                    continue
+                key = (
+                    fixed_id,
+                    str(entry["original_month_year"]),
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                # If a payment row was created (paid or skipped) for
+                # this identity, the obligation is resolved.
+                stmt = select(FixedExpensePayment).where(
+                    FixedExpensePayment.fixed_expense_id == fixed_id,
+                    FixedExpensePayment.month_year == key[1],
+                )
+                payment = self.repo.session.execute(stmt).scalar_one_or_none()
+                if payment and (
+                    payment.paid_at is not None or payment.skipped
+                ):
+                    continue
+                from datetime import date as _date
+                from decimal import Decimal as _D
+
+                unresolved.append(
+                    CarriedOverFixedOccurrence(
+                        fixed_id=fixed_id,
+                        name=str(entry.get("name", "")),
+                        expected_amount=_D(str(entry["expected_amount"])),
+                        currency=str(entry["currency"]),
+                        due_date=_date.fromisoformat(
+                            str(entry["due_date"])
+                        ),
+                        original_month_year=key[1],
+                    )
+                )
+        return unresolved
 
     # ------------------------------------------------------------------
     # payments (atomic, source-keyed)

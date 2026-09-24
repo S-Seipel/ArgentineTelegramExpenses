@@ -23,3 +23,11 @@ def register_all_models() -> None:
         FixedExpensePayment,
         MonthlyBudget,
     )
+    from app.money.models import (  # noqa: F401, F811
+        CycleIncome,
+        FinancialCycle,
+        SavingsRealization,
+        SavingsReserved,
+        SavingsTarget,
+        UserSettings,
+    )
