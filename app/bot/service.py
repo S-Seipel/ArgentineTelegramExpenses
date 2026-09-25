@@ -75,6 +75,12 @@ async def _process_message_async(
         parsed: ParsedMessage = await runtime.ai.interpret(cleaned)
     except AIUnavailable:
         logger.exception("AI provider unreachable")
+        provider = runtime.settings.ai_provider.lower()
+        if provider == "minimax":
+            return (
+                "🤖 MiniMax no responde en este momento. Revisá la conexión, "
+                "la Subscription Key y el saldo del Token Plan."
+            )
         return (
             "🤖 Ollama no responde en este momento. Verificá que esté "
             "corriendo (`ollama serve`) y que el modelo esté descargado "
@@ -319,6 +325,7 @@ def _help_text() -> str:
         "/hoy /semana /mes — totales rápidos\n"
         "/gastos — últimos 10 gastos\n"
         "/desglose — desglose por categoría del mes\n"
+        "/analisis — opinión de la IA sobre tus gastos y posibles ajustes\n"
         "/buscar <texto> — buscar gastos por nombre\n"
         "/borrar_ultimo /borrar <id> — borrar gasto\n"
         "/editar_ultimo <monto> — corregir último gasto\n"
@@ -333,13 +340,21 @@ def _help_text() -> str:
         "/gastofijo_add <nombre> <monto> [día] [método]\n"
         "/pague <nombre> [monto_real] — marcar pagado\n"
         "/salte <nombre> — saltar este mes\n"
-        "/ingreso <monto> — setear ingreso del mes\n"
-        "/extra <monto> — setear extra del mes\n"
         "/liberado — resumen del mes (income - fijos)\n"
         "*Ciclo:*\n"
         "/cycle — resumen completo del ciclo activo\n"
         "/disponible — disponible para gastar este ciclo\n"
-        "/gastar_diario — gasto diario sugerido"
+        "/gastar_diario — gasto diario sugerido\n"
+        "/ingreso <monto> — setear ingreso base del ciclo\n"
+        "/extra <monto> [nota] — registrar ingreso extra\n"
+        "/extra_editar <id> <monto> [nota] — editar un extra\n"
+        "/extra_borrar <id> — borrar un extra\n"
+        "/target <valor> — setear target de ahorro (20% o monto)\n"
+        "/reservar <monto> — setear reserva del ciclo\n"
+        "/liberar <monto> — liberar parte de la reserva\n"
+        "/ahorro_realizado <monto> [nota] — registrar ahorro realizado\n"
+        "/ahorro_editar <id> <monto> [nota] — editar un ahorro realizado\n"
+        "/ahorro_borrar <id> — borrar un ahorro realizado"
     )
 
 

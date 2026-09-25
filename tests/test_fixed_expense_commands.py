@@ -183,37 +183,29 @@ def test_salte_marks_as_skipped(runtime):
 
 
 def test_ingreso_and_liberado(runtime):
+    """``/liberado`` continues to read the legacy ``MonthlyBudget`` row.
+
+    R3 redirects ``/ingreso`` and ``/extra`` to the financial-cycle
+    state (``CycleIncome``), leaving ``MonthlyBudget`` untouched (spec
+    §20: models coexist during the transition). To exercise
+    ``/liberado`` we therefore seed ``MonthlyBudget`` directly.
+    """
     from app.fixed_expenses.service import FixedExpenseDraft
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
         service.add(user_id=1, draft=FixedExpenseDraft(
             name="CASA", expected_amount=Decimal("90000")))
         service.mark_paid(1, service.list_active(1)[0].id, "2026-09")
+        # Seed MonthlyBudget directly — R3 no longer writes here.
+        service.set_budget(1, "2026-09", income=Decimal("1100000"))
+        service.set_budget(1, "2026-09", extra=Decimal("75000"))
 
-    # Set income
-    message = MagicMock()
-    message.text = "/ingreso 1100000"
-    message.reply_text = AsyncMock()
-    message.chat.send_action = AsyncMock()
-    update = _make_update(1, message)
-    deps = BotDependencies(runtime=runtime)
-    _run(handle_command(update, None, deps))
-    assert "1.100.000" in message.reply_text.call_args.args[0] or "1100000" in message.reply_text.call_args.args[0]
-
-    # Set extra
-    message2 = MagicMock()
-    message2.text = "/extra 75000"
-    message2.reply_text = AsyncMock()
-    message2.chat.send_action = AsyncMock()
-    update2 = _make_update(1, message2)
-    _run(handle_command(update2, None, deps))
-
-    # Summary
     message3 = MagicMock()
     message3.text = "/liberado"
     message3.reply_text = AsyncMock()
     message3.chat.send_action = AsyncMock()
     update3 = _make_update(1, message3)
+    deps = BotDependencies(runtime=runtime)
     _run(handle_command(update3, None, deps))
     reply = message3.reply_text.call_args.args[0]
     assert "Ingreso" in reply

@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config.settings import Settings, get_settings
 from app.database.database import session_scope
+from app.money import MoneyEngine
 from app.utils.dates import today_in_tz
 from app.web.queries import (
     budget_status,
@@ -27,6 +28,7 @@ from app.web.queries import (
     recent_expenses,
     recurring_upcoming,
     resolve_period,
+    resolve_month,
     summary_for_period,
 )
 
@@ -51,6 +53,11 @@ async def dashboard_html() -> str:
     return DASHBOARD_HTML
 
 
+@router.get("/dashboard/mensual", response_class=HTMLResponse, include_in_schema=False)
+async def monthly_dashboard_html() -> str:
+    return DASHBOARD_HTML
+
+
 @router.get("/api/summary")
 async def api_summary(
     period: str = Query("month"),
@@ -64,6 +71,77 @@ async def api_summary(
     )
     with session_scope() as s:
         return summary_for_period(s, user_id, window)
+
+
+@router.get("/api/monthly-summary")
+async def api_monthly_summary(
+    month: Optional[str] = Query(None),
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    try:
+        window = resolve_month(month, today)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    previous_start = window.start.replace(day=1)
+    if previous_start.month == 1:
+        previous_key = f"{previous_start.year - 1}-12"
+    else:
+        previous_key = f"{previous_start.year}-{previous_start.month - 1:02d}"
+    previous = resolve_month(previous_key, today)
+
+    with session_scope() as s:
+        summary = summary_for_period(s, user_id, window)
+        trend = daily_trend(
+            s,
+            user_id,
+            end=window.end,
+            days=window.days_in_period,
+        )
+        comparison_result = comparison(s, user_id, window, previous)
+        budget_rows = budget_status(s, user_id, window)
+        items = recent_expenses(
+            s,
+            user_id,
+            500,
+            start=window.start,
+            end=window.end,
+        )
+        total_by_currency = period_total_by_currency(
+            s, user_id, start=window.start, end=window.end
+        )
+        count = period_count(s, user_id, start=window.start, end=window.end)
+
+    single_total = (
+        next(iter(total_by_currency.values()))
+        if len(total_by_currency) == 1
+        else None
+    )
+    return {
+        "month": window.start.strftime("%Y-%m"),
+        "current_month": today.strftime("%Y-%m"),
+        "summary": summary,
+        "trend": trend,
+        "comparison": comparison_result,
+        "budgets": {"items": budget_rows},
+        "expenses": {
+            "period_label": window.label,
+            "start": window.start.isoformat(),
+            "end": window.end.isoformat(),
+            "count": count,
+            "total": (
+                float(single_total.quantize(Decimal("0.01")))
+                if single_total is not None
+                else None
+            ),
+            "total_by_currency": {
+                key: float(value.quantize(Decimal("0.01")))
+                for key, value in total_by_currency.items()
+            },
+            "items": items,
+        },
+    }
 
 
 @router.get("/api/trend")
@@ -99,6 +177,7 @@ async def api_expenses(
     period: str = Query("month"),
     custom_start: Optional[date] = None,
     custom_end: Optional[date] = None,
+    category: Optional[str] = Query(None, max_length=64),
     limit: int = Query(500, ge=1, le=2000),
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
@@ -123,12 +202,21 @@ async def api_expenses(
             limit,
             start=window.start,
             end=window.end,
+            category=category,
         )
         total_by_currency = period_total_by_currency(
-            s, user_id, start=window.start, end=window.end
+            s,
+            user_id,
+            start=window.start,
+            end=window.end,
+            category=category,
         )
         count = period_count(
-            s, user_id, start=window.start, end=window.end
+            s,
+            user_id,
+            start=window.start,
+            end=window.end,
+            category=category,
         )
     single_total = (
         next(iter(total_by_currency.values()))
@@ -605,6 +693,525 @@ async def api_cycle_ensure(
     }
 
 
+# ---------------------------------------------------------------------------
+# R3 — income / savings mutations
+# ---------------------------------------------------------------------------
+
+
+def _resolve_open_cycle(
+    user_id: int, cycle_id: int | None, today: date
+) -> FinancialCycle:
+    """Return the open cycle a mutation targets.
+
+    When ``cycle_id`` is omitted, ``CycleService.ensure_current_cycle``
+    walks the rollover chain and returns the open cycle for ``today``.
+    """
+    from app.money import (
+        CycleCatchUpLimitExceeded,
+        CycleService,
+        FinancialCycle,
+        MoneyStateError,
+    )
+
+    with session_scope() as s:
+        cycle_service = CycleService(s)
+        if cycle_id is None:
+            try:
+                return cycle_service.ensure_current_cycle(user_id, today)
+            except CycleCatchUpLimitExceeded as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "cycle_catch_up_limit_exceeded",
+                        "message": str(exc),
+                    },
+                ) from exc
+        cycle = s.get(FinancialCycle, cycle_id)
+        if cycle is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "cycle_not_found",
+                    "message": f"Cycle {cycle_id} not found",
+                },
+            )
+        if cycle.telegram_user_id != user_id:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "cycle_not_found",
+                    "message": f"Cycle {cycle_id} not found",
+                },
+            )
+        if cycle.status != "open":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cycle_closed",
+                    "message": (
+                        f"Cycle {cycle_id} is closed; historical state "
+                        "is immutable"
+                    ),
+                },
+            )
+        return cycle
+
+
+def _parse_amount(raw) -> Decimal:
+    """Parse a request body amount. JSON gives us a string already; the
+    service does its own coercion but we want a clean 400 here.
+    """
+    if raw is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_amount", "message": "amount required"},
+        )
+    try:
+        if isinstance(raw, Decimal):
+            return raw
+        return Decimal(str(raw))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_amount",
+                "message": f"amount must be a Decimal-compatible value: {exc}",
+            },
+        ) from exc
+
+
+def _state_error_to_http(exc: Exception) -> HTTPException:
+    from app.money import (
+        CycleClosedError,
+        CycleNotFoundError,
+        CycleOwnershipMismatchError,
+        ExtraIncomeNotFoundError,
+        InvalidAmountError,
+        InvalidSourceKeyError,
+        InvalidTargetValueError,
+        SavingsRealizationNotFoundError,
+        TargetXorViolationError,
+    )
+
+    if isinstance(exc, CycleClosedError):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "cycle_closed", "message": str(exc)},
+        )
+    if isinstance(exc, (CycleNotFoundError, CycleOwnershipMismatchError)):
+        return HTTPException(
+            status_code=404,
+            detail={"code": "cycle_not_found", "message": str(exc)},
+        )
+    if isinstance(exc, (ExtraIncomeNotFoundError, SavingsRealizationNotFoundError)):
+        return HTTPException(
+            status_code=404,
+            detail={"code": "entity_not_found", "message": str(exc)},
+        )
+    if isinstance(exc, (InvalidAmountError, InvalidSourceKeyError,
+                         InvalidTargetValueError, TargetXorViolationError)):
+        return HTTPException(
+            status_code=400,
+            detail={"code": "invalid_argument", "message": str(exc)},
+        )
+    raise HTTPException(
+        status_code=500,
+        detail={"code": "internal_error", "message": str(exc)},
+    )
+
+
+def _income_to_payload(row) -> dict:
+    return {
+        "id": row.id,
+        "cycle_id": row.cycle_id,
+        "currency": row.currency,
+        "kind": row.kind,
+        "amount": str(row.amount),
+        "source_key": row.source_key,
+        "note": row.note,
+        "revision": row.revision,
+        "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _target_to_payload(row) -> dict:
+    return {
+        "cycle_id": row.cycle_id,
+        "currency": row.currency,
+        "target_pct": str(row.target_pct) if row.target_pct is not None else None,
+        "target_amount": str(row.target_amount) if row.target_amount is not None else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _reserved_to_payload(row) -> dict:
+    return {
+        "cycle_id": row.cycle_id,
+        "currency": row.currency,
+        "amount": str(row.amount),
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _realization_to_payload(row) -> dict:
+    return {
+        "id": row.id,
+        "cycle_id": row.cycle_id,
+        "currency": row.currency,
+        "amount": str(row.amount),
+        "source_key": row.source_key,
+        "note": row.note,
+        "revision": row.revision,
+        "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@router.post("/api/cycles/income")
+async def api_cycle_set_income(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Upsert the base income for the open cycle + currency."""
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    amount = _parse_amount(payload.get("amount"))
+    currency = str(payload.get("currency") or "ARS")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).set_income(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "income": _income_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.post("/api/cycles/extra")
+async def api_cycle_record_extra(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    """Upsert an extra income identified by ``source_key``."""
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    amount = _parse_amount(payload.get("amount"))
+    currency = str(payload.get("currency") or "ARS")
+    source_key = payload.get("source_key")
+    note = payload.get("note")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).record_extra_income(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                amount=amount,
+                source_key=str(source_key) if source_key is not None else "",
+                note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "extra": _income_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.patch("/api/cycles/extra/{extra_id}")
+async def api_cycle_update_extra(
+    extra_id: int,
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    amount = payload.get("amount")
+    amount_decimal = _parse_amount(amount) if amount is not None else None
+    note = payload.get("note")  # None means "leave as-is", sentinel handled below
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).update_extra_income(
+                user_id=user_id,
+                extra_id=extra_id,
+                amount=amount_decimal,
+                note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+            return {
+                "extra": _income_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.delete("/api/cycles/extra/{extra_id}")
+async def api_cycle_soft_delete_extra(
+    extra_id: int,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).soft_delete_extra_income(
+                user_id=user_id, extra_id=extra_id
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+            return {
+                "extra": _income_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.post("/api/cycles/savings/target")
+async def api_cycle_set_savings_target(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    currency = str(payload.get("currency") or "ARS")
+    target_pct = payload.get("target_pct")
+    target_amount = payload.get("target_amount")
+    pct_decimal = _parse_amount(target_pct) if target_pct is not None else None
+    amt_decimal = _parse_amount(target_amount) if target_amount is not None else None
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).set_savings_target(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                target_pct=pct_decimal,
+                target_amount=amt_decimal,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "target": _target_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.post("/api/cycles/savings/reserved")
+async def api_cycle_set_savings_reserved(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    amount = _parse_amount(payload.get("amount"))
+    currency = str(payload.get("currency") or "ARS")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).set_savings_reserved(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "reserved": _reserved_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.post("/api/cycles/savings/release")
+async def api_cycle_release_savings(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    amount = _parse_amount(payload.get("amount"))
+    currency = str(payload.get("currency") or "ARS")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).release_savings(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "reserved": _reserved_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.post("/api/cycles/savings/realized")
+async def api_cycle_record_savings_realized(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        int(cycle_id) if cycle_id is not None else None,
+        today,
+    )
+    amount = _parse_amount(payload.get("amount"))
+    currency = str(payload.get("currency") or "ARS")
+    source_key = payload.get("source_key")
+    note = payload.get("note")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).record_savings_realized(
+                user_id=user_id,
+                cycle_id=cycle.id,
+                currency=currency,
+                amount=amount,
+                source_key=str(source_key) if source_key is not None else "",
+                note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(user_id, cycle.id, today=today)
+            return {
+                "realization": _realization_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.patch("/api/cycles/savings/realized/{realization_id}")
+async def api_cycle_update_savings_realized(
+    realization_id: int,
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    amount = payload.get("amount")
+    amount_decimal = _parse_amount(amount) if amount is not None else None
+    note = payload.get("note")
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).update_savings_realized(
+                user_id=user_id,
+                realization_id=realization_id,
+                amount=amount_decimal,
+                note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+            return {
+                "realization": _realization_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
+@router.delete("/api/cycles/savings/realized/{realization_id}")
+async def api_cycle_soft_delete_savings_realized(
+    realization_id: int,
+    user_id: int = Depends(_current_user_id),
+    today: date = Depends(_today),
+):
+    from app.money import MoneyStateService
+
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).soft_delete_savings_realized(
+                user_id=user_id, realization_id=realization_id
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+            return {
+                "realization": _realization_to_payload(row),
+                "summary": _summary_to_payload(summary),
+            }
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            raise
+        raise _state_error_to_http(exc) from exc
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -959,6 +1566,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
     }
 
+    .category-modal[hidden] { display: none; }
+    .category-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .category-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.72);
+      backdrop-filter: blur(5px);
+    }
+    .category-modal-card {
+      position: relative;
+      width: min(720px, 100%);
+      max-height: min(720px, 90vh);
+      overflow: auto;
+      padding: 24px;
+      border: 1px solid var(--glass-border);
+      border-radius: 20px;
+      background: #111a2d;
+      box-shadow: var(--glass-shadow-hover);
+    }
+    .category-modal-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .category-modal-close {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 24px;
+      cursor: pointer;
+      line-height: 1;
+    }
+
     /* ===========================================================
        Background chart colors (Apple-inspired palette)
        =========================================================== */
@@ -968,7 +1617,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
   <main>
     <header>
-      <h1><span class="emoji">💸</span> Argentine Telegram Expenses</h1>
+      <h1 id="page-title"><span class="emoji">💸</span> Argentine Telegram Expenses</h1>
       <div class="subtitle" id="subtitle">Cargando…</div>
     </header>
 
@@ -978,12 +1627,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button data-p="today">Hoy</button>
       <button data-p="last_month">Mes pasado</button>
       <button data-p="year">Año</button>
+      <a href="/dashboard/mensual" style="margin-left:auto; color:var(--accent); text-decoration:none; font-size:12px; align-self:center">Resumen mensual →</a>
+    </div>
+
+    <div class="toolbar" id="month-nav" style="display:none; justify-content:center; gap:16px; align-items:center">
+      <button id="prev-month" aria-label="Mes anterior">←</button>
+      <strong id="month-nav-label"></strong>
+      <button id="next-month" aria-label="Mes siguiente">→</button>
+      <a href="/dashboard" style="margin-left:10px; color:var(--accent); text-decoration:none; font-size:12px">Vista general</a>
     </div>
 
     <div class="grid" id="kpis"></div>
 
     <div class="row">
-      <div class="panel">
+       <div class="panel" id="recurring-panel">
         <h2 id="trend-title">Tendencia</h2>
         <div class="chart-wrap"><canvas id="trend-chart"></canvas></div>
       </div>
@@ -1075,6 +1732,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div class="panel" style="margin-top:18px">
+      <h2 id="grouped-title">Gastos agrupados</h2>
+      <div id="grouped-list"></div>
+    </div>
+
     <div class="row">
       <div class="panel">
         <h2 id="comparison-title">Comparativa</h2>
@@ -1129,12 +1791,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </main>
 
+  <div id="category-modal" class="category-modal" hidden>
+    <div class="category-modal-backdrop" data-close-category-modal></div>
+    <section class="category-modal-card" role="dialog" aria-modal="true" aria-labelledby="category-modal-title">
+      <div class="category-modal-head">
+        <div>
+          <h2 id="category-modal-title">Gastos de la categoría</h2>
+          <div id="category-modal-summary" class="subtitle"></div>
+        </div>
+        <button class="category-modal-close" type="button" aria-label="Cerrar" data-close-category-modal>×</button>
+      </div>
+      <div id="category-modal-body"></div>
+    </section>
+  </div>
+
 <script>
 const fmt = new Intl.NumberFormat('es-AR');
 const currency = (n, c) => '$ ' + fmt.format(n) + ' ' + c;
+const monthlyDashboard = location.pathname === '/dashboard/mensual';
 let trendChart, categoryChart;
 let currentPeriod = 'month';
+let selectedMonth = null;
+let latestMonth = null;
 let firstLoad = true;
+let activeSummary = null;
 const kpiLastValues = {};
 
 const PERIOD_LABELS = {
@@ -1165,6 +1845,19 @@ function comparisonTitleFor(period) {
 
 function projectionApplies(period) {
   return period !== 'today';
+}
+
+function shiftMonth(month, offset) {
+  const [year, monthNumber] = month.split('-').map(Number);
+  const value = new Date(year, monthNumber - 1 + offset, 1);
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function updateMonthNav(summary) {
+  selectedMonth = summary.month;
+  latestMonth = summary.current_month;
+  document.getElementById('month-nav-label').textContent = summary.period_label;
+  document.getElementById('next-month').disabled = selectedMonth >= latestMonth;
 }
 
 /* ==============================
@@ -1206,19 +1899,35 @@ async function refresh() {
   const periodParam = '?period=' + currentPeriod;
   let summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all;
   try {
-    [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all] =
-      await Promise.all([
-        getJSON('/api/summary' + periodParam),
-        getJSON('/api/trend' + periodParam),
-        getJSON('/api/recent?limit=10'),
-        getJSON('/api/budgets' + periodParam),
-        getJSON('/api/recurring/upcoming'),
-        getJSON('/api/comparison' + periodParam),
-        getJSON('/api/projection' + periodParam),
-        getJSON('/api/fixed-expenses'),
-        getJSON('/api/month-summary'),
-        getJSON('/api/expenses' + periodParam),
-      ]);
+    if (monthlyDashboard) {
+      const monthParam = selectedMonth ? '?month=' + selectedMonth : '';
+      const monthly = await getJSON('/api/monthly-summary' + monthParam);
+      summary = monthly.summary;
+      trend = monthly.trend;
+      recent = {items: monthly.expenses.items.slice(0, 10)};
+      budgets = monthly.budgets;
+      recurring = {items: []};
+      comparison = monthly.comparison;
+      projection = {applies: false};
+      fixed = {items: []};
+      monthSum = null;
+      all = monthly.expenses;
+      updateMonthNav(monthly);
+    } else {
+      [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all] =
+        await Promise.all([
+          getJSON('/api/summary' + periodParam),
+          getJSON('/api/trend' + periodParam),
+          getJSON('/api/recent?limit=10'),
+          getJSON('/api/budgets' + periodParam),
+          getJSON('/api/recurring/upcoming'),
+          getJSON('/api/comparison' + periodParam),
+          getJSON('/api/projection' + periodParam),
+          getJSON('/api/fixed-expenses'),
+          getJSON('/api/month-summary'),
+          getJSON('/api/expenses' + periodParam),
+        ]);
+    }
   } catch (err) {
     subtitle.classList.remove('refreshing');
     subtitle.textContent = 'Error: ' + err.message;
@@ -1227,16 +1936,20 @@ async function refresh() {
 
   subtitle.textContent = summary.period_label + ' · ' + summary.start + ' → ' + summary.end;
   subtitle.classList.remove('refreshing');
+  activeSummary = summary;
 
-  document.getElementById('trend-title').textContent = trendTitleFor(currentPeriod);
+  document.getElementById('trend-title').textContent = monthlyDashboard
+    ? 'Gastos por día'
+    : trendTitleFor(currentPeriod);
   document.getElementById('budgets-title').textContent =
     'Presupuestos — ' + summary.period_label.toLowerCase();
-  document.getElementById('comparison-title').textContent =
-    comparisonTitleFor(currentPeriod);
+  document.getElementById('comparison-title').textContent = monthlyDashboard
+    ? `${summary.period_label} vs mes anterior`
+    : comparisonTitleFor(currentPeriod);
   document.getElementById('projection-title').textContent =
     'Proyección — ' + summary.period_label.toLowerCase();
   document.getElementById('projection-panel').style.display =
-    projectionApplies(currentPeriod) ? '' : 'none';
+    monthlyDashboard ? 'none' : (projectionApplies(currentPeriod) ? '' : 'none');
 
   // KPI cards (with animated counters on first load)
   const totals = Object.entries(summary.total_by_currency || {});
@@ -1318,9 +2031,14 @@ async function refresh() {
         }],
       },
       options: {
-        responsive: true, maintainAspectRatio: false,
-        cutout: '62%',
-        plugins: {
+         responsive: true, maintainAspectRatio: false,
+         cutout: '62%',
+         onClick: (_event, elements) => {
+           if (elements.length) {
+             openCategoryModal(cats[elements[0].index].name);
+           }
+         },
+         plugins: {
           legend: {
             position: 'bottom',
             labels: {
@@ -1343,12 +2061,32 @@ async function refresh() {
     );
   }
 
+  // Repeated expenses grouped by normalized name, category and currency.
+  const groupedDiv = document.getElementById('grouped-list');
+  document.getElementById('grouped-title').textContent =
+    'Gastos agrupados — ' + summary.period_label;
+  const grouped = summary.by_name_by_currency || {};
+  const groupedCurrencies = Object.keys(grouped);
+  if (!groupedCurrencies.length) {
+    groupedDiv.innerHTML = '<div class="subtitle">Sin gastos en este período.</div>';
+  } else {
+    groupedDiv.innerHTML = groupedCurrencies.map(cur => `
+      <div style="margin-bottom:14px">
+        <div class="subtitle" style="margin-bottom:6px">${cur}</div>
+        ${grouped[cur].map(g => `
+          <div style="display:flex; justify-content:space-between; gap:12px; padding:9px 0; border-bottom:1px solid rgba(255,255,255,0.05)">
+            <div><strong>${escapeHTML(g.name)}</strong><div class="subtitle">${escapeHTML(g.category)} · ${g.count} gasto${g.count === 1 ? '' : 's'}</div></div>
+            <strong style="white-space:nowrap">${currency(g.amount, cur)}</strong>
+          </div>`).join('')}
+      </div>`).join('');
+  }
+
   // Budgets
   const bDiv = document.getElementById('budgets-list');
   if (budgets.items.length === 0) {
     bDiv.innerHTML = '<div class="subtitle">No tenés presupuestos. Creá uno con <code>/presupuesto &lt;categoría&gt; &lt;monto&gt;</code> en Telegram.</div>';
   } else {
-    const isMonth = currentPeriod === 'month';
+    const isMonth = currentPeriod === 'month' || monthlyDashboard;
     bDiv.innerHTML = budgets.items.map(b => {
       const color = b.level === 'exceeded' ? '#f87171'
                    : b.level === 'warning' ? '#fbbf24' : '#34d399';
@@ -1472,7 +2210,7 @@ async function refresh() {
     </tr>`).join('');
 
   // Fixed expenses section
-  renderFixedExpenses(fixed, monthSum);
+  if (!monthlyDashboard) renderFixedExpenses(fixed, monthSum);
 
   // All-expenses panel
   renderAllExpenses(all);
@@ -1618,6 +2356,58 @@ function renderAllExpenses(data) {
   }
 }
 
+async function openCategoryModal(category) {
+  const modal = document.getElementById('category-modal');
+  const body = document.getElementById('category-modal-body');
+  const summaryEl = document.getElementById('category-modal-summary');
+  document.getElementById('category-modal-title').textContent = category;
+  summaryEl.textContent = 'Cargando…';
+  body.innerHTML = '';
+  modal.hidden = false;
+
+  const params = new URLSearchParams({category, limit: '2000'});
+  if (monthlyDashboard) {
+    params.set('period', 'custom');
+    params.set('custom_start', activeSummary.start);
+    params.set('custom_end', activeSummary.end);
+  } else {
+    params.set('period', currentPeriod);
+  }
+
+  try {
+    const data = await getJSON('/api/expenses?' + params.toString());
+    const totals = Object.entries(data.total_by_currency || {})
+      .map(([cur, amount]) => currency(amount, cur)).join(' · ');
+    summaryEl.textContent = `${data.count} gasto${data.count === 1 ? '' : 's'} · ${totals || 'Sin movimientos'}`;
+    if (!data.items.length) {
+      body.innerHTML = '<div class="subtitle">No hay movimientos en este período.</div>';
+      return;
+    }
+    body.innerHTML = `
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>Fecha</th><th>Nombre</th><th style="text-align:right">Monto</th></tr></thead>
+          <tbody>${data.items.map(e => `
+            <tr>
+              <td>${e.date}</td>
+              <td>${escapeHTML(e.name)}</td>
+              <td class="amount">${currency(e.amount, e.currency)}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      ${data.count > data.items.length
+        ? `<div class="subtitle" style="margin-top:10px">Mostrando ${data.items.length} de ${data.count} gastos.</div>`
+        : ''}`;
+  } catch (err) {
+    summaryEl.textContent = '';
+    body.innerHTML = `<div class="subtitle" style="color:#f87171">Error: ${escapeHTML(err.message)}</div>`;
+  }
+}
+
+function closeCategoryModal() {
+  document.getElementById('category-modal').hidden = true;
+}
+
 async function fxCreate() {
   const errEl = document.getElementById('fx-error');
   errEl.style.display = 'none';
@@ -1743,6 +2533,27 @@ function escapeHTML(s) {
     c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+if (monthlyDashboard) {
+  document.getElementById('page-title').innerHTML =
+    '<span class="emoji">📅</span> Resumen mensual';
+  document.getElementById('period-bar').style.display = 'none';
+  document.getElementById('month-nav').style.display = 'flex';
+  document.getElementById('fixed-panel').style.display = 'none';
+  document.getElementById('recurring-panel').style.display = 'none';
+  document.getElementById('projection-panel').style.display = 'none';
+
+  document.getElementById('prev-month').addEventListener('click', () => {
+    selectedMonth = shiftMonth(selectedMonth, -1);
+    refresh().catch(console.error);
+  });
+  document.getElementById('next-month').addEventListener('click', () => {
+    if (selectedMonth < latestMonth) {
+      selectedMonth = shiftMonth(selectedMonth, 1);
+      refresh().catch(console.error);
+    }
+  });
+}
+
 document.querySelectorAll('#period-bar button').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('#period-bar button').forEach(b => b.classList.remove('active'));
@@ -1784,6 +2595,12 @@ document.getElementById('fx-amount').addEventListener('keydown', (e) => {
 });
 document.getElementById('all-sort').addEventListener('change', () => {
   if (currentAllData) renderAllExpenses(currentAllData);
+});
+document.querySelectorAll('[data-close-category-modal]').forEach(el => {
+  el.addEventListener('click', closeCategoryModal);
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeCategoryModal();
 });
 </script>
 </body>

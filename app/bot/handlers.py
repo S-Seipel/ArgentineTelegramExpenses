@@ -33,11 +33,13 @@ from app.fixed_expenses.service import (
     FixedExpenseValidationError,
     current_month_year,
 )
-from app.money import UserSettingsService
+from app.money import MoneyEngine, UserSettingsService
 from app.utils.amounts import _normalize_decimal, find_thousand_amounts
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
 from app.ai.schemas import AIError, AIUnavailable
+from app.insights import format_spending_analysis, spending_context
+from app.web.queries import resolve_period
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,38 @@ async def handle_command(
     command = parts[0].lower()
     args = parts[1:]
     user_id = update.effective_user.id
+
+    if command in ("/analisis", "/analisis_mes", "/consejos"):
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        today = today_in_tz(deps.runtime.settings.timezone)
+        with session_scope() as session:
+            context_data = spending_context(session, user_id, today)
+        if context_data is None:
+            await update.effective_message.reply_text(
+                "Todavía no tengo gastos del mes para analizar."
+            )
+            return
+        try:
+            analysis = await deps.runtime.ai.analyze_spending(context_data)
+        except AIUnavailable:
+            logger.exception("AI provider unreachable during spending analysis")
+            await update.effective_message.reply_text(
+                "🤖 No pude consultar la IA para analizar tus gastos. "
+                "Probá de nuevo en un momento."
+            )
+            return
+        except AIError:
+            logger.exception("AI spending analysis failed")
+            await update.effective_message.reply_text(
+                "🤖 No pude generar un análisis válido. Probá de nuevo."
+            )
+            return
+        await update.effective_message.reply_text(
+            format_spending_analysis(
+                analysis, resolve_period("month", today).label
+            )
+        )
+        return
 
     spec = command_to_spec(command)
     if spec is not None:
@@ -149,7 +183,6 @@ async def handle_command(
         "/gastosfijos", "/gastofijo_add", "/gastofijo_del",
         "/gastofijo_off", "/gastofijo_on",
         "/pague", "/salte", "/liberado",
-        "/ingreso", "/extra",
     ):
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         with session_scope() as session:
@@ -176,6 +209,116 @@ async def handle_command(
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         reply = _handle_cycle_read_command(
             command,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/ingreso":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_ingreso_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/extra":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_extra_command(
+            args,
+            user_id=user_id,
+            chat_id=update.effective_message.chat_id,
+            message_id=update.effective_message.message_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/extra_editar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_extra_editar_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/extra_borrar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_extra_borrar_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/target":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_target_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/reservar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_reservar_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/liberar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_liberar_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/ahorro_realizado":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_ahorro_realizado_command(
+            args,
+            user_id=user_id,
+            chat_id=update.effective_message.chat_id,
+            message_id=update.effective_message.message_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+            text=raw,
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/ahorro_editar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_ahorro_editar_command(
+            args,
+            user_id=user_id,
+            today=today_in_tz(deps.runtime.settings.timezone),
+        )
+        await update.effective_message.reply_text(reply)
+        return
+
+    if command == "/ahorro_borrar":
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        reply = _handle_ahorro_borrar_command(
+            args,
             user_id=user_id,
             today=today_in_tz(deps.runtime.settings.timezone),
         )
@@ -1058,26 +1201,6 @@ def _handle_fixed_expense_command(
     if command == "/liberado":
         return _format_month_summary(service, user_id, month_year)
 
-    if command == "/ingreso":
-        if not args:
-            return "❓ Decime el monto. Ej: `/ingreso 1100000`."
-        amount = _parse_user_amount(args[0])
-        if amount is None:
-            return f"❓ No pude interpretar el monto `{args[0]}`."
-        if amount < 0:
-            return "🤔 El ingreso no puede ser negativo."
-        service.set_budget(user_id, month_year, income=amount)
-        return f"💸 Ingreso de {month_year}: ${amount}"
-
-    if command == "/extra":
-        if not args:
-            return "❓ Decime el monto. Ej: `/extra 75000`."
-        amount = _parse_user_amount(args[0])
-        if amount is None:
-            return f"❓ No pude interpretar el monto `{args[0]}`."
-        service.set_budget(user_id, month_year, extra=amount)
-        return f"💸 Extra de {month_year}: ${amount}"
-
     return "Comando no reconocido."
 
 
@@ -1198,9 +1321,9 @@ def _handle_cycle_read_command(
     ``CycleService.ensure_current_cycle`` walks the rollover chain if
     the open cycle is expired; ``MoneyEngine.get_cycle_summary`` is
     the read-only source of truth inside the same session so the
-    numbers stay in lockstep with the API layer.
+     numbers stay in lockstep with the API layer.
     """
-    from app.money import CycleService, MoneyEngine
+    from app.money import CycleService
 
     with session_scope() as session:
         cycle_service = CycleService(session)
@@ -1308,3 +1431,512 @@ def _format_daily(summary) -> str:
         f"📅 Podés gastar {bits} por día "
         f"(quedan {days} día(s) en el ciclo)."
     )
+
+
+# ---------------------------------------------------------------------------
+# R3 — money mutations over Telegram
+# ---------------------------------------------------------------------------
+#
+# Source keys are deterministic per (chat, message) so retried / replayed
+# messages never create duplicate rows. Currency comes from the existing
+# detect_currency_hint helper; ARS is the default.
+
+
+def _tg_source_key(prefix: str, chat_id: int, message_id: int) -> str:
+    return f"telegram:{prefix}:{chat_id}:{message_id}"
+
+
+def _parse_tg_amount(args: list[str]) -> Decimal | None:
+    if not args:
+        return None
+    return _normalize_decimal(args[0])
+
+
+def _parse_tg_currency(text: str, args: list[str]) -> str:
+    # Reuse the existing detector so the surface stays consistent.
+    from app.utils.amounts import detect_currency_hint
+
+    hint = detect_currency_hint(" ".join(args) or text or "")
+    return (hint or "ARS").upper()
+
+
+def _resolve_current_cycle_id_or_message(user_id: int, today) -> tuple[int | None, str | None]:
+    """Return ``(cycle_id, error_message)``.
+
+    ``CycleService.ensure_current_cycle`` walks the rollover chain so a
+    Telegram user does not need to know about cycles; the handler is
+    always implicitly about the open one. Failures map to user-friendly
+    Spanish strings.
+    """
+    from app.money import CycleCatchUpLimitExceeded, CycleService
+
+    with session_scope() as s:
+        try:
+            cycle = CycleService(s).ensure_current_cycle(user_id, today)
+        except CycleCatchUpLimitExceeded as exc:
+            return None, (
+                "⚠️ Detecté muchos ciclos cerrados sin cerrar; "
+                "avisale al admin para revisar el estado. "
+                f"Detalle: {exc}"
+            )
+    return cycle.id, None
+
+
+def _handle_ingreso_command(
+    args: list[str],
+    *,
+    user_id: int,
+    today,
+    text: str = "",
+) -> str:
+    from app.money import MoneyStateService
+
+    amount = _parse_tg_amount(args)
+    if amount is None:
+        return (
+            "❓ Decime el monto. Ej: `/ingreso 1100000`.\n"
+            "Valores válidos: 0 o más."
+        )
+    if amount < 0:
+        return "❓ El monto tiene que ser 0 o más."
+    currency = _parse_tg_currency(text, args)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).set_income(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency, amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ingreso failed")
+        return f"⚠️ No pude guardar el ingreso: {exc}"
+    return _format_mutation_ack(
+        "💼 Ingreso base actualizado.",
+        currency, summary.base_income.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_extra_command(
+    args: list[str],
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    today,
+    text: str = "",
+) -> str:
+    from app.money import MoneyStateService
+
+    amount = _parse_tg_amount(args)
+    if amount is None:
+        return (
+            "❓ Decime el monto. Ej: `/extra 50000 regalo cumpleaños`.\n"
+            "Valores válidos: mayor a 0."
+        )
+    if amount <= 0:
+        return "❓ El monto tiene que ser mayor a 0."
+    currency = _parse_tg_currency(text, args)
+    note = " ".join(args[1:]).strip() or None
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    source_key = _tg_source_key("extra", chat_id, message_id)
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).record_extra_income(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency, amount=amount,
+                source_key=source_key, note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("extra failed")
+        return f"⚠️ No pude guardar el extra: {exc}"
+    return _format_mutation_ack(
+        f"🎁 Extra registrado (id #{row.id}).",
+        currency, summary.extra_income.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_extra_editar_command(
+    args: list[str],
+    *,
+    user_id: int,
+    today,
+) -> str:
+    from app.money import MoneyStateService
+
+    if not args:
+        return "❓ Uso: `/extra_editar <id> <monto> [nota]`."
+    try:
+        extra_id = int(args[0])
+    except ValueError:
+        return "❓ El id tiene que ser un número entero."
+    if len(args) < 2:
+        return "❓ Falta el monto. Uso: `/extra_editar <id> <monto> [nota]`."
+    amount = _normalize_decimal(args[1])
+    if amount is None:
+        return "❓ El monto no es un número válido."
+    note = " ".join(args[2:]).strip() or None
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).update_extra_income(
+                user_id=user_id, extra_id=extra_id,
+                amount=amount, note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("extra_editar failed")
+        return f"⚠️ No pude editar el extra: {exc}"
+    return _format_mutation_ack(
+        f"✏️ Extra #{extra_id} actualizado.",
+        row.currency, summary.extra_income.get(row.currency),
+        summary=summary,
+    )
+
+
+def _handle_extra_borrar_command(
+    args: list[str], *, user_id: int, today
+) -> str:
+    from app.money import MoneyStateService
+
+    if not args:
+        return "❓ Uso: `/extra_borrar <id>`."
+    try:
+        extra_id = int(args[0])
+    except ValueError:
+        return "❓ El id tiene que ser un número entero."
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).soft_delete_extra_income(
+                user_id=user_id, extra_id=extra_id,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, _resolve_cycle_id_for_extra(s, user_id, extra_id),
+                today=today,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("extra_borrar failed")
+        return f"⚠️ No pude borrar el extra: {exc}"
+    return _format_mutation_ack(
+        f"🗑️ Extra #{extra_id} borrado.",
+        "ARS", None, summary=summary,
+    )
+
+
+def _resolve_cycle_id_for_extra(s, user_id: int, extra_id: int) -> int:
+    """Look up the cycle id for a deleted extra so we can summarize."""
+    from sqlalchemy import select
+    from app.money.models import CycleIncome, FinancialCycle
+
+    cycle_id = s.execute(
+        select(CycleIncome.cycle_id).where(CycleIncome.id == extra_id)
+    ).scalar_one_or_none()
+    if cycle_id is None:
+        return 0
+    s.execute(
+        select(FinancialCycle.id).where(
+            FinancialCycle.id == cycle_id,
+            FinancialCycle.telegram_user_id == user_id,
+        )
+    ).scalar_one_or_none()
+    return cycle_id
+
+
+def _parse_target_value(args: list[str]) -> tuple[Decimal | None, Decimal | None]:
+    """Parse the /target argument as either ``pct`` or ``amount``.
+
+    Spec §15 keeps the syntax explicit:
+
+    - ``/target 20%``     → pct = 0.20
+    - ``/target 220000``  → amount = 220000
+
+    The percentage suffix (``%``) is the only thing that disambiguates
+    "20%" (pct) from "20" (amount). Anything without the suffix is
+    treated as an amount — we never silently interpret a bare number as
+    a percentage.
+    """
+    if not args:
+        return None, None
+    raw = args[0]
+    if raw.endswith("%"):
+        pct = _normalize_decimal(raw[:-1].strip())
+        if pct is None:
+            return None, None
+        return pct / Decimal("100"), None
+    val = _normalize_decimal(raw)
+    if val is None:
+        return None, None
+    return None, val
+
+
+def _handle_target_command(
+    args: list[str], *, user_id: int, today, text: str = ""
+) -> str:
+    from app.money import MoneyStateService
+
+    if not args:
+        return (
+            "❓ Decime el target. Ej: `/target 20%` o `/target 220000`."
+        )
+    pct, amount = _parse_target_value(args)
+    if pct is None and amount is None:
+        return (
+            "❓ No pude entender el target.\n"
+            "Usá `/target 20%` para porcentaje o "
+            "`/target 220000` para monto."
+        )
+    currency = _parse_tg_currency(text, args)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).set_savings_target(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency,
+                target_pct=pct, target_amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("target failed")
+        return f"⚠️ No pude guardar el target: {exc}"
+    return _format_mutation_ack(
+        "🎯 Target de ahorro actualizado.",
+        currency, summary.savings_target.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_reservar_command(
+    args: list[str], *, user_id: int, today, text: str = ""
+) -> str:
+    from app.money import MoneyStateService
+
+    amount = _parse_tg_amount(args)
+    if amount is None:
+        return (
+            "❓ Decime el monto. Ej: `/reservar 220000`.\n"
+            "Valores válidos: 0 o más."
+        )
+    if amount < 0:
+        return "❓ El monto tiene que ser 0 o más."
+    currency = _parse_tg_currency(text, args)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).set_savings_reserved(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency, amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("reservar failed")
+        return f"⚠️ No pude guardar la reserva: {exc}"
+    return _format_mutation_ack(
+        "🔒 Reserva actualizada.",
+        currency, summary.savings_reserved.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_liberar_command(
+    args: list[str], *, user_id: int, today, text: str = ""
+) -> str:
+    from app.money import MoneyStateService
+
+    amount = _parse_tg_amount(args)
+    if amount is None:
+        return (
+            "❓ Decime el monto a liberar. Ej: `/liberar 100000`.\n"
+            "Valores válidos: mayor a 0."
+        )
+    if amount <= 0:
+        return "❓ El monto tiene que ser mayor a 0."
+    currency = _parse_tg_currency(text, args)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).release_savings(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency, amount=amount,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("liberar failed")
+        return f"⚠️ No pude liberar la reserva: {exc}"
+    return _format_mutation_ack(
+        "🔓 Reserva liberada.",
+        currency, summary.savings_reserved.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_ahorro_realizado_command(
+    args: list[str],
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    today,
+    text: str = "",
+) -> str:
+    from app.money import MoneyStateService
+
+    amount = _parse_tg_amount(args)
+    if amount is None:
+        return (
+            "❓ Decime el monto. Ej: `/ahorro_realizado 50000 transferencia`."
+        )
+    if amount <= 0:
+        return "❓ El monto tiene que ser mayor a 0."
+    currency = _parse_tg_currency(text, args)
+    note = " ".join(args[1:]).strip() or None
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    if err is not None:
+        return err
+    source_key = _tg_source_key("savings", chat_id, message_id)
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).record_savings_realized(
+                user_id=user_id, cycle_id=cycle_id,
+                currency=currency, amount=amount,
+                source_key=source_key, note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ahorro_realizado failed")
+        return f"⚠️ No pude guardar el ahorro: {exc}"
+    return _format_mutation_ack(
+        f"🏦 Ahorro realizado registrado (id #{row.id}).",
+        currency, summary.savings_realized.get(currency),
+        summary=summary,
+    )
+
+
+def _handle_ahorro_editar_command(
+    args: list[str], *, user_id: int, today
+) -> str:
+    from app.money import MoneyStateService
+
+    if not args:
+        return "❓ Uso: `/ahorro_editar <id> <monto> [nota]`."
+    try:
+        rid = int(args[0])
+    except ValueError:
+        return "❓ El id tiene que ser un número entero."
+    if len(args) < 2:
+        return "❓ Falta el monto. Uso: `/ahorro_editar <id> <monto> [nota]`."
+    amount = _normalize_decimal(args[1])
+    if amount is None:
+        return "❓ El monto no es un número válido."
+    note = " ".join(args[2:]).strip() or None
+    try:
+        with session_scope() as s:
+            row = MoneyStateService(s).update_savings_realized(
+                user_id=user_id, realization_id=rid,
+                amount=amount, note=note,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id, row.cycle_id, today=today
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ahorro_editar failed")
+        return f"⚠️ No pude editar el ahorro: {exc}"
+    return _format_mutation_ack(
+        f"✏️ Ahorro #{rid} actualizado.",
+        row.currency, summary.savings_realized.get(row.currency),
+        summary=summary,
+    )
+
+
+def _handle_ahorro_borrar_command(
+    args: list[str], *, user_id: int, today
+) -> str:
+    from app.money import MoneyStateService
+
+    if not args:
+        return "❓ Uso: `/ahorro_borrar <id>`."
+    try:
+        rid = int(args[0])
+    except ValueError:
+        return "❓ El id tiene que ser un número entero."
+    try:
+        with session_scope() as s:
+            MoneyStateService(s).soft_delete_savings_realized(
+                user_id=user_id, realization_id=rid,
+            )
+            summary = MoneyEngine(s).get_cycle_summary(
+                user_id,
+                _resolve_cycle_id_for_realization(s, rid),
+                today=today,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ahorro_borrar failed")
+        return f"⚠️ No pude borrar el ahorro: {exc}"
+    return _format_mutation_ack(
+        f"🗑️ Ahorro #{rid} borrado.",
+        "ARS", None, summary=summary,
+    )
+
+
+def _resolve_cycle_id_for_realization(s, realization_id: int) -> int:
+    from sqlalchemy import select
+    from app.money.models import SavingsRealization
+
+    return s.execute(
+        select(SavingsRealization.cycle_id).where(
+            SavingsRealization.id == realization_id
+        )
+    ).scalar_one_or_none() or 0
+
+
+def _format_mutation_ack(
+    headline: str,
+    currency: str,
+    new_value: Decimal | None,
+    *,
+    summary,
+) -> str:
+    from app.utils.formatting import format_currency_amount
+
+    parts: list[str] = [headline]
+    if new_value is not None:
+        parts.append(
+            f"→ {currency}: {format_currency_amount(new_value, currency)}"
+        )
+    available = summary.available_to_spend.get(currency)
+    if available is not None:
+        parts.append(
+            f"💰 Disponible: {format_currency_amount(available, currency)} {currency}"
+        )
+    committed = summary.savings_committed.get(currency)
+    if committed is not None:
+        parts.append(
+            f"🔒 Comprometido: {format_currency_amount(committed, currency)} {currency}"
+        )
+    return "\n".join(parts)
+    return "\n".join(parts)
