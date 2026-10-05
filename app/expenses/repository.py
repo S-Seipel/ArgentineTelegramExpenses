@@ -8,6 +8,7 @@ from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.expenses.models import Expense
+from app.expenses.names import normalize_expense_name
 from app.expenses.schemas import ExpenseCreate, ExpenseSummary
 from app.categories.models import Category
 
@@ -27,6 +28,7 @@ class ExpenseRepository:
         obj = Expense(
             telegram_user_id=payload.telegram_user_id,
             name=payload.name,
+            name_key=payload.name_key or normalize_expense_name(payload.name),
             amount=payload.amount,
             currency=payload.currency,
             category_id=payload.category_id,
@@ -61,6 +63,7 @@ class ExpenseRepository:
             Expense(
                 telegram_user_id=p.telegram_user_id,
                 name=p.name,
+                name_key=p.name_key or normalize_expense_name(p.name),
                 amount=p.amount,
                 currency=p.currency,
                 category_id=p.category_id,
@@ -547,6 +550,7 @@ class ExpenseRepository:
         if len(new_name) > 200:
             raise ValueError("name too long")
         row.name = new_name
+        row.name_key = normalize_expense_name(new_name)
         row.revision = (row.revision or 1) + 1
         self.session.commit()
         self.session.refresh(row)

@@ -789,6 +789,7 @@ def _state_error_to_http(exc: Exception) -> HTTPException:
         InvalidAmountError,
         InvalidSourceKeyError,
         InvalidTargetValueError,
+        MoneySourceCurrencyConflictError,
         SavingsRealizationNotFoundError,
         TargetXorViolationError,
     )
@@ -797,6 +798,14 @@ def _state_error_to_http(exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=409,
             detail={"code": "cycle_closed", "message": str(exc)},
+        )
+    if isinstance(exc, MoneySourceCurrencyConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_currency_conflict",
+                "message": "La moneda de esta operación no se puede cambiar.",
+            },
         )
     if isinstance(exc, (CycleNotFoundError, CycleOwnershipMismatchError)):
         return HTTPException(

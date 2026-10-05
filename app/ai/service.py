@@ -21,6 +21,7 @@ from typing import Any, Protocol
 import httpx
 
 from app.ai.prompts import (
+    spending_analysis_prompt,
     system_prompt,
     today_str,
     user_instructions,
@@ -30,6 +31,7 @@ from app.ai.schemas import (
     AIUnavailable,
     Intent,
     ParsedMessage,
+    SpendingAnalysis,
     parse_ai_response,
 )
 from app.config.settings import Settings
@@ -71,6 +73,8 @@ class AIService(Protocol):
     ) -> ParsedMessage: ...
 
     async def transcribe(self, audio: bytes) -> str: ...
+
+    async def analyze_spending(self, context: str) -> SpendingAnalysis: ...
 
 
 class OllamaAIService:
@@ -226,6 +230,32 @@ class OllamaAIService:
 
         raise AIError(
             f"Could not get a valid AI response: {last_error}"
+        ) from last_error
+
+    async def analyze_spending(self, context: str) -> SpendingAnalysis:
+        if not context or not context.strip():
+            raise AIError("Empty spending analysis context")
+        system_msg = spending_analysis_prompt()
+        user_msg = context
+        last_error: Exception | None = None
+        for attempt in range(self.cfg.max_retries + 1):
+            try:
+                raw = await self._call_model(system_msg, user_msg)
+                return SpendingAnalysis.model_validate(raw)
+            except AIUnavailable:
+                raise
+            except (AIError, ValueError) as exc:
+                last_error = exc
+                if attempt < self.cfg.max_retries:
+                    user_msg = (
+                        f"{context}\n\nLa respuesta anterior fue inválida. "
+                        "Devolvé un JSON válido, breve y completo con exactamente "
+                        "summary, observations, recommendations y caveat."
+                    )
+                    continue
+                break
+        raise AIError(
+            f"AI spending analysis failed: {last_error}"
         ) from last_error
 
     async def _call_model(self, system: str, user: str) -> Any:

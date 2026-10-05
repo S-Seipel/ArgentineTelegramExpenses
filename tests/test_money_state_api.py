@@ -58,6 +58,30 @@ def _post(client: TestClient, path: str, payload: dict):
     return client.post(path, json=payload)
 
 
+@pytest.mark.parametrize(
+    "path", ["/api/cycles/extra", "/api/cycles/savings/realized"]
+)
+def test_api_source_key_rejects_currency_change(api_client, in_memory_db, path):
+    user_id = _auth_user_id()
+    view = _open_cycle(user_id, payday_day=2, today=date(2026, 10, 5))
+    payload = {
+        "cycle_id": view.cycle_id, "currency": "ARS",
+        "amount": "50", "source_key": "X",
+    }
+    assert _post(api_client, path, payload).status_code == 200
+    conflict = _post(api_client, path, {**payload, "currency": "USD"})
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "source_currency_conflict"
+    assert "X" not in conflict.json()["detail"]["message"]
+    with session_scope() as s:
+        from app.money.models import CycleIncome, SavingsRealization
+
+        model = CycleIncome if path.endswith("extra") else SavingsRealization
+        rows = s.query(model).filter_by(cycle_id=view.cycle_id, source_key="X").all()
+        assert len(rows) == 1
+        assert rows[0].currency == "ARS"
+
+
 # ---------------------------------------------------------------------------
 # /api/cycles/income
 # ---------------------------------------------------------------------------

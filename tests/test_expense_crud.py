@@ -228,3 +228,23 @@ def test_sum_by_category_with_period(in_memory_db):
             1, start=date(2026, 1, 1), end=date(2026, 1, 31)
         )
     assert totals.get("Café") == Decimal("5000.00")
+
+
+def test_name_key_is_saved_and_updated(in_memory_db):
+    with session_scope() as s:
+        service = ExpenseService(ExpenseRepository(s))
+        outcome = service.register_many(
+            user_id=1,
+            drafts=[_draft(name="tapa bocas")],
+            original_message="seed",
+        )
+        expense_id = outcome.saved[0].id
+        assert outcome.saved[0].name_key == "tapabocas"
+
+        updated = ExpenseRepository(s).update_name(
+            1, expense_id, "tapabocas"
+        )
+        assert updated is not None
+        row = ExpenseRepository(s).get_entity(1, expense_id)
+        assert row is not None
+        assert row.name_key == "tapabocas"

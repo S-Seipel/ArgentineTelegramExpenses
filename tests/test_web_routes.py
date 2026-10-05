@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -86,6 +86,73 @@ def test_api_summary_with_expenses(in_memory_db):
     cats = {c["name"]: c["amount"] for c in data["by_category"]}
     assert cats["Café"] == 5000.0
     assert cats["Restaurante"] == 15000.0
+
+
+def test_api_expenses_filters_by_category(in_memory_db):
+    today = today_in_tz("UTC")
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=USER_ID,
+            drafts=[
+                _draft(name="Café", amount=Decimal("5000"), category="Café"),
+                _draft(name="Almuerzo", amount=Decimal("15000"), category="Restaurante"),
+            ],
+            original_message="seed",
+        )
+
+    data = TestClient(app).get(
+        "/api/expenses?period=month&category=Caf%C3%A9"
+    ).json()
+    assert data["count"] == 1
+    assert data["total_by_currency"] == {"ARS": 5000.0}
+    assert data["items"][0]["name"] == "Café"
+
+
+def test_api_summary_groups_name_variants(in_memory_db):
+    today = today_in_tz("UTC")
+    with session_scope() as s:
+        service = ExpenseService(ExpenseRepository(s))
+        service.register_many(
+            user_id=USER_ID,
+            drafts=[
+                _draft(name="tapa bocas", amount=Decimal("5000"), expense_date=today),
+                _draft(name="tapabocas", amount=Decimal("7000"), expense_date=today),
+            ],
+            original_message="seed",
+        )
+
+    data = TestClient(app).get("/api/summary?period=month").json()
+    groups = data["by_name_by_currency"]["ARS"]
+    assert {
+        (group["name"], group["count"], group["amount"])
+        for group in groups
+    } == {("tapabocas", 2, 12000.0)}
+
+
+def test_api_monthly_summary_uses_exact_calendar_month(in_memory_db):
+    today = today_in_tz("UTC")
+    month_end = today.replace(day=1) - timedelta(days=1)
+    month_key = month_end.strftime("%Y-%m")
+    with session_scope() as s:
+        ExpenseService(ExpenseRepository(s)).register_many(
+            user_id=USER_ID,
+            drafts=[
+                _draft(
+                    name="Cierre del mes",
+                    amount=Decimal("8000"),
+                    expense_date=month_end,
+                )
+            ],
+            original_message="seed",
+        )
+
+    data = TestClient(app).get(
+        f"/api/monthly-summary?month={month_key}"
+    ).json()
+    assert data["month"] == month_key
+    assert data["summary"]["start"] == f"{month_key}-01"
+    assert len(data["trend"]["points"]) == month_end.day
+    assert data["expenses"]["total_by_currency"]["ARS"] == 8000.0
 
 
 def test_api_trend_returns_daily_series(client):

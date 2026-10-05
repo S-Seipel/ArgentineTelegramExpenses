@@ -393,6 +393,34 @@ def test_invariant_no_violations_for_clean_state(in_memory_db):
     assert v == []
 
 
+def test_invariant_detection_is_scoped_to_template_owner(in_memory_db):
+    today = date(2026, 10, 15)
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        good = svc.add(
+            1, FixedExpenseDraft(name="A", expected_amount=Decimal("100"),
+                                 due_day_of_month=5)
+        )
+        svc.mark_paid(1, good.id, "2026-10", paid_on=today)
+        bad = svc.add(
+            2, FixedExpenseDraft(name="B", expected_amount=Decimal("100"),
+                                 due_day_of_month=5)
+        )
+        svc.mark_paid(2, bad.id, "2026-10", paid_on=today)
+        payment = s.query(FixedExpensePayment).filter_by(
+            fixed_expense_id=bad.id, month_year="2026-10"
+        ).one()
+        payment.expense_id = None
+
+    with session_scope() as s:
+        engine = MoneyEngine(s)
+        assert engine.detect_invariant_violations(1) == []
+        violations = engine.detect_invariant_violations(2)
+        assert len(violations) == 1
+        assert violations[0].kind == InvariantViolationKind.EXPENSE_ID_NULL
+        assert violations[0].fixed_expense_id == bad.id
+
+
 def test_invariant_no_violations_for_pending_payment(in_memory_db):
     """Pending payments (paid_at IS NULL) are not inspected."""
     today = date(2026, 10, 15)

@@ -39,9 +39,59 @@ from app.money.money_state_service import (
     InvalidAmountError,
     InvalidSourceKeyError,
     InvalidTargetValueError,
+    MoneySourceCurrencyConflictError,
     SavingsRealizationNotFoundError,
     TargetXorViolationError,
 )
+
+
+@pytest.mark.parametrize(
+    "model,record_name,update_name,delete_name",
+    [
+        (CycleIncome, "record_extra_income", "update_extra_income",
+         "soft_delete_extra_income"),
+        (SavingsRealization, "record_savings_realized",
+         "update_savings_realized", "soft_delete_savings_realized"),
+    ],
+)
+def test_source_key_currency_stays_fixed_through_retry_update_and_restore(
+    in_memory_db, model, record_name, update_name, delete_name
+):
+    view = _open_cycle(1, payday_day=2, today=date(2026, 10, 5))
+
+    def record(currency, amount):
+        with session_scope() as s:
+            return getattr(MoneyStateService(s), record_name)(
+                user_id=1, cycle_id=view.cycle_id, currency=currency,
+                amount=Decimal(amount), source_key="X",
+            )
+
+    first = record("ARS", "10")
+    assert record("ARS", "10").id == first.id
+    with session_scope() as s:
+        getattr(MoneyStateService(s), update_name)(
+            1, first.id, amount=Decimal("20"), note="corregido"
+        )
+
+    with pytest.raises(MoneySourceCurrencyConflictError) as exc_info:
+        record("USD", "30")
+    assert exc_info.value.source_key == "X"
+    assert exc_info.value.existing_currency == "ARS"
+    assert exc_info.value.requested_currency == "USD"
+
+    with session_scope() as s:
+        getattr(MoneyStateService(s), delete_name)(1, first.id)
+    with pytest.raises(MoneySourceCurrencyConflictError):
+        record("USD", "30")
+
+    restored = record("ARS", "25")
+    assert restored.id == first.id
+    with session_scope() as s:
+        rows = s.query(model).filter_by(cycle_id=view.cycle_id, source_key="X").all()
+        assert len(rows) == 1
+        assert rows[0].currency == "ARS"
+        assert rows[0].amount == Decimal("25.00")
+        assert rows[0].deleted_at is None
 
 
 # ---------------------------------------------------------------------------

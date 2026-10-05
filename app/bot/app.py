@@ -90,6 +90,17 @@ def build_application(
     application.add_handler(
         CommandHandler(
             [
+                "config_payday", "cycle", "disponible", "gastar_diario",
+                "extra_editar", "extra_borrar", "target", "reservar",
+                "ahorro_realizado", "ahorro_editar", "ahorro_borrar",
+                "liberar",
+            ],
+            _command_handler,
+        )
+    )
+    application.add_handler(
+        CommandHandler(
+            [
                 "presupuesto",
                 "presupuestos",
                 "presupuesto_del",

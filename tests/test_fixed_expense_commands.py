@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,7 +13,10 @@ from app.bot.service import BotRuntime
 from app.config.settings import Settings
 from app.database.database import session_scope
 from app.fixed_expenses.repository import FixedExpenseRepository
-from app.fixed_expenses.service import FixedExpenseService
+from app.fixed_expenses.service import (
+    FixedExpenseHasHistoricalCarryOverError,
+    FixedExpenseService,
+)
 
 
 def _settings() -> Settings:
@@ -182,7 +185,7 @@ def test_salte_marks_as_skipped(runtime):
     assert "salteado" in reply.lower()
 
 
-def test_ingreso_and_liberado(runtime):
+def test_ingreso_and_liberado(runtime, monkeypatch):
     """``/liberado`` continues to read the legacy ``MonthlyBudget`` row.
 
     R3 redirects ``/ingreso`` and ``/extra`` to the financial-cycle
@@ -190,6 +193,7 @@ def test_ingreso_and_liberado(runtime):
     §20: models coexist during the transition). To exercise
     ``/liberado`` we therefore seed ``MonthlyBudget`` directly.
     """
+    monkeypatch.setattr("app.bot.handlers.today_in_tz", lambda _tz: date(2026, 9, 25))
     from app.fixed_expenses.service import FixedExpenseDraft
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
@@ -260,3 +264,20 @@ def test_gastofijo_off_then_on(runtime):
     update2 = _make_update(1, message2)
     _run(handle_command(update2, None, deps))
     assert "reanudado" in message2.reply_text.call_args.args[0].lower()
+
+
+def test_gastofijo_del_historical_carry_over_error_is_user_facing(runtime):
+    message = MagicMock()
+    message.text = "/gastofijo_del 7"
+    message.reply_text = AsyncMock()
+    message.chat.send_action = AsyncMock()
+    update = _make_update(1, message)
+    with patch.object(
+        FixedExpenseService, "delete",
+        side_effect=FixedExpenseHasHistoricalCarryOverError(
+            "Desactivalo para evitar nuevos vencimientos."
+        ),
+    ):
+        _run(handle_command(update, None, BotDependencies(runtime=runtime)))
+    reply = message.reply_text.call_args.args[0]
+    assert "Desactivalo" in reply

@@ -29,6 +29,7 @@ from app.budgets.service import BudgetDraft, BudgetService, BudgetValidationErro
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.service import (
     FixedExpenseDraft,
+    FixedExpenseHasHistoricalCarryOverError,
     FixedExpenseService,
     FixedExpenseValidationError,
     current_month_year,
@@ -1129,7 +1130,15 @@ def _handle_fixed_expense_command(
         except ValueError:
             return "❓ El ID tiene que ser un número entero."
         if command == "/gastofijo_del":
-            obj = service.delete(user_id, fid)
+            from app.money.engine import FixedExpenseHasOutstandingDebtError
+
+            try:
+                obj = service.delete(user_id, fid)
+            except (
+                FixedExpenseHasHistoricalCarryOverError,
+                FixedExpenseHasOutstandingDebtError,
+            ) as exc:
+                return f"⚠️ {exc}"
             if obj is None:
                 return f"🤷 No encontré el gasto fijo #{fid}."
             action = "eliminado"
@@ -1531,7 +1540,7 @@ def _handle_extra_command(
     today,
     text: str = "",
 ) -> str:
-    from app.money import MoneyStateService
+    from app.money import MoneySourceCurrencyConflictError, MoneyStateService
 
     amount = _parse_tg_amount(args)
     if amount is None:
@@ -1557,6 +1566,8 @@ def _handle_extra_command(
             summary = MoneyEngine(s).get_cycle_summary(
                 user_id, cycle_id, today=today
             )
+    except MoneySourceCurrencyConflictError:
+        return "⚠️ Ese extra ya fue registrado en otra moneda."
     except Exception as exc:  # noqa: BLE001
         logger.exception("extra failed")
         return f"⚠️ No pude guardar el extra: {exc}"
@@ -1802,7 +1813,7 @@ def _handle_ahorro_realizado_command(
     today,
     text: str = "",
 ) -> str:
-    from app.money import MoneyStateService
+    from app.money import MoneySourceCurrencyConflictError, MoneyStateService
 
     amount = _parse_tg_amount(args)
     if amount is None:
@@ -1827,6 +1838,8 @@ def _handle_ahorro_realizado_command(
             summary = MoneyEngine(s).get_cycle_summary(
                 user_id, cycle_id, today=today
             )
+    except MoneySourceCurrencyConflictError:
+        return "⚠️ Ese ahorro ya fue registrado en otra moneda."
     except Exception as exc:  # noqa: BLE001
         logger.exception("ahorro_realizado failed")
         return f"⚠️ No pude guardar el ahorro: {exc}"

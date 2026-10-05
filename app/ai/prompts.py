@@ -65,6 +65,23 @@ def user_instructions(today_iso: str, timezone_name: str) -> str:
     )
 
 
+def spending_analysis_prompt() -> str:
+    """Prompt for grounded, aggregate-only spending advice."""
+    return (
+        "Sos un analista de gastos personales. Devolvé SOLO JSON válido, "
+        "sin markdown. Analizá únicamente los datos agregados provistos. "
+        "No inventes ingresos, precios, deudas ni ahorros. Sé concreto, "
+        "respetuoso y práctico. Separá monedas. No recomiendes eliminar "
+        "Gastos fijos automáticamente: son compromisos y sólo podés sugerir "
+        "revisarlos. Priorizá hasta 3 oportunidades reales de reducción. "
+        "Mantené cada texto breve y la respuesta debajo de 350 tokens.\n\n"
+        "Schema exacto:\n"
+        '{"summary":"...", "observations":["..."], '
+        '"recommendations":[{"category":"...", "reason":"...", '
+        '"action":"..."}], "caveat":"..." o null}'
+    )
+
+
 def today_str(timezone_name: str | None = None) -> str:
     if timezone_name is None:
         from app.config.settings import get_settings

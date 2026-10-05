@@ -18,6 +18,7 @@ class ExpenseCreate:
     ai_confidence: Decimal
     source_type: str = "telegram"
     source_key: Optional[str] = None
+    name_key: Optional[str] = None
     telegram_chat_id: Optional[int] = None
     telegram_message_id: Optional[int] = None
     revision: int = 1

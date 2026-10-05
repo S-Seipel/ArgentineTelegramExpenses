@@ -93,6 +93,21 @@ class InvalidSourceKeyError(MoneyStateError):
     """``source_key`` is missing or empty."""
 
 
+class MoneySourceCurrencyConflictError(MoneyStateError):
+    """An existing source-keyed operation cannot change currency."""
+
+    def __init__(
+        self, source_key: str, existing_currency: str, requested_currency: str
+    ) -> None:
+        self.source_key = source_key
+        self.existing_currency = existing_currency
+        self.requested_currency = requested_currency
+        super().__init__(
+            f"source_key={source_key!r} has currency {existing_currency!r}; "
+            f"requested {requested_currency!r}"
+        )
+
+
 class TargetXorViolationError(MoneyStateError):
     """Both or neither of ``target_pct`` / ``target_amount`` were passed."""
 
@@ -145,6 +160,13 @@ def _validate_amount_positive_or_zero(amount, *, name: str) -> Decimal:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _require_source_currency(row, currency: str, source_key: str) -> None:
+    if row.currency != currency:
+        raise MoneySourceCurrencyConflictError(
+            source_key, row.currency, currency
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +330,7 @@ class MoneyStateService:
         now = _now_utc()
         existing = self._find_extra(user_id, cycle_id, source_key)
         if existing is not None:
+            _require_source_currency(existing, currency, source_key)
             changed = False
             if existing.deleted_at is not None:
                 existing.deleted_at = None
@@ -317,9 +340,6 @@ class MoneyStateService:
                 changed = True
             if (existing.note or None) != (note or None):
                 existing.note = note
-                changed = True
-            if existing.currency != currency:
-                existing.currency = currency
                 changed = True
             if changed:
                 existing.revision = (existing.revision or 1) + 1
@@ -346,14 +366,13 @@ class MoneyStateService:
             canonical = self._find_extra(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
+            _require_source_currency(canonical, currency, source_key)
             if canonical.deleted_at is not None:
                 canonical.deleted_at = None
             if canonical.amount != amount:
                 canonical.amount = amount
             if (canonical.note or None) != (note or None):
                 canonical.note = note
-            if canonical.currency != currency:
-                canonical.currency = currency
             canonical.revision = (canonical.revision or 1) + 1
             canonical.updated_at = now
             self.session.commit()
@@ -662,6 +681,7 @@ class MoneyStateService:
         new_amount = amount.quantize(Decimal("0.01"))
         existing = self._find_realization(user_id, cycle_id, source_key)
         if existing is not None:
+            _require_source_currency(existing, currency, source_key)
             changed = False
             if existing.deleted_at is not None:
                 existing.deleted_at = None
@@ -671,9 +691,6 @@ class MoneyStateService:
                 changed = True
             if (existing.note or None) != (note or None):
                 existing.note = note
-                changed = True
-            if existing.currency != currency:
-                existing.currency = currency
                 changed = True
             if changed:
                 existing.revision = (existing.revision or 1) + 1
@@ -699,14 +716,13 @@ class MoneyStateService:
             canonical = self._find_realization(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
+            _require_source_currency(canonical, currency, source_key)
             if canonical.deleted_at is not None:
                 canonical.deleted_at = None
             if canonical.amount != new_amount:
                 canonical.amount = new_amount
             if (canonical.note or None) != (note or None):
                 canonical.note = note
-            if canonical.currency != currency:
-                canonical.currency = currency
             canonical.revision = (canonical.revision or 1) + 1
             canonical.updated_at = now
             self.session.commit()
@@ -816,6 +832,7 @@ __all__ = [
     "InvalidSourceKeyError",
     "InvalidTargetValueError",
     "MoneyStateError",
+    "MoneySourceCurrencyConflictError",
     "MoneyStateService",
     "SavingsRealizationNotFoundError",
     "TargetXorViolationError",

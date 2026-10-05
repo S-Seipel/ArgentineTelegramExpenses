@@ -107,6 +107,33 @@ def _summary(runtime, cycle_id: int):
         return MoneyEngine(s).get_cycle_summary(user_id, cycle_id)
 
 
+@pytest.mark.parametrize(
+    "command,model",
+    [
+        ("/extra", "CycleIncome"),
+        ("/ahorro_realizado", "SavingsRealization"),
+    ],
+)
+def test_tg_source_key_currency_conflict_is_friendly_and_keeps_one_row(
+    runtime, in_memory_db, command, model
+):
+    from app.money import models
+
+    today = today_in_tz(runtime.settings.timezone)
+    view = _seed_cycle(runtime.settings.telegram_allowed_user_id, today)
+    first = _send(runtime, f"{command} 50", message_id=77, today=today)
+    assert "registrado" in first.lower()
+    conflict = _send(runtime, f"{command} 60 USD", message_id=77, today=today)
+    assert "otra moneda" in conflict
+    assert "telegram:" not in conflict
+    with session_scope() as s:
+        rows = s.query(getattr(models, model)).filter_by(cycle_id=view.cycle_id).all()
+        if model == "CycleIncome":
+            rows = [row for row in rows if row.kind == "extra"]
+        assert len(rows) == 1
+        assert rows[0].currency == "ARS"
+
+
 # ---------------------------------------------------------------------------
 # /ingreso
 # ---------------------------------------------------------------------------

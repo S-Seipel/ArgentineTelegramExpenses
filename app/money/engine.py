@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 
 from app.expenses.models import Expense
 from app.fixed_expenses.models import (
+    FixedExpense,
     FixedExpensePayment,
 )
 from app.fixed_expenses.service import fixed_payment_source_key
@@ -214,7 +215,10 @@ class MoneyEngine:
         """
         out: list[InvariantViolation] = []
         payments = self.session.execute(
-            select(FixedExpensePayment).where(
+            select(FixedExpensePayment)
+            .join(FixedExpense, FixedExpense.id == FixedExpensePayment.fixed_expense_id)
+            .where(
+                FixedExpense.telegram_user_id == user_id,
                 FixedExpensePayment.paid_at.is_not(None),
                 FixedExpensePayment.skipped.is_(False),
             )

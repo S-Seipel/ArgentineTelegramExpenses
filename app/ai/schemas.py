@@ -31,6 +31,19 @@ class AIUnavailable(AIError):
     """Raised when the AI provider is unreachable or times out."""
 
 
+class SpendingRecommendation(BaseModel):
+    category: str
+    reason: str
+    action: str
+
+
+class SpendingAnalysis(BaseModel):
+    summary: str
+    observations: list[str] = Field(default_factory=list)
+    recommendations: list[SpendingRecommendation] = Field(default_factory=list)
+    caveat: str | None = None
+
+
 class ExpenseExtraction(BaseModel):
     """Single expense extraction entry.
 

@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from app.budgets.models import Budget
 from app.categories.models import Category
 from app.expenses.models import Expense
+from app.expenses.names import normalize_expense_name
 from app.recurring.models import RecurringExpense
 
 
@@ -186,6 +187,41 @@ def resolve_period(
     return resolve_period("month", today)
 
 
+def resolve_month(month: str | None, today: date) -> PeriodWindow:
+    """Resolve an exact calendar month, defaulting to the last closed one."""
+    if month is None:
+        if today.month == 1:
+            year, month_number = today.year - 1, 12
+        else:
+            year, month_number = today.year, today.month - 1
+    else:
+        try:
+            year, month_number = (int(part) for part in month.split("-"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("month must use YYYY-MM format") from exc
+        if not 1 <= month_number <= 12:
+            raise ValueError("month must use YYYY-MM format")
+
+    if (year, month_number) > (today.year, today.month):
+        raise ValueError("future months are not available")
+
+    start = date(year, month_number, 1)
+    end = date(year, month_number, calendar.monthrange(year, month_number)[1])
+    month_names = (
+        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    )
+    is_current = (year, month_number) == (today.year, today.month)
+    return PeriodWindow(
+        label=f"{month_names[month_number - 1]} {year}",
+        start=start,
+        end=end,
+        days_elapsed=today.day if is_current else (end - start).days + 1,
+        days_in_period=(end - start).days + 1,
+        is_full_period=not is_current,
+    )
+
+
 def summary_for_period(
     session: Session,
     user_id: int,
@@ -195,8 +231,11 @@ def summary_for_period(
     by_cat_rows = session.execute(
         select(
             Category.name,
+            Expense.name,
+            Expense.name_key,
             Expense.currency,
             Expense.amount,
+            Expense.id,
         )
         .join(Category, Category.id == Expense.category_id)
         .where(
@@ -211,7 +250,8 @@ def summary_for_period(
     cat_per_currency: dict[str, dict[str, Decimal]] = {}
     # Flat per-currency totals (USD and ARS stay separate).
     total_by_currency: dict[str, Decimal] = {}
-    for cat_name, currency, amount in by_cat_rows:
+    name_groups: dict[tuple[str, str, str], dict] = {}
+    for cat_name, expense_name, name_key, currency, amount, expense_id in by_cat_rows:
         cur = currency or "ARS"
         cat_per_currency.setdefault(cat_name, {})
         cat_per_currency[cat_name][cur] = (
@@ -221,6 +261,17 @@ def summary_for_period(
         total_by_currency[cur] = total_by_currency.get(
             cur, Decimal("0")
         ) + Decimal(amount or 0)
+
+        key = name_key or normalize_expense_name(expense_name)
+        group = name_groups.setdefault(
+            (cat_name, key, cur),
+            {"amount": Decimal("0"), "count": 0, "names": {}},
+        )
+        group["amount"] += Decimal(amount or 0)
+        group["count"] += 1
+        name_counts = group["names"]
+        count, latest_id = name_counts.get(expense_name, (0, 0))
+        name_counts[expense_name] = (count + 1, max(latest_id, expense_id))
 
     # Top categories by amount (per-currency). Keeps the dashboard's
     # "top 10" cap while being currency-safe.
@@ -237,6 +288,23 @@ def summary_for_period(
         ]
 
     single_total = _scalar_for_single_currency(total_by_currency)
+
+    by_name_by_currency: dict[str, list[dict]] = {}
+    for (cat_name, _key, cur), group in name_groups.items():
+        display_name = max(
+            group["names"],
+            key=lambda value: group["names"][value],
+        )
+        by_name_by_currency.setdefault(cur, []).append(
+            {
+                "name": display_name,
+                "category": cat_name,
+                "count": group["count"],
+                "amount": _money(group["amount"]),
+            }
+        )
+    for rows in by_name_by_currency.values():
+        rows.sort(key=lambda row: row["amount"], reverse=True)
 
     # Legacy field. When there's one currency, keep the existing shape
     # so the dashboard JS doesn't change. When there are multiple
@@ -269,6 +337,7 @@ def summary_for_period(
             k: _money(v) for k, v in total_by_currency.items()
         },
         "by_category_by_currency": by_category_by_currency,
+        "by_name_by_currency": by_name_by_currency,
         # Legacy: single currency → list, multi-currency → null.
         "by_category": by_category_legacy,
         # New: legacy "Total" (kept for the main number) is a Decimal
@@ -363,6 +432,7 @@ def recent_expenses(
     *,
     start: date | None = None,
     end: date | None = None,
+    category: str | None = None,
 ) -> list[dict]:
     stmt = (
         select(
@@ -385,6 +455,8 @@ def recent_expenses(
         stmt = stmt.where(Expense.expense_date >= start)
     if end is not None:
         stmt = stmt.where(Expense.expense_date <= end)
+    if category:
+        stmt = stmt.where(Category.name == category)
     rows = session.execute(stmt).all()
     return [
         {
@@ -405,6 +477,7 @@ def period_total_by_currency(
     *,
     start: date,
     end: date,
+    category: str | None = None,
 ) -> dict[str, Decimal]:
     """Financial total for the period grouped by currency.
 
@@ -412,10 +485,10 @@ def period_total_by_currency(
     the fix for the audit-found bug where the dashboard's ``total`` was
     just ``sum(items.amount)`` and changed as the user scrolled.
     """
-    rows = session.execute(
-        select(
-            Expense.currency, func.coalesce(func.sum(Expense.amount), 0)
-        )
+    stmt = (
+        select(Expense.currency, func.coalesce(func.sum(Expense.amount), 0))
+        .select_from(Expense)
+        .join(Category, Category.id == Expense.category_id)
         .where(
             Expense.telegram_user_id == user_id,
             Expense.expense_date >= start,
@@ -423,7 +496,10 @@ def period_total_by_currency(
             _NOT_DELETED,
         )
         .group_by(Expense.currency)
-    ).all()
+    )
+    if category:
+        stmt = stmt.where(Category.name == category)
+    rows = session.execute(stmt).all()
     return {cur or "ARS": Decimal(total or 0) for cur, total in rows}
 
 
@@ -433,6 +509,7 @@ def period_count(
     *,
     start: date,
     end: date,
+    category: str | None = None,
 ) -> int:
     """Number of expenses (any currency) in the period.
 
@@ -445,6 +522,10 @@ def period_count(
         Expense.expense_date <= end,
         _NOT_DELETED,
     )
+    if category:
+        stmt = stmt.join(Category, Category.id == Expense.category_id).where(
+            Category.name == category
+        )
     return int(session.execute(stmt).scalar_one() or 0)
 
 

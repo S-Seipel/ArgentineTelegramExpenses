@@ -29,6 +29,9 @@ class Expense(Base):
         BigInteger, nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name_key: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default="", index=True
+    )
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False, default="ARS")
     category_id: Mapped[int] = mapped_column(

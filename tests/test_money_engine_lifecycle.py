@@ -5,6 +5,7 @@ Postgres-specific concurrency lives in :mod:`tests.test_money_engine_pg`.
 """
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -14,8 +15,10 @@ from app.database.database import session_scope
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.service import (
     FixedExpenseDraft,
+    FixedExpenseHasHistoricalCarryOverError,
     FixedExpenseService,
 )
+from app.fixed_expenses.models import FixedExpensePayment
 from app.money import (
     CycleCatchUpLimitExceeded,
     CycleHasPendingError,
@@ -454,6 +457,88 @@ def test_delete_template_with_outstanding_debt_rejected(in_memory_db):
 
         svc = FixedExpenseService(FixedExpenseRepository(s))
         with pytest.raises(FixedExpenseHasOutstandingDebtError):
+            svc.delete(1, bill.id)
+
+
+@pytest.mark.parametrize("resolution", ["paid", "skipped"])
+def test_resolved_carry_over_template_cannot_be_deleted(
+    in_memory_db, resolution
+):
+    first = _open_cycle(1, payday_day=2, today=date(2026, 9, 5))
+    bill = _add_fixed(1, name="LUZ", amount=Decimal("80"), due_day=15)
+    with session_scope() as s:
+        current = CycleService(s).rollover_cycle(1, date(2026, 10, 3))
+        current_id = current.id
+        snapshot_before = json.dumps(
+            s.get(FinancialCycle, first.cycle_id).closing_snapshot,
+            sort_keys=True,
+        )
+        assert "2026-09" in snapshot_before
+
+    # Keep the open-cycle pending bucket focused on the September debt.
+    # An active template would also produce a new October obligation.
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        svc.set_active(1, bill.id, False)
+        if resolution == "paid":
+            svc.mark_paid(1, bill.id, "2026-09", paid_on=date(2026, 10, 3))
+        else:
+            svc.mark_skipped(1, bill.id, "2026-09")
+
+    with session_scope() as s:
+        summary = MoneyEngine(s).get_cycle_summary(
+            1, current_id, today=date(2026, 10, 3)
+        )
+        assert summary.pending_fixed_obligations.get("ARS") == 0
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        with pytest.raises(FixedExpenseHasHistoricalCarryOverError):
+            svc.delete(1, bill.id)
+
+    with session_scope() as s:
+        payment = s.query(FixedExpensePayment).filter_by(
+            fixed_expense_id=bill.id, month_year="2026-09"
+        ).one()
+        assert (payment.paid_at is not None) if resolution == "paid" else payment.skipped
+        assert s.get(FinancialCycle, first.cycle_id).closing_snapshot is not None
+        assert json.dumps(
+            s.get(FinancialCycle, first.cycle_id).closing_snapshot,
+            sort_keys=True,
+        ) == snapshot_before
+        summary = MoneyEngine(s).get_cycle_summary(
+            1, current_id, today=date(2026, 10, 3)
+        )
+        assert summary.pending_fixed_obligations.get("ARS") == 0
+
+
+def test_template_without_carry_over_retains_hard_delete_semantics(in_memory_db):
+    bill = _add_fixed(1, name="NO_HISTORY", amount=Decimal("50"), due_day=10)
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        svc.mark_paid(1, bill.id, "2026-10", paid_on=date(2026, 10, 10))
+    with session_scope() as s:
+        assert FixedExpenseService(FixedExpenseRepository(s)).delete(1, bill.id)
+    with session_scope() as s:
+        assert FixedExpenseRepository(s).get_by_id(1, bill.id) is None
+        assert s.query(FixedExpensePayment).filter_by(fixed_expense_id=bill.id).count() == 0
+
+
+def test_historical_delete_guard_scans_beyond_recent_48_cycles(in_memory_db):
+    bill = _add_fixed(1, name="OLD_LUZ", amount=Decimal("80"), due_day=10)
+    with session_scope() as s:
+        for index in range(1, 51):
+            s.add(FinancialCycle(
+                telegram_user_id=1, cycle_index=index,
+                start_date=date(2022, 1, 1), end_date=date(2022, 1, 31),
+                payday_day=1, status="closed",
+                closing_snapshot={"carried_over_fixed": [{
+                    "fixed_id": bill.id, "name": "OLD_LUZ",
+                    "expected_amount": "80", "currency": "ARS",
+                    "due_date": "2022-01-10", "original_month_year": "2022-01",
+                }]} if index == 1 else {},
+            ))
+    with session_scope() as s:
+        svc = FixedExpenseService(FixedExpenseRepository(s))
+        with pytest.raises(FixedExpenseHasHistoricalCarryOverError):
             svc.delete(1, bill.id)
 
 

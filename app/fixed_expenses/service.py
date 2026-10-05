@@ -46,6 +46,10 @@ class FixedExpenseValidationError(ValueError):
     pass
 
 
+class FixedExpenseHasHistoricalCarryOverError(RuntimeError):
+    """A snapshot still references this template and its payment history."""
+
+
 _ALLOWED_METHODS = {
     "TRANSFERENCIA", "EFECTIVO", "DEBITO", "DEBITO AUTOMATICO",
     "TARJETA", "CREDITO", "MERCADO PAGO", "APP", "OTRO",
@@ -179,22 +183,17 @@ class FixedExpenseService:
         return self.repo.set_active(obj, is_active)
 
     def delete(self, user_id: int, fixed_id: int) -> FixedExpense | None:
-        """Delete a template while retaining linked expense history.
+        """Delete only templates absent from every carry-over snapshot.
 
-        R2 hardens this path: deleting a template with outstanding debt
-        (any ``FixedExpensePayment`` without a paid or skipped status,
-        OR an unresolved carried-over obligation in any closed cycle
-        snapshot) is refused with ``FixedExpenseHasOutstandingDebtError``.
-        The caller must first settle, skip, or unlink the obligation
-        before the template can disappear. Historical occurrences
-        already represented in a previous cycle's ``carried_over_fixed``
-        block remain frozen regardless of whether the template still
-        exists.
+        A snapshot needs its payment row to interpret a paid or skipped
+        historical obligation, so a referenced template cannot be
+        hard-deleted even after that obligation is resolved.
         """
         obj = self.repo.get_by_id_for_update(user_id, fixed_id)
         if obj is None:
             return None
-        for payment in self.repo.payments_for_fixed(fixed_id):
+        payments = self.repo.payments_for_fixed(fixed_id)
+        for payment in payments:
             if (
                 payment.paid_at is None
                 and not payment.skipped
@@ -208,15 +207,8 @@ class FixedExpenseService:
                     f"(pago {payment.month_year} sin resolver). "
                     "Marcá como pagado o salteado primero."
                 )
-            if payment.expense_id:
-                self._soft_delete_expense(
-                    user_id, payment.expense_id, commit=False
-                )
-            self.repo.session.delete(payment)
 
-        # Carry-over chain: walk the closed cycles and refuse the
-        # delete if any unresolved historical obligation still exists
-        # for this template.
+        # All guards run before scheduling any payment/history deletion.
         unresolved = self._unresolved_carry_over(user_id, fixed_id)
         if unresolved:
             from app.money.engine import (
@@ -230,8 +222,41 @@ class FixedExpenseService:
                 f"otros). Marcá como pagado o salteado primero."
             )
 
+        if self._has_historical_carry_over(user_id, fixed_id):
+            raise FixedExpenseHasHistoricalCarryOverError(
+                f"No se puede eliminar '{obj.name}': un ciclo cerrado "
+                "conserva este gasto fijo en su historial. "
+                "Desactivalo para evitar nuevos vencimientos."
+            )
+
+        for payment in payments:
+            if payment.expense_id:
+                self._soft_delete_expense(
+                    user_id, payment.expense_id, commit=False
+                )
+            self.repo.session.delete(payment)
         self.repo.session.delete(obj)
         return obj
+
+    def _has_historical_carry_over(self, user_id: int, fixed_id: int) -> bool:
+        """Scan all closed snapshots; a bounded scan could miss old debt."""
+        from sqlalchemy import select
+
+        from app.money.models import FinancialCycle
+
+        snapshots = self.repo.session.execute(
+            select(FinancialCycle.closing_snapshot).where(
+                FinancialCycle.telegram_user_id == user_id,
+                FinancialCycle.status == "closed",
+                FinancialCycle.closing_snapshot.is_not(None),
+            )
+        ).scalars()
+        return any(
+            isinstance(entry, dict) and entry.get("fixed_id") == fixed_id
+            for snapshot in snapshots
+            if isinstance(snapshot, dict)
+            for entry in snapshot.get("carried_over_fixed", ())
+        )
 
     def _unresolved_carry_over(self, user_id: int, fixed_id: int):
         """Return the list of unresolved carried-over obligations for

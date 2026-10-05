@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.ai.service import StubAIService
+from app.ai.schemas import SpendingAnalysis, SpendingRecommendation
 from app.bot.app import BotDependencies
 from app.bot.handlers import handle_command
 from app.bot.service import BotRuntime
@@ -278,6 +279,32 @@ async def test_desglose_when_empty(runtime):
     await handle_command(update, None, deps)
     reply = message.reply_text.call_args[0][0]
     assert "no tenés" in reply.lower() or "no hay" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_analisis_uses_aggregate_context(runtime):
+    _seed()
+    runtime.ai.analyze_spending = AsyncMock(
+        return_value=SpendingAnalysis(
+            summary="Hay margen para ajustar.",
+            observations=["Café concentra una parte importante."],
+            recommendations=[SpendingRecommendation(
+                category="Café",
+                reason="Es una de las categorías más altas.",
+                action="Compará precios o fijá un límite semanal.",
+            )],
+        )
+    )
+    message = MagicMock()
+    message.text = "/analisis"
+    message.reply_text = AsyncMock()
+    message.chat.send_action = AsyncMock()
+    update = _make_update(1, message)
+    await handle_command(update, None, BotDependencies(runtime=runtime))
+    reply = message.reply_text.call_args[0][0]
+    assert "Hay margen" in reply
+    assert "Compará precios" in reply
+    runtime.ai.analyze_spending.assert_awaited_once()
 
 
 @pytest.mark.asyncio
