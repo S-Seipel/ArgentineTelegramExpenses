@@ -51,10 +51,12 @@ def format_amount(value: Decimal | float | int) -> str:
     """Argentine-style thousands with dot, no decimals for whole numbers."""
     if not isinstance(value, Decimal):
         value = Decimal(str(value))
-    quantized = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    quantized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     sign = "-" if quantized < 0 else ""
-    n = abs(int(quantized))
-    text = f"{n:,}".replace(",", ".")
+    whole, cents = f"{abs(quantized):,.2f}".split('.')
+    text = whole.replace(',', '.')
+    if cents != '00':
+        text += ',' + cents
     return f"{sign}{text}"
 
 

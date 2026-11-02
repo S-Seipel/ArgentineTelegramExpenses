@@ -40,8 +40,14 @@ def _current_user_id(settings: Settings = Depends(get_settings)) -> int:
     return settings.telegram_allowed_user_id
 
 
-def _today(settings: Settings = Depends(get_settings)) -> date:
-    return today_in_tz(settings.timezone)
+def _today(settings: Settings = Depends(get_settings), user_id: int = Depends(_current_user_id)) -> date:
+    from app.users import UserService
+    try:
+        with session_scope() as session:
+            prefs = UserService(session, settings=settings).get_preferences(user_id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return today_in_tz(prefs.timezone)
 
 
 @router.get("/", include_in_schema=False)
@@ -1907,6 +1913,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="grid" id="kpis"></div>
 
+    <section class="panel" id="extra-tools">
+      <h2>Herramientas</h2>
+      <button id="undo-last" type="button" class="fx-btn">↩ Deshacer último cambio</button>
+      <p id="tools-status" class="subtitle" role="status" style="margin-top:10px">Hasta 10 ediciones, eliminaciones o cambios de ubicación de tus gastos.</p>
+      <details style="margin-top:16px"><summary>Ticket por foto</summary>
+        <p class="subtitle" style="margin:10px 0">Lectura local. Revisá el total y confirmá antes de guardar.</p>
+        <input id="receipt-file" type="file" accept="image/jpeg,image/png" aria-label="Foto del ticket" style="max-width:100%">
+        <button id="receipt-read" type="button" class="fx-btn" disabled>Leer ticket</button>
+        <p id="receipt-status" class="subtitle" role="status" style="margin:10px 0"></p>
+        <form id="receipt-review" hidden>
+          <label>Nombre<input id="receipt-name" class="fx-input" maxlength="255" required></label>
+          <label>Total<input id="receipt-amount" class="fx-input" type="number" min="0.01" step="0.01" required></label>
+          <label>Moneda<input id="receipt-currency" class="fx-input" maxlength="3" pattern="[A-Za-z]{3}" required></label>
+          <label>Fecha<input id="receipt-date" class="fx-input" type="date" required></label>
+          <button id="receipt-confirm" class="fx-btn fx-btn-primary" type="submit" style="margin-top:10px">Confirmar y guardar gasto</button>
+        </form>
+      </details>
+      <details style="margin-top:16px"><summary>Preferencias del bot</summary>
+        <form id="preferences-form" style="margin-top:10px">
+          <label>Idioma del bot<select id="pref-language" class="fx-input"><option value="es">Español</option><option value="en">English</option><option value="pt">Português</option></select></label>
+          <label style="display:block;margin:10px 0"><input id="pref-voice" type="checkbox"> Responder también con audio</label>
+          <label>Zona horaria<input id="pref-timezone" class="fx-input" placeholder="America/Argentina/Buenos_Aires" required></label>
+          <button id="preferences-save" class="fx-btn fx-btn-primary" type="submit" disabled style="margin-top:10px">Guardar preferencias</button>
+          <p id="preferences-status" class="subtitle" role="status" style="margin-top:10px"></p>
+        </form>
+      </details>
+      <details id="users-tools" hidden style="margin-top:16px"><summary>Usuarios autorizados</summary>
+        <p class="subtitle" style="margin:10px 0">Cada usuario usa sus propios datos desde su chat de Telegram. Este dashboard local pertenece al propietario.</p>
+        <div id="users-list"></div>
+        <form id="users-form" style="margin-top:10px"><label>ID de Telegram<input id="new-user-id" class="fx-input" inputmode="numeric" pattern="[0-9]+" required></label><button id="user-add" class="fx-btn" type="submit" style="margin-top:10px">Autorizar acceso</button></form>
+        <p id="users-status" class="subtitle" role="status"></p>
+      </details>
+      <details style="margin-top:16px"><summary>Ubicaciones de gastos</summary>
+        <p class="subtitle" style="margin:10px 0">Coordenadas compartidas por vos. Mapa de coordenadas sin servicios externos.</p>
+        <svg id="locations-map" viewBox="0 0 600 300" role="img" aria-label="Ubicaciones por longitud y latitud" hidden style="width:100%;max-height:260px;background:#0f172a;border-radius:8px"></svg>
+        <div id="locations-list" style="overflow-wrap:anywhere"></div>
+      </details>
+    </section>
+
     <div class="panel" id="active-cycle-panel">
       <h2>Ciclo activo</h2>
       <label style="display:flex;align-items:center;gap:10px;margin-bottom:14px">Moneda del ciclo
@@ -2981,6 +3026,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeCategoryModal();
 });
 </script>
+<script src="/assets/extras.js" defer></script>
 </body>
 </html>
 """

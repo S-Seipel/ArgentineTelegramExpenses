@@ -32,11 +32,12 @@ class QueryService:
     out of validated ``QuerySpec`` objects.
     """
 
-    def __init__(self, repo: ExpenseRepository) -> None:
+    def __init__(self, repo: ExpenseRepository, *, today: date | None = None) -> None:
         self.repo = repo
+        self._today = today
 
     def today(self) -> date:
-        return business_today()
+        return self._today or business_today()
 
     def run(self, user_id: int, spec: QuerySpec) -> QueryResult:
         period = self._resolve_period(spec)
@@ -126,6 +127,8 @@ class QueryService:
             )
 
         total_by_currency = self._compute_total(user_id, spec, period)
+        if spec.period == "range" and spec.currency:
+            total_by_currency = {cur: amount for cur, amount in total_by_currency.items() if cur == spec.currency}
         return QueryResult(
             total_by_currency=total_by_currency,
             items=None,
@@ -306,6 +309,11 @@ class QueryService:
 
     def _resolve_period(self, spec: QuerySpec) -> _Range:
         today = self.today()
+        if spec.period == "range":
+            if not isinstance(spec.range_start, date) or not isinstance(spec.range_end, date) or spec.range_start > spec.range_end:
+                raise ValueError("Indicá un rango de fechas válido, con el inicio antes del fin.")
+            return _Range(start=spec.range_start, end=spec.range_end,
+                          label=f"{spec.range_start.isoformat()} → {spec.range_end.isoformat()}")
         if spec.kind == "list":
             return _Range(start=None, end=None, label="Últimos gastos")
         if spec.period is None:

@@ -249,6 +249,66 @@ copias automáticas a ingresos del ciclo. El histórico se consulta con
 El resumen visual mensual está en `/dashboard/mensual`. Abre el último mes
 cerrado y permite recorrer los meses con los botones anterior/siguiente.
 
+### Tickets, deshacer y preferencias
+
+El panel **Herramientas** del dashboard permite leer tickets JPEG/PNG,
+revisar nombre, total, moneda y fecha, y confirmar antes de guardar.
+La lectura es local: la foto no se almacena en la base ni se manda a otro
+proveedor. Si el OCR no distingue un total, tenés que indicarlo. Se registra
+un gasto por ticket, sin sumar ítems por suposición. Reintentar una
+confirmación o subir el mismo archivo no duplica el gasto de ese usuario.
+Los borradores duran 15 minutos y se pierden al reiniciar; los gastos
+confirmados permanecen en PostgreSQL.
+
+También podés enviar la foto por Telegram y usar los comandos que devuelve:
+`/ticket_confirmar <borrador> [total corregido] [moneda]` o
+`/ticket_cancelar <borrador>`. Mandar la foto crea sólo un borrador.
+
+- `/undo` o `/deshacer`: revierte la última edición, eliminación o ubicación
+  de un gasto normal. Conserva hasta diez acciones pendientes por usuario y
+  sobrevive reinicios. Si el gasto cambió por fuera de esa secuencia, rechaza
+  la reversión. Los pagos fijos/recurrentes usan sus propios flujos.
+- `/ubicacion <ID>`: selecciona un gasto para asociarle la ubicación que
+  compartas después en ese mismo chat. La selección vence a los 15 minutos.
+  `/ubicacion <ID> quitar` la elimina; esa acción también se puede deshacer.
+  El dashboard muestra las coordenadas y un mapa local sin enviar datos a mapas externos.
+- `/idioma es|en|pt`: cambia ayuda y respuestas estructuradas del bot.
+  Los nombres e importes no se traducen. La prosa libre de IA y el dashboard
+  conservan su idioma original.
+- `/voz on|off`: activa audio además del texto, generado localmente con
+  eSpeak NG y FFmpeg. La voz empieza apagada; si falla, el texto permanece.
+- `/zona America/Argentina/Buenos_Aires`: cambia la zona horaria del usuario.
+  Los avisos salen entre las 09:00 y 09:30 de su zona, verificando acceso y
+  preferencias antes de enviar. Se pueden posponer con **mañana**,
+  **en 3 días** o **el viernes que viene**, sin cambiar la identidad de la deuda.
+- `/rango 2026-03-05 2026-03-15 [moneda]`: consulta ambas fechas inclusive.
+  También entiende consultas como *cuánto gasté del 5 al 15 de marzo* por
+  texto o audio. Sin año explícito usa el año actual.
+- `/clasificador`: informa cuántos ejemplos propios conoce. Un nombre con
+  al menos tres ejemplos unánimes permite registrar un gasto simple sin
+  esperar al modelo; los casos nuevos o ambiguos siguen el flujo habitual.
+
+El propietario conserva el ID configurado en `TELEGRAM_ALLOWED_USER_ID`.
+`/usuario_add <ID>` autoriza una persona, `/usuario_off <ID>` pausa su acceso
+sin borrar sus registros y `/usuarios` lista los activos. Cada persona
+maneja sus datos en su chat de Telegram; sólo el propietario administra la
+lista. El dashboard sigue siendo privado y local del propietario. No se
+autoriza a nadie más durante una actualización.
+
+La API local agrega `/api/preferences`, `/api/users`, `/api/undo`,
+`/api/locations`, `PATCH /api/expenses/{id}/location`,
+`POST /api/receipts/preview` (imagen binaria JPEG/PNG) y
+`POST /api/receipts/confirm`. `/metrics` expone contadores y latencias en el
+[formato de Prometheus](https://prometheus.io/docs/instrumenting/exposition_formats/),
+sin IDs, textos, importes ni coordenadas como etiquetas. Los contadores se
+reinician con el proceso.
+
+Al actualizar ejecutá `alembic upgrade head` y reconstruí la imagen para
+instalar los motores locales de OCR/voz. Las migraciones nuevas son
+`0018_expense_history_location` y `0019_user_preferences`; conservan los
+registros anteriores y bloquean un downgrade que descartaría historial o
+preferencias. Hacé un backup verificado antes de actualizar.
+
 ### Planificación por ciclo financiero (F1–F3)
 
 Configurá un día fijo con `/config_payday <día>` o el primer viernes de
@@ -271,7 +331,7 @@ La API `GET/PATCH /api/settings/payday` consulta y guarda `pay_rule`:
 `payday_weekday` de 0 (lunes) a 6 (domingo). El primer viernes es
 `{"pay_rule":"first_weekday","payday_weekday":4}`; su ordinal siempre es 1.
 Las instalaciones existentes deben ejecutar `alembic upgrade head` para
-aplicar todas las migraciones hasta `0017_currency_cycles` antes de iniciar
+aplicar todas las migraciones hasta `0019_user_preferences` antes de iniciar
 esta versión.
 El disponible descuenta ahorro comprometido, gastos realizados y obligaciones
 fijas pendientes; puede ser negativo. ARS y USD se muestran por separado,

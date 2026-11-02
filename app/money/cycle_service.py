@@ -518,6 +518,10 @@ class CycleService:
             if latest is None:
                 view = self.open_initial_cycle(user_id, today, currency=currency)
                 return self._require_cycle(user_id, view.cycle_id)
+            if latest.status == "open":
+                # A concurrent opener may commit between the two SELECTs.
+                # Re-read its canonical row instead of treating it as closed.
+                return self._rollover_once(user_id, today, attempt=attempt + 1, currency=currency)
             if today <= latest.end_date:
                 raise LookupError(
                     "El ciclo actual ya está cerrado; el próximo comienza "
@@ -645,6 +649,7 @@ class CycleService:
             .where(FinancialCycle.telegram_user_id == user_id, cycle_currency_scope(currency))
             .order_by(FinancialCycle.cycle_index.desc())
             .limit(1)
+            .execution_options(populate_existing=True)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 

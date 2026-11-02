@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 from app.categories.models import Category
 from app.expenses.models import Expense
 from app.expenses.repository import ExpenseRepository
-from app.expenses.schemas import ExpenseCreate, ExpenseSummary
+from app.expenses.schemas import ExpenseCreate, ExpenseSummary, UndoResult
+from app.expenses.history import UndoConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,12 @@ class ExpenseService:
 
     def __init__(self, repo: ExpenseRepository) -> None:
         self.repo = repo
+
+    def undo_last(self, user_id: int) -> UndoResult | None:
+        return self.repo.undo_last(user_id)
+
+    def set_location(self, user_id: int, expense_id: int, latitude, longitude) -> ExpenseSummary | None:
+        return self.repo.set_location(user_id, expense_id, latitude, longitude)
 
     def register_many(
         self,

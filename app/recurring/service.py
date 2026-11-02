@@ -348,6 +348,7 @@ class RecurringService:
         *,
         occurrence_date: date | None = None,
         today: date | None = None,
+        until: date | None = None,
         commit: bool = True,
     ) -> RecurringExpense | None:
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
@@ -363,7 +364,12 @@ class RecurringService:
         reminder_date = template_obj.next_due_date
         if template_obj.is_obligation and today is not None:
             reminder_date = max(reminder_date, today)
-        new_due = postpone_due_date(reminder_date)
+        if until is not None:
+            if not isinstance(until, date) or today is None or until <= today:
+                raise RecurringValidationError("La nueva fecha de aviso debe ser posterior a hoy.")
+            new_due = until
+        else:
+            new_due = postpone_due_date(reminder_date)
         template_obj.next_due_date = new_due
         self.repo.session.flush()
         if commit:

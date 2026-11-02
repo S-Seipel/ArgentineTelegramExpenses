@@ -10,7 +10,8 @@ RUN groupadd --system app && useradd --system --gid app --home /app app
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ffmpeg \
+    && apt-get install -y --no-install-recommends curl ffmpeg espeak-ng \
+       tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng tesseract-ocr-por \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

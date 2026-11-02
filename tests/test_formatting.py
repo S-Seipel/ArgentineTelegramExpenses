@@ -17,8 +17,12 @@ def test_format_amount_basic():
 
 
 def test_format_amount_decimal_rounding():
-    assert format_amount(Decimal("10.4")) == "10"
-    assert format_amount(Decimal("10.5")) == "11"
+    assert format_amount(Decimal("10.4")) == "10,40"
+    assert format_amount(Decimal("10.5")) == "10,50"
+    assert format_amount(Decimal("1234.56")) == "1.234,56"
+    assert format_amount(Decimal("0.01")) == "0,01"
+    assert format_amount(Decimal("-1234.56")) == "-1.234,56"
+    assert format_amount(Decimal("10.005")) == "10,01"
 
 
 def test_format_currency_amount():

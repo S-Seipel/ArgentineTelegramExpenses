@@ -191,13 +191,19 @@ def test_nonrepresentable_downgrade_fails_before_changing_schema(fresh_db, reaso
                         "INSERT INTO financial_cycles (telegram_user_id,currency,cycle_index,start_date,end_date,"
                         "payday_day,status) VALUES (42,:currency,1,'2026-10-01','2026-10-31',1,:status)"
                     ), {"currency": currency, "status": "open" if reason == "open" else "closed"})
+        tables_before = set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            revision_before = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         with pytest.raises(CalledProcessError) as caught:
             run_alembic("downgrade", "0016_legacy_monthly_budget", database_url=fresh_db)
         assert "Cannot downgrade" in caught.value.stderr
+        assert set(inspect(engine).get_table_names()) == tables_before
         assert "currency_payday_settings" in inspect(engine).get_table_names()
         assert "currency" in {column["name"] for column in inspect(engine).get_columns("financial_cycles")}
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0017_currency_cycles"
+            # The entire attempted downgrade is transactional, including
+            # revisions newer than F3. Restore the exact starting revision.
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == revision_before
             table = "currency_payday_settings" if reason == "settings" else "financial_cycles"
             assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == (1 if reason == "settings" else 2)
     finally:

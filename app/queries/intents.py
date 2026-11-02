@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Literal
 
-Period = Literal["today", "yesterday", "week", "month", "all", "last_n_days"]
+Period = Literal["today", "yesterday", "week", "month", "all", "last_n_days", "range"]
 SortOrder = Literal["amount_desc", "amount_asc", "date_desc", "date_asc"]
 
 
@@ -22,6 +22,8 @@ class QuerySpec:
     limit: int | None = None
     order_by: SortOrder | None = None
     label: str = ""
+    range_start: date | None = None
+    range_end: date | None = None
 
 
 @dataclass

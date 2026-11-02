@@ -1,23 +1,21 @@
 """Daily scheduler that fires recurring-expense reminders.
 
-Runs as an asyncio task started from the FastAPI lifespan. On each tick it
-checks whether it's 09:00 in the configured timezone, then walks the
-``recurring_expenses`` table and sends a reminder per due row.
+Runs as an asyncio task started from the FastAPI lifespan. Each active
+user has a separate 09:00–09:30 window in their own timezone. Access and
+presentation preferences are refreshed immediately before delivery.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from typing import TYPE_CHECKING
 
-from sqlalchemy import distinct, select
-
 from app.database.database import session_scope
-from app.recurring.models import RecurringExpense
+from app.metrics import metrics
 from app.recurring.repository import RecurringRepository
-from app.utils.dates import today_in_tz
-from app.utils.formatting import format_currency_amount, format_date_short
+from app.users import UserAccessDenied, UserService
+from app.utils.formatting import format_currency_amount
 
 if TYPE_CHECKING:
     from telegram.ext import Application
@@ -35,25 +33,11 @@ async def recurring_reminder_loop(
     bot_app: "Application", runtime: "BotRuntime"
 ) -> None:
     """Periodically send reminders to users with due recurring expenses."""
-    tz_name = runtime.settings.timezone
     last_fired_for: dict[int, str] = {}
 
     while True:
         try:
-            now_in_tz = _now_in_tz(tz_name)
-            day_key = now_in_tz.date().isoformat()
-            should_fire = (
-                now_in_tz.time() >= time(NOTIFY_HOUR, 0)
-                and now_in_tz.time()
-                <= time(NOTIFY_HOUR, NOTIFY_MINUTE_WINDOW)
-            )
-
-            if should_fire:
-                await _fire_due_reminders(
-                    bot_app, runtime, now_in_tz.date(), day_key, last_fired_for
-                )
-            else:
-                last_fired_for.clear()
+            await _fire_due_reminders(bot_app, runtime, last_fired_for)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -76,23 +60,54 @@ def _now_in_tz(tz_name: str) -> datetime:
 async def _fire_due_reminders(
     bot_app: "Application",
     runtime: "BotRuntime",
-    today,
-    day_key: str,
     last_fired_for: dict[int, str],
 ) -> None:
     with session_scope() as session:
-        repo = RecurringRepository(session)
-        user_ids = [
-            row[0]
-            for row in session.execute(
-                select(distinct(RecurringExpense.telegram_user_id))
-            ).all()
-        ]
+        profiles = UserService(session, settings=runtime.settings).list_active()
 
-    for user_id in user_ids:
+    active_ids = {profile.telegram_user_id for profile in profiles}
+    for user_id in list(last_fired_for):
+        if user_id not in active_ids:
+            last_fired_for.pop(user_id, None)
+    for profile in profiles:
+        user_id = profile.telegram_user_id
+        now = _now_in_tz(profile.timezone)
+        if not _in_notify_window(now):
+            # Another user's clock must not clear this user's daily cache.
+            last_fired_for.pop(user_id, None)
+            continue
+        day_key = now.date().isoformat()
         if last_fired_for.get(user_id) == day_key:
             continue
-        await _try_send_for_user(bot_app, runtime, user_id, today, day_key, last_fired_for)
+        await _try_send_for_user(bot_app, runtime, user_id, now.date(), day_key,
+                                 last_fired_for, enforce_window=True)
+
+
+def _in_notify_window(now: datetime) -> bool:
+    return time(NOTIFY_HOUR, 0) <= now.time() <= time(NOTIFY_HOUR, NOTIFY_MINUTE_WINDOW)
+
+
+def _authorized_preferences(runtime, user_id: int):
+    with session_scope() as session:
+        users = UserService(session, settings=runtime.settings)
+        if not users.is_authorized(user_id):
+            return None
+        try:
+            return users.get_preferences(user_id)
+        except UserAccessDenied:
+            return None
+
+
+def _release_delivery_claim(user_id, template_id, occurrence_date, delivery_attempt):
+    """Release only this attempt, preserving any newer payment or snooze."""
+    with session_scope() as session:
+        repo = RecurringRepository(session)
+        repo.get_by_id_for_update(user_id, template_id)
+        reminder = repo.get_reminder(user_id, template_id, occurrence_date)
+        if (reminder is not None and reminder.status == "pending"
+                and reminder.delivery_status == "sending"
+                and reminder.attempt_count == delivery_attempt):
+            repo.mark_reminder_delivery_failed(reminder)
 
 
 async def _try_send_for_user(
@@ -102,7 +117,12 @@ async def _try_send_for_user(
     today,
     day_key: str,
     last_fired_for: dict[int, str],
+    *,
+    enforce_window: bool = False,
 ) -> None:
+    if _authorized_preferences(runtime, user_id) is None:
+        last_fired_for.pop(user_id, None)
+        return
     with session_scope() as session:
         repo = RecurringRepository(session)
         due = repo.due_on(user_id, today)
@@ -110,6 +130,7 @@ async def _try_send_for_user(
     if not due:
         return
 
+    all_delivered = True
     for template in due:
         occurrence_date = (
             template.obligation_due_date or template.next_due_date
@@ -119,6 +140,9 @@ async def _try_send_for_user(
         try:
             with session_scope() as session:
                 repo = RecurringRepository(session)
+                if not UserService(session, settings=runtime.settings).is_authorized(user_id):
+                    last_fired_for.pop(user_id, None)
+                    return
                 # Refresh under the same template lock used by replies. A
                 # payment after the initial due query may already have moved
                 # this template to its next occurrence.
@@ -140,10 +164,24 @@ async def _try_send_for_user(
                 if reminder.status != "pending":
                     continue
                 if not repo.claim_reminder(reminder):
+                    if reminder.delivery_status != "sent":
+                        all_delivered = False
                     continue
                 delivery_attempt = reminder.attempt_count
-            text = _format_reminder(template)
-            message = await bot_app.bot.send_message(chat_id=user_id, text=text)
+            preferences = _authorized_preferences(runtime, user_id)
+            if preferences is None:
+                _release_delivery_claim(user_id, template.id, occurrence_date, delivery_attempt)
+                last_fired_for.pop(user_id, None)
+                return
+            if enforce_window:
+                now = _now_in_tz(preferences.timezone)
+                if not _in_notify_window(now) or now.date() != today:
+                    _release_delivery_claim(user_id, template.id, occurrence_date, delivery_attempt)
+                    last_fired_for.pop(user_id, None)
+                    return
+            text = _format_reminder(template, language=preferences.language)
+            with metrics.measure("reminder"):
+                message = await bot_app.bot.send_message(chat_id=user_id, text=text)
             with session_scope() as session:
                 repo = RecurringRepository(session)
                 repo.get_by_id_for_update(user_id, template.id)
@@ -161,47 +199,43 @@ async def _try_send_for_user(
                 ):
                     repo.mark_reminder_sent(reminder, message.message_id)
         except Exception:
+            all_delivered = False
             logger.exception(
                 "Failed to send reminder for user %s, template %s",
                 user_id,
                 template.id,
             )
-            with session_scope() as session:
-                repo = RecurringRepository(session)
-                repo.get_by_id_for_update(user_id, template.id)
-                reminder = repo.get_reminder(
-                    user_id, template.id, occurrence_date
-                )
-                if (
-                    reminder is not None
-                    and reminder.status == "pending"
-                    and reminder.delivery_status == "sending"
-                    and reminder.attempt_count == delivery_attempt
-                ):
-                    repo.mark_reminder_delivery_failed(reminder)
+            _release_delivery_claim(user_id, template.id, occurrence_date, delivery_attempt)
 
-    last_fired_for[user_id] = day_key
-
-
-def _format_reminder(template) -> str:
-    if template.frequency == "yearly" and template.month_of_year is not None:
-        month_names = [
-            "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
-            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
-        ]
-        when = (
-            f"el {template.day_of_month} de "
-            f"{month_names[template.month_of_year]}"
-        )
+    if all_delivered:
+        last_fired_for[user_id] = day_key
     else:
-        when = f"el día {template.day_of_month} de cada mes"
-    return (
-        f"💡 *Recordatorio*: {template.name} — "
-        f"{format_currency_amount(template.amount, template.currency)} "
-        f"({when})\n\n"
-        f"¿Lo registro?\n"
-        f"• *sí* — registrar gasto hoy\n"
-        f"• *no* — saltar este mes\n"
-        f"• *posponer* — avisame mañana\n"
-        f"• *eliminar* — borrar este recurrente"
-    )
+        # A delivery failure or unexpired claim remains retryable during
+        # this morning's window; the persistent lease prevents duplicates.
+        last_fired_for.pop(user_id, None)
+
+
+def _format_reminder(template, language: str = "es") -> str:
+    language = str(language).lower().replace("_", "-").split("-", 1)[0]
+    if language not in {"es", "en", "pt"}:
+        language = "es"
+    month_names = {
+        "es": ("", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"),
+        "en": ("", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+        "pt": ("", "janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"),
+    }[language]
+    if template.frequency == "yearly" and template.month_of_year is not None:
+        month = month_names[template.month_of_year]
+        when = {"es": f"el {template.day_of_month} de {month}",
+                "en": f"{month} {template.day_of_month}",
+                "pt": f"dia {template.day_of_month} de {month}"}[language]
+    else:
+        when = {"es": f"el día {template.day_of_month} de cada mes",
+                "en": f"day {template.day_of_month} of each month",
+                "pt": f"dia {template.day_of_month} de cada mês"}[language]
+    title, instructions = {
+        "es": ("Recordatorio", "¿Lo registro? Respondé a este mensaje:\n• *sí* — registrar gasto hoy\n• *no* — saltar esta ocurrencia\n• *mañana* — avisame mañana\n• *en 3 días* — avisame en tres días\n• *el viernes que viene* — avisame el próximo viernes\n• *eliminar* — borrar este recurrente"),
+        "en": ("Reminder", "Record it? Reply to this message:\n• *yes* — record today's expense\n• *no* — skip this occurrence\n• *tomorrow* — remind me tomorrow\n• *in 3 days* — remind me in three days\n• *next friday* — remind me next Friday\n• *eliminar* — delete this recurring expense"),
+        "pt": ("Lembrete", "Registrar? Responda a esta mensagem:\n• *sim* — registrar a despesa de hoje\n• *no* — pular esta ocorrência\n• *amanhã* — lembrar amanhã\n• *em 3 dias* — lembrar em três dias\n• *next friday* — lembrar na próxima sexta-feira\n• *eliminar* — excluir esta despesa recorrente"),
+    }[language]
+    return f"💡 *{title}*: {template.name} — {format_currency_amount(template.amount, template.currency)} ({when})\n\n{instructions}"

@@ -205,9 +205,21 @@ class OllamaAIService:
         if not message or not message.strip():
             raise AIError("Empty message")
 
-        today = today_str(self.cfg.timezone)
-        system_msg = system_prompt(today, self.cfg.timezone)
-        user_msg = user_instructions(today, self.cfg.timezone)
+        timezone = self.cfg.timezone
+        today = today_str(timezone)
+        if user_context:
+            try:
+                from datetime import date
+                from zoneinfo import ZoneInfo
+                context_data = json.loads(user_context)
+                if isinstance(context_data, dict) and context_data.get('today') and context_data.get('timezone'):
+                    selected_day = date.fromisoformat(context_data['today']).isoformat()
+                    ZoneInfo(context_data['timezone'])
+                    today, timezone = selected_day, context_data['timezone']
+            except (ValueError, TypeError, KeyError):
+                pass
+        system_msg = system_prompt(today, timezone)
+        user_msg = user_instructions(today, timezone)
         if user_context:
             user_msg = f"{user_msg}\n\nContexto adicional: {user_context}"
         user_msg = f"{user_msg}\n\nMensaje del usuario:\n{message}"

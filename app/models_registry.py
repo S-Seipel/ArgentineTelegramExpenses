@@ -9,10 +9,11 @@ from __future__ import annotations
 
 
 def register_all_models() -> None:
+    from app.users.models import AppUser  # noqa: F401
     # Import side-effects: each module attaches its mapped classes to
     # ``Base.metadata`` on import.
     from app.categories.models import Category  # noqa: F401, F811
-    from app.expenses.models import Expense  # noqa: F401, F811
+    from app.expenses.models import Expense, ExpenseChange  # noqa: F401, F811
     from app.recurring.models import (  # noqa: F401, F811
         RecurringExpense,
         RecurringReminder,

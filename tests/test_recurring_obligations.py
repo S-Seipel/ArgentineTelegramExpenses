@@ -21,6 +21,13 @@ from app.recurring.service import RecurringService, recurring_occurrence_source_
 USER = 123456
 
 
+def _scheduler_runtime():
+    from types import SimpleNamespace
+    from app.config.settings import Settings
+    return SimpleNamespace(settings=Settings(_env_file=None,
+        TELEGRAM_BOT_TOKEN="test-token", TELEGRAM_ALLOWED_USER_ID=USER, TIMEZONE="UTC"))
+
+
 def _cycle(today=date(2026, 10, 15), payday=1, income="1000", currency="ARS"):
     with session_scope() as s:
         UserSettingsService(s).set_payday_day(USER, payday, currency=currency)
@@ -168,10 +175,10 @@ async def test_scheduler_reuses_canonical_reminder_after_snooze(in_memory_db):
     rid = _recurring(due)
     bot = MagicMock()
     bot.bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=10), MagicMock(message_id=11)])
-    await _try_send_for_user(bot, MagicMock(), USER, due, "2026-10-31", {})
+    await _try_send_for_user(bot, _scheduler_runtime(), USER, due, "2026-10-31", {})
     with session_scope() as s:
         RecurringService(RecurringRepository(s)).postpone_occurrence(USER, rid, occurrence_date=due)
-    await _try_send_for_user(bot, MagicMock(), USER, date(2026, 11, 1), "2026-11-01", {})
+    await _try_send_for_user(bot, _scheduler_runtime(), USER, date(2026, 11, 1), "2026-11-01", {})
     with session_scope() as s:
         reminders = s.query(RecurringReminder).all()
         assert len(reminders) == 1
@@ -221,7 +228,7 @@ async def test_snooze_while_delivery_is_in_flight_keeps_new_attempt_pending(in_m
             )
         return MagicMock(message_id=10)
     bot.bot.send_message = AsyncMock(side_effect=deliver_then_snooze)
-    await _try_send_for_user(bot, MagicMock(), USER, due, due.isoformat(), {})
+    await _try_send_for_user(bot, _scheduler_runtime(), USER, due, due.isoformat(), {})
     with session_scope() as s:
         reminder = s.query(RecurringReminder).one()
         assert reminder.status == "pending"

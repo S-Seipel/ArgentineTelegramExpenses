@@ -49,6 +49,7 @@ class BotRuntime:
         self.ai = ai
         # user_id -> {"recurring_id": int, "name": str, "amount": Decimal, "currency": str}
         self.pending_reminders: dict[int, dict] = {}
+        self.pending_locations: dict[tuple[int, int], tuple[int, float]] = {}
 
     @classmethod
     def create(cls, settings: Settings) -> "BotRuntime":
@@ -71,8 +72,22 @@ async def _process_message_async(
     if len(cleaned) > runtime.settings.max_message_length:
         return "El mensaje es demasiado largo."
 
+    learned = _try_local_expense(runtime, cleaned, user_id=user_id, today=today)
+    if learned is not None:
+        return learned
+
     try:
-        parsed: ParsedMessage = await runtime.ai.interpret(cleaned)
+        from app.metrics import metrics
+        import json
+        from app.users import UserService
+        try:
+            with session_scope() as session:
+                prefs = UserService(session, settings=runtime.settings).get_preferences(user_id)
+            context = json.dumps({'today': today.isoformat(), 'timezone': prefs.timezone, 'language': prefs.language})
+        except Exception:
+            context = json.dumps({'today': today.isoformat(), 'timezone': runtime.settings.timezone, 'language': 'es'})
+        with metrics.measure('interpret'):
+            parsed: ParsedMessage = await runtime.ai.interpret(cleaned, user_context=context)
     except AIUnavailable:
         logger.exception("AI provider unreachable")
         provider = runtime.settings.ai_provider.lower()
@@ -191,10 +206,18 @@ async def _process_message_async(
 
     if intent_type == "query":
         spec = resolve_query_spec(intent, default_currency="ARS")
+        from app.utils.dates import parse_date_range
+        try:
+            window = parse_date_range(cleaned, today=today)
+        except ValueError:
+            return "Indicá un rango de fechas válido, con el inicio antes del fin."
+        if window:
+            spec.period, spec.range_start, spec.range_end = 'range', *window
+            spec.currency = intent.query.currency if intent.query else None
         try:
             with session_scope() as session:
                 repo = ExpenseRepository(session)
-                qservice = QueryService(repo)
+                qservice = QueryService(repo, today=today)
                 result = qservice.run(user_id=user_id, spec=spec)
         except Exception:
             logger.exception("DB error while querying")
@@ -202,6 +225,52 @@ async def _process_message_async(
         return _format_query(result)
 
     return "🤖 Algo raro pasó con el mensaje. Probá reformulándolo."
+
+
+
+def _try_local_expense(runtime, text, *, user_id, today):
+    """Only unambiguous single expenses with an exact learned category skip AI."""
+    import re
+    from datetime import timedelta
+    from decimal import Decimal
+    from app.expenses.classifier import predict_category
+    from app.metrics import metrics
+    from app.utils.amounts import _normalize_decimal
+
+    match = re.fullmatch(r"(?:(hoy|ayer)\s+)?(?:gasté|gaste|pagué|pague)\s+\$?\s*(\d[\d.,]*)(?:\s*(k|mil|lucas))?(?:\s+(ARS|USD|pesos|dolares|dólares))?\s+en\s+(.{1,255})", text.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    amount = _normalize_decimal(match[2])
+    if amount is None or not amount.is_finite() or amount <= 0:
+        return None
+    if match[3]:
+        amount *= 1000
+    currency = 'USD' if (match[4] or '').lower() in ('usd','dolares','dólares') else 'ARS'
+    when = today - timedelta(days=1) if (match[1] or '').lower() == 'ayer' else today
+    try:
+        with metrics.measure('classifier'):
+            with session_scope() as session:
+                prediction = predict_category(session, user_id, match[5])
+    except Exception:
+        logger.warning('Local learned-category lookup unavailable; using normal interpretation')
+        return None
+    if prediction is None:
+        return None
+    # Once a write is attempted, never fall back to a second registration.
+    try:
+        with session_scope() as session:
+            outcome = ExpenseService(ExpenseRepository(session)).register_many(user_id, [ExpenseDraft(
+                name=match[5], amount=amount, currency=currency, category=prediction.category,
+                expense_date=when, confidence=prediction.confidence,
+            )], original_message=text)
+    except Exception:
+        logger.warning('Could not confirm learned expense registration')
+        return '⚠️ No pude confirmar el registro del gasto. Revisá /gastos antes de repetirlo.'
+    if not outcome.saved:
+        return '🤔 No pude validar el gasto. Revisá el monto e intentá de nuevo.'
+    answer = _expense_confirmation(outcome.saved)
+    warning = _check_budget_alerts(user_id=user_id, outcome=outcome, today=today)
+    return answer + ('\n\n' + warning if warning else '')
 
 
 def _draft_from_extracted(
@@ -578,8 +647,6 @@ def _format_query(result: QueryResult) -> str:
 
         lines = [f"📊 *Desglose por categoría ({result.period_label})*", ""]
         for cat, by_currency in result.category_totals.items():
-            from app.utils.formatting import format_currency_amount
-
             icon = icon_for(cat) or CATEGORY_ICONS.get(cat, "🧾")
             if len(by_currency) == 1:
                 cur, amount = next(iter(by_currency.items()))

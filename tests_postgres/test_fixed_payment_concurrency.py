@@ -30,6 +30,13 @@ from app.recurring.scheduler import _try_send_for_user
 from tests_postgres.conftest import run_alembic
 
 
+def _scheduler_runtime():
+    from types import SimpleNamespace
+    from app.config.settings import Settings
+    return SimpleNamespace(settings=Settings(_env_file=None,
+        TELEGRAM_BOT_TOKEN="test-token", TELEGRAM_ALLOWED_USER_ID=42, TIMEZONE="UTC"))
+
+
 def _bootstrap(pg_database_url: str) -> None:
     """Fresh schema. The categories seed ships with migration 0003,
     so there's no need to insert duplicates here — doing so would
@@ -180,7 +187,7 @@ def test_scheduler_repeated_runs_persist_one_reminder(fresh_db):
     asyncio.run(
         _try_send_for_user(
             app,
-            object(),
+            _scheduler_runtime(),
             42,
             occurrence,
             occurrence.isoformat(),
@@ -190,7 +197,7 @@ def test_scheduler_repeated_runs_persist_one_reminder(fresh_db):
     asyncio.run(
         _try_send_for_user(
             app,
-            object(),
+            _scheduler_runtime(),
             42,
             occurrence,
             occurrence.isoformat(),
@@ -200,7 +207,7 @@ def test_scheduler_repeated_runs_persist_one_reminder(fresh_db):
     asyncio.run(
         _try_send_for_user(
             app,
-            object(),
+            _scheduler_runtime(),
             42,
             occurrence,
             occurrence.isoformat(),
@@ -266,7 +273,7 @@ def test_scheduler_failure_then_retry_delivers_once(fresh_db):
         asyncio.run(
             _try_send_for_user(
                 app,
-                object(),
+                _scheduler_runtime(),
                 42,
                 occurrence,
                 occurrence.isoformat(),
@@ -328,7 +335,7 @@ def test_scheduler_reclaims_crashed_delivery_claim(fresh_db):
     asyncio.run(
         _try_send_for_user(
             app,
-            object(),
+            _scheduler_runtime(),
             42,
             occurrence,
             occurrence.isoformat(),

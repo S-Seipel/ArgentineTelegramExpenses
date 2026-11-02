@@ -135,6 +135,20 @@ def build_application(
             filters.VOICE | filters.AUDIO, _voice_handler
         )
     )
+    application.add_handler(CommandHandler([
+        'undo', 'deshacer', 'idioma', 'voz', 'zona', 'usuarios', 'usuario_add',
+        'usuario_off', 'ubicacion', 'ticket_confirmar', 'ticket_cancelar', 'rango', 'clasificador',
+    ], _command_handler))
+    from app.bot.extensions import handle_photo, handle_location
+
+    async def photo(update, context):
+        await handle_photo(update, context, deps)
+
+    async def location(update, context):
+        await handle_location(update, context, deps)
+
+    application.add_handler(MessageHandler(filters.PHOTO, photo))
+    application.add_handler(MessageHandler(filters.LOCATION, location))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _text_handler)
     )

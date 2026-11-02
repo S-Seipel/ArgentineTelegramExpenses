@@ -63,6 +63,57 @@ def test_same_user_can_have_one_open_cycle_per_currency(in_memory_db):
             ))
 
 
+@pytest.mark.parametrize("currency,payday", [("ARS", 5), ("USD", 20)])
+def test_ensure_recovers_opener_committed_between_cycle_reads(in_memory_db, monkeypatch, currency, payday):
+    today = date(2026, 11, 2)
+    with session_scope() as session:
+        UserSettingsService(session).set_payday_day(USER, payday, currency=currency)
+        winner = CycleService(session).ensure_current_cycle(USER, today, currency=currency)
+        canonical = (winner.id, winner.currency, winner.start_date, winner.end_date)
+        service = CycleService(session)
+        real_lookup = service._latest_open_cycle
+        first_read = True
+
+        def opener_not_committed_on_first_read(user_id, *, currency="ARS"):
+            nonlocal first_read
+            if first_read:
+                first_read = False
+                return None
+            return real_lookup(user_id, currency=currency)
+
+        # At READ COMMITTED, the first SELECT can miss a new cycle and
+        # the following all-status SELECT can see the opener's commit.
+        monkeypatch.setattr(service, "_latest_open_cycle", opener_not_committed_on_first_read)
+        result = service.ensure_current_cycle(USER, today, currency=currency)
+        assert (result.id, result.currency, result.start_date, result.end_date) == canonical
+        assert session.query(FinancialCycle).count() == 1
+
+        # A genuinely closed current period must still reject reopening.
+        service.close_cycle(USER, result.id)
+        frozen = deepcopy(session.get(FinancialCycle, result.id).closing_snapshot)
+        with pytest.raises(LookupError, match="ya está cerrado"):
+            service.ensure_current_cycle(USER, today, currency=currency)
+        assert session.query(FinancialCycle).count() == 1
+        assert session.get(FinancialCycle, result.id).closing_snapshot == frozen
+
+
+@pytest.mark.parametrize("currency", ["ARS", "USD"])
+def test_ensure_refreshes_cached_open_after_another_session_closes(in_memory_db, currency):
+    cycle_id = _open(currency)
+    factory = get_session_factory()
+    with factory() as stale:
+        cached = stale.get(FinancialCycle, cycle_id)
+        assert cached.status == "open"
+        with session_scope() as writer:
+            CycleService(writer).close_cycle(USER, cycle_id)
+        with pytest.raises(LookupError, match="ya está cerrado"):
+            CycleService(stale).ensure_current_cycle(USER, TODAY, currency=currency)
+    with session_scope() as session:
+        assert session.query(FinancialCycle).count() == 1
+        row = session.get(FinancialCycle, cycle_id)
+        assert row.status == "closed" and row.closing_snapshot is not None
+
+
 def test_inherited_currency_calendar_freezes_at_first_open(in_memory_db):
     with session_scope() as s:
         config = UserSettingsService(s)

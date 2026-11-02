@@ -40,6 +40,16 @@ class ExpenseSummary:
     source_key: Optional[str] = None
     deleted_at: Optional[datetime] = None
     revision: int = 1
+    latitude: Optional[Decimal] = None
+    longitude: Optional[Decimal] = None
+    location_recorded_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class UndoResult:
+    change_id: int
+    action: str
+    expense: ExpenseSummary
 
 
 class ExpenseOut:

@@ -46,6 +46,11 @@ async def lifespan(app: FastAPI):
     configure_logging(get_settings().log_level)
     settings = get_settings()
 
+    from app.users import UserService
+    from app.database.database import session_scope
+    with session_scope() as session:
+        UserService(session, settings=settings).ensure_owner()
+
     deps = BotDependencies(runtime=BotRuntime.create(settings))
 
     try:
@@ -118,6 +123,22 @@ app = FastAPI(
 from app.web.routes import router as web_router  # noqa: E402
 
 app.include_router(web_router)
+
+from app.web.extras import router as extras_router  # noqa: E402
+app.include_router(extras_router)
+
+
+@app.middleware("http")
+async def operational_metrics(request, call_next):
+    from app.metrics import metrics
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        metrics.http(request.method, getattr(route, "path", None), status)
 
 
 @app.get("/health")

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Sequence
 
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.expenses.models import Expense
+from app.expenses.models import Expense, ExpenseChange
+from app.expenses.history import (
+    UndoConflictError,
+    lock_user_history,
+    record_change,
+    restore_snapshot,
+    snapshot,
+)
 from app.expenses.names import normalize_expense_name
-from app.expenses.schemas import ExpenseCreate, ExpenseSummary
+from app.expenses.schemas import ExpenseCreate, ExpenseSummary, UndoResult
 from app.categories.models import Category
 
 
@@ -475,7 +482,7 @@ class ExpenseRepository:
             SystemOwnedExpenseError,
         )
 
-        row = self.get_entity(user_id, expense_id)
+        row = self._locked_entity(user_id, expense_id)
         if row is None:
             return None
         # Existing FK guard first: keeps backward-compat for callers
@@ -489,8 +496,10 @@ class ExpenseRepository:
             )
         self._assert_not_system_owned(row)
         summary = self._to_summary(row)
-        row.deleted_at = datetime.utcnow()
+        before, revision = snapshot(row), row.revision
+        row.deleted_at = datetime.now(timezone.utc)
         row.revision = (row.revision or 1) + 1
+        record_change(self.session, row, "delete", before, revision)
         self.session.commit()
         return summary
 
@@ -505,8 +514,16 @@ class ExpenseRepository:
         row = self.get_entity(user_id, expense_id)
         if row is None:
             return None
-        row.deleted_at = when or datetime.utcnow()
+        normal = self._is_normal(row)
+        if normal:
+            row = self._locked_entity(user_id, expense_id)
+            if row is None:
+                return None
+        before, revision = snapshot(row), row.revision
+        row.deleted_at = when or datetime.now(timezone.utc)
         row.revision = (row.revision or 1) + 1
+        if normal:
+            record_change(self.session, row, "delete", before, revision)
         if commit:
             self.session.commit()
             self.session.refresh(row)
@@ -516,8 +533,16 @@ class ExpenseRepository:
         row = self.get_entity(user_id, expense_id, include_deleted=True)
         if row is None or row.deleted_at is None:
             return None
+        normal = self._is_normal(row)
+        if normal:
+            row = self._locked_entity(user_id, expense_id, include_deleted=True)
+            if row is None or row.deleted_at is None:
+                return None
+        before, revision = snapshot(row), row.revision
         row.deleted_at = None
         row.revision = (row.revision or 1) + 1
+        if normal:
+            record_change(self.session, row, "restore", before, revision)
         self.session.commit()
         self.session.refresh(row)
         return row
@@ -525,14 +550,25 @@ class ExpenseRepository:
     def update_amount(
         self, user_id: int, expense_id: int, new_amount: Decimal
     ) -> ExpenseSummary | None:
-        row = self.get_entity(user_id, expense_id)
+        row = self._locked_entity(user_id, expense_id)
         if row is None:
             return None
-        self._assert_not_system_owned(row)
-        if new_amount <= 0:
+        self._assert_user_editable(row)
+        if not isinstance(new_amount, Decimal) or not new_amount.is_finite() or new_amount <= 0:
             raise ValueError("amount must be positive")
+        if new_amount >= Decimal("10000000000000000"):
+            raise ValueError("amount is too large")
+        new_amount = new_amount.quantize(Decimal("0.01"))
+        if new_amount <= 0:
+            raise ValueError("amount must be at least 0.01")
+        if new_amount >= Decimal("10000000000000000"):
+            raise ValueError("amount is too large")
+        if new_amount == row.amount:
+            return self._to_summary(row)
+        before, revision = snapshot(row), row.revision
         row.amount = new_amount
         row.revision = (row.revision or 1) + 1
+        record_change(self.session, row, "amount", before, revision)
         self.session.commit()
         self.session.refresh(row)
         return self._to_summary(row)
@@ -540,21 +576,104 @@ class ExpenseRepository:
     def update_name(
         self, user_id: int, expense_id: int, new_name: str
     ) -> ExpenseSummary | None:
-        row = self.get_entity(user_id, expense_id)
+        row = self._locked_entity(user_id, expense_id)
         if row is None:
             return None
-        self._assert_not_system_owned(row)
+        self._assert_user_editable(row)
         new_name = new_name.strip()
         if not new_name:
             raise ValueError("name cannot be empty")
         if len(new_name) > 200:
             raise ValueError("name too long")
+        if new_name == row.name:
+            return self._to_summary(row)
+        before, revision = snapshot(row), row.revision
         row.name = new_name
         row.name_key = normalize_expense_name(new_name)
         row.revision = (row.revision or 1) + 1
+        record_change(self.session, row, "name", before, revision)
         self.session.commit()
         self.session.refresh(row)
         return self._to_summary(row)
+
+    def set_location(self, user_id: int, expense_id: int, latitude, longitude) -> ExpenseSummary | None:
+        """Attach explicitly supplied coordinates, or remove them with None/None."""
+        if latitude is None and longitude is None:
+            lat = lon = None
+        elif latitude is None or longitude is None:
+            raise ValueError("latitude and longitude must be provided together")
+        else:
+            try:
+                lat, lon = Decimal(str(latitude)), Decimal(str(longitude))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("coordinates must be finite numbers") from exc
+            if not lat.is_finite() or not lon.is_finite() or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise ValueError("latitude must be -90..90 and longitude -180..180")
+            lat, lon = lat.quantize(Decimal("0.0000001")), lon.quantize(Decimal("0.0000001"))
+        row = self._locked_entity(user_id, expense_id)
+        if row is None:
+            return None
+        self._assert_user_editable(row)
+        if row.latitude == lat and row.longitude == lon:
+            return self._to_summary(row)
+        before, revision = snapshot(row), row.revision
+        row.latitude, row.longitude = lat, lon
+        row.location_recorded_at = datetime.now(timezone.utc) if lat is not None else None
+        row.revision = (row.revision or 1) + 1
+        record_change(self.session, row, "location", before, revision)
+        self.session.commit()
+        self.session.refresh(row)
+        return self._to_summary(row)
+
+    def undo_last(self, user_id: int) -> UndoResult | None:
+        lock_user_history(self.session, user_id)
+        change = self.session.execute(select(ExpenseChange).where(
+            ExpenseChange.telegram_user_id == user_id,
+            ExpenseChange.status == "pending",
+        ).order_by(ExpenseChange.id.desc()).limit(1).with_for_update(of=ExpenseChange)
+            .execution_options(populate_existing=True)).scalar_one_or_none()
+        if change is None:
+            return None
+        row = self._locked_entity(user_id, change.expense_id, include_deleted=True)
+        if row is None:
+            raise UndoConflictError("El gasto ya no está disponible; no se cambió ningún dato.")
+        self._assert_user_editable(row)
+        if row.revision != change.expected_revision or snapshot(row) != change.after_snapshot:
+            raise UndoConflictError("El gasto cambió después de esa acción; no se sobrescribió ningún dato.")
+        revision = row.revision
+        restore_snapshot(row, change.before_snapshot)
+        row.revision = revision + 1
+        change.status = "undone"
+        change.undone_at = datetime.now(timezone.utc)
+        self.session.flush()
+        previous = self.session.execute(select(ExpenseChange).where(
+            ExpenseChange.telegram_user_id == user_id,
+            ExpenseChange.expense_id == row.id,
+            ExpenseChange.status == "pending",
+        ).order_by(ExpenseChange.id.desc()).limit(1)).scalar_one_or_none()
+        if previous is not None and previous.after_snapshot == snapshot(row):
+            previous.expected_revision = row.revision
+        self.session.commit()
+        self.session.refresh(row)
+        return UndoResult(change_id=change.id, action=change.action, expense=self._to_summary(row))
+
+    def _locked_entity(self, user_id: int, expense_id: int, *, include_deleted: bool = False) -> Expense | None:
+        lock_user_history(self.session, user_id)
+        stmt = select(Expense).where(Expense.telegram_user_id == user_id, Expense.id == expense_id)
+        if not include_deleted:
+            stmt = stmt.where(_NOT_DELETED)
+        return self.session.execute(stmt.with_for_update(of=Expense)
+            .execution_options(populate_existing=True)).scalar_one_or_none()
+
+    def _is_normal(self, row: Expense) -> bool:
+        return row.source_type not in ("fixed_payment", "recurring") and not self._is_linked_to_fixed_payment(row.id)
+
+    def _assert_user_editable(self, row: Expense) -> None:
+        from app.expenses.service import LinkedFixedPaymentError
+
+        if self._is_linked_to_fixed_payment(row.id):
+            raise LinkedFixedPaymentError("Este gasto pertenece a un pago fijo. Usá el flujo de gastos fijos.")
+        self._assert_not_system_owned(row)
 
     def touch_revision(self, row: Expense) -> None:
         """Bump revision in-place for callers that already mutated a row."""
@@ -610,4 +729,7 @@ class ExpenseRepository:
             source_key=row.source_key,
             deleted_at=row.deleted_at,
             revision=row.revision,
+            latitude=row.latitude,
+            longitude=row.longitude,
+            location_recorded_at=row.location_recorded_at,
         )

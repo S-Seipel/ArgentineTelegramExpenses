@@ -39,12 +39,15 @@ from app.utils.amounts import _normalize_decimal, find_thousand_amounts
 from app.utils.dates import today_in_tz
 from app.utils.formatting import format_currency_amount, format_date_short
 from app.ai.schemas import AIError, AIUnavailable
+from app.bot.extensions import reply as _reply, timezone_for, handle_extension_command, preferences_for
+from app.metrics import metrics, instrument
 from app.insights import format_spending_analysis, spending_context
 from app.web.queries import resolve_period
 
 logger = logging.getLogger(__name__)
 
 
+@instrument('telegram_command')
 async def handle_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -60,36 +63,39 @@ async def handle_command(
 
     raw = (update.effective_message.text or "").strip()
     parts = raw.split()
-    command = parts[0].lower()
+    command = parts[0].lower().split("@", 1)[0]
     args = parts[1:]
     user_id = update.effective_user.id
+    if await handle_extension_command(update, context, deps):
+        return
 
     if command in ("/analisis", "/analisis_mes", "/consejos"):
         await update.effective_message.chat.send_action(ChatAction.TYPING)
-        today = today_in_tz(deps.runtime.settings.timezone)
+        today = today_in_tz(timezone_for(deps, user_id))
         with session_scope() as session:
             context_data = spending_context(session, user_id, today)
         if context_data is None:
-            await update.effective_message.reply_text(
+            await _reply(update, deps,
                 "Todavía no tengo gastos del mes para analizar."
             )
             return
         try:
-            analysis = await deps.runtime.ai.analyze_spending(context_data)
+            with metrics.measure("analysis"):
+                analysis = await deps.runtime.ai.analyze_spending(context_data)
         except AIUnavailable:
             logger.exception("AI provider unreachable during spending analysis")
-            await update.effective_message.reply_text(
+            await _reply(update, deps,
                 "🤖 No pude consultar la IA para analizar tus gastos. "
                 "Probá de nuevo en un momento."
             )
             return
         except AIError:
             logger.exception("AI spending analysis failed")
-            await update.effective_message.reply_text(
+            await _reply(update, deps,
                 "🤖 No pude generar un análisis válido. Probá de nuevo."
             )
             return
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             format_spending_analysis(
                 analysis, resolve_period("month", today).label
             )
@@ -100,9 +106,9 @@ async def handle_command(
     if spec is not None:
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         with session_scope() as session:
-            qservice = QueryService(ExpenseRepository(session))
+            qservice = QueryService(ExpenseRepository(session), today=today_in_tz(timezone_for(deps, user_id)))
             result = qservice.run(user_id=user_id, spec=spec)
-        await update.effective_message.reply_text(_format_query(result))
+        await _reply(update, deps, _format_query(result))
         return
 
     if command in ("/borrar", "/borrar_ultimo"):
@@ -112,7 +118,7 @@ async def handle_command(
             reply = await _handle_delete_command(
                 update, repo, user_id, command, args
             )
-        await update.effective_message.reply_text(reply, parse_mode=None)
+        await _reply(update, deps, reply, parse_mode=None)
         return
 
     if command in ("/editar", "/editar_ultimo"):
@@ -122,11 +128,11 @@ async def handle_command(
             reply = await _handle_edit_command(
                 update, repo, user_id, command, args
             )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command in ("/exportar", "/csv"):
-        await _handle_export_command(update, user_id)
+        await _handle_export_command(update, user_id, timezone=timezone_for(deps, user_id))
         return
 
     if command in (
@@ -143,9 +149,9 @@ async def handle_command(
             repo = RecurringRepository(session)
             service = RecurringService(repo)
             reply = _handle_recurring_command(
-                command, args, service, user_id, today_in_tz(deps.runtime.settings.timezone)
+                command, args, service, user_id, today_in_tz(timezone_for(deps, user_id))
             )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command in (
@@ -162,12 +168,12 @@ async def handle_command(
             reply = _handle_budget_command(
                 command, args, service, user_id
             )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/buscar":
         if not args:
-            await update.effective_message.reply_text(
+            await _reply(update, deps,
                 "❓ Decime qué buscar. Ej: `/buscar starbucks`"
             )
             return
@@ -176,7 +182,7 @@ async def handle_command(
         with session_scope() as session:
             repo = ExpenseRepository(session)
             results = repo.search_by_name(user_id, query, limit=20)
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             _format_search_results(query, results)
         )
         return
@@ -201,7 +207,7 @@ async def handle_command(
                 f"✅ Reparé {result.repaired} espejos de pagos fijos."
                 if result.repaired else "✅ Los pagos fijos están consistentes."
             )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command in (
@@ -215,9 +221,9 @@ async def handle_command(
             service = FixedExpenseService(repo)
             reply = _handle_fixed_expense_command(
                 command, args, service, user_id,
-                today=today_in_tz(deps.runtime.settings.timezone),
+                today=today_in_tz(timezone_for(deps, user_id)),
             )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/config_payday":
@@ -225,9 +231,9 @@ async def handle_command(
         reply = _handle_config_payday_command(
             args,
             user_id=user_id,
-            timezone=deps.runtime.settings.timezone,
+            timezone=timezone_for(deps, user_id),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command in ("/cycle", "/disponible", "/liberado", "/gastar_diario"):
@@ -235,9 +241,9 @@ async def handle_command(
         reply = _handle_cycle_read_command(
             command, args=args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/ingreso":
@@ -245,10 +251,10 @@ async def handle_command(
         reply = _handle_ingreso_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/extra":
@@ -258,10 +264,10 @@ async def handle_command(
             user_id=user_id,
             chat_id=update.effective_message.chat_id,
             message_id=update.effective_message.message_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/extra_editar":
@@ -269,9 +275,9 @@ async def handle_command(
         reply = _handle_extra_editar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/extra_borrar":
@@ -279,9 +285,9 @@ async def handle_command(
         reply = _handle_extra_borrar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/target":
@@ -289,10 +295,10 @@ async def handle_command(
         reply = _handle_target_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/reservar":
@@ -300,10 +306,10 @@ async def handle_command(
         reply = _handle_reservar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/liberar":
@@ -311,10 +317,10 @@ async def handle_command(
         reply = _handle_liberar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/ahorro_realizado":
@@ -324,10 +330,10 @@ async def handle_command(
             user_id=user_id,
             chat_id=update.effective_message.chat_id,
             message_id=update.effective_message.message_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
             text=raw,
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/ahorro_editar":
@@ -335,9 +341,9 @@ async def handle_command(
         reply = _handle_ahorro_editar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command == "/ahorro_borrar":
@@ -345,18 +351,20 @@ async def handle_command(
         reply = _handle_ahorro_borrar_command(
             args,
             user_id=user_id,
-            today=today_in_tz(deps.runtime.settings.timezone),
+            today=today_in_tz(timezone_for(deps, user_id)),
         )
-        await update.effective_message.reply_text(reply)
+        await _reply(update, deps, reply)
         return
 
     if command in ("/start", "/help", "/ayuda"):
-        await update.effective_message.reply_text(_help_text())
+        from app.users.i18n import translate
+        await _reply(update, deps, translate("help", preferences_for(deps, user_id).language))
         return
 
-    await update.effective_message.reply_text("Comando no reconocido.")
+    await _reply(update, deps, "Comando no reconocido.")
 
 
+@instrument('telegram_text')
 async def handle_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -372,7 +380,7 @@ async def handle_text(
 
     text = update.effective_message.text or ""
     user_id = update.effective_user.id
-    today = today_in_tz(deps.runtime.settings.timezone)
+    today = today_in_tz(timezone_for(deps, user_id))
 
     reply_to = getattr(update.effective_message, "reply_to_message", None)
     reply_to_message_id = getattr(reply_to, "message_id", None)
@@ -382,7 +390,7 @@ async def handle_text(
         deps, user_id, text, today, reply_to_message_id=reply_to_message_id
     )
     if handled is not None:
-        await update.effective_message.reply_text(handled)
+        await _reply(update, deps, handled)
         return
 
     await update.effective_message.chat.send_action(ChatAction.TYPING)
@@ -394,9 +402,10 @@ async def handle_text(
         logger.exception("Unhandled error processing message")
         reply = "⚠️ Ocurrió un error procesando tu mensaje. Probá de nuevo."
 
-    await update.effective_message.reply_text(reply)
+    await _reply(update, deps, reply)
 
 
+@instrument('telegram_audio')
 async def handle_voice(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -424,7 +433,7 @@ async def handle_voice(
         return
 
     user_id = update.effective_user.id
-    today = today_in_tz(deps.runtime.settings.timezone)
+    today = today_in_tz(timezone_for(deps, user_id))
     await update.effective_message.chat.send_action(ChatAction.TYPING)
 
     try:
@@ -432,34 +441,35 @@ async def handle_voice(
         audio_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception:
         logger.exception("Failed to download voice file")
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             "⚠️ No pude descargar el audio."
         )
         return
 
     try:
-        transcript = await deps.runtime.ai.transcribe(audio_bytes)
+        with metrics.measure("transcribe"):
+            transcript = await deps.runtime.ai.transcribe(audio_bytes)
     except AIUnavailable:
         logger.exception("Whisper unreachable")
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             "🤖 No pude transcribir el audio. Verificá que ffmpeg esté"
             " disponible y que el modelo de Whisper se haya descargado"
             f" ({deps.runtime.settings.whisper_model_size})."
         )
         return
     except AIError as exc:
-        await update.effective_message.reply_text(f"🤖 {exc}")
+        await _reply(update, deps, f"🤖 {exc}")
         return
     except Exception:
         logger.exception("Unexpected error transcribing audio")
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             "⚠️ Error inesperado al transcribir."
         )
         return
 
     transcript = (transcript or "").strip()
     if not transcript:
-        await update.effective_message.reply_text(
+        await _reply(update, deps,
             "🤔 No pude entender el audio. ¿Podés escribirlo?"
         )
         return
@@ -476,7 +486,7 @@ async def handle_voice(
         f"🎤 _{transcript}_\n\n"
         f"{reply}"
     )
-    await update.effective_message.reply_text(formatted, parse_mode=None)
+    await _reply(update, deps, formatted, parse_mode=None)
 
 
 async def _maybe_handle_reminder_reply(
@@ -497,10 +507,15 @@ async def _maybe_handle_reminder_reply(
         "sí", "si", "dale", "ok", "listo", "confirmo",
         "no", "nope", "skip", "saltar",
         "posponer", "mañana", "manana",
+        "en 3 días", "en 3 dias", "el viernes que viene", "viernes",
+        "yes", "sim", "tomorrow", "amanha", "amanhã", "in 3 days", "em 3 dias", "next friday",
         "eliminar", "borrar", "nunca más", "nunca mas", "quitar",
     }
     if normalized not in control_words:
         return None
+    normalized = {'yes': 'si', 'sim': 'si', 'tomorrow': 'mañana', 'amanha': 'mañana',
+                  'amanhã': 'mañana', 'in 3 days': 'en 3 dias', 'em 3 dias': 'en 3 dias',
+                  'next friday': 'el viernes que viene'}.get(normalized, normalized)
 
     with session_scope() as session:
         repo = RecurringRepository(session)
@@ -566,11 +581,15 @@ async def _maybe_handle_reminder_reply(
                 f"Próximo aviso: {format_date_short(template_after.next_due_date)}"
             )
 
-        if normalized in ("posponer", "mañana", "manana"):
+        if normalized in ("posponer", "mañana", "manana", "en 3 días", "en 3 dias", "el viernes que viene", "viernes"):
+            from datetime import timedelta
+            extra = 3 if normalized in ("en 3 días", "en 3 dias") else (4 - today.weekday()) % 7 or 7
+            until = today + timedelta(days=extra) if normalized not in ("posponer", "mañana", "manana") else None
             service.postpone_occurrence(
                 user_id=user_id, recurring_id=recurring_id,
                 occurrence_date=reminder.occurrence_date if reminder is not None else None,
                 today=today,
+                until=until,
                 commit=False,
             )
             if reminder is not None and not template_obj.is_obligation:
@@ -579,7 +598,7 @@ async def _maybe_handle_reminder_reply(
                 deps.runtime.pending_reminders.pop(user_id, None)
             template_after = repo.get_by_id_for_update(user_id, recurring_id)
             return (
-                f"⏰ Dale, te aviso mañana. "
+                f"⏰ Dale, te aviso {template_after.next_due_date.isoformat() if until else 'mañana'}. "
                 f"Próximo intento: {format_date_short(template_after.next_due_date)}"
             )
 
@@ -620,8 +639,13 @@ async def _ensure_authorized(
 ) -> None:
     if update.effective_user is None:
         return
-    allowed = deps.runtime.settings.telegram_allowed_user_id
-    if update.effective_user.id != allowed:
+    from app.users import UserService
+    try:
+        with session_scope() as session:
+            authorized = UserService(session, settings=deps.runtime.settings).is_authorized(update.effective_user.id)
+    except Exception:
+        authorized = False
+    if not authorized:
         logger.warning("Rejected unauthorized user %s", update.effective_user.id)
         if update.effective_message is not None:
             await update.effective_message.reply_text(
@@ -788,7 +812,7 @@ def _parse_user_amount(text: str) -> Decimal | None:
 
 
 async def _handle_export_command(
-    update: Update, user_id: int
+    update: Update, user_id: int, *, timezone: str | None = None
 ) -> None:
     """Build a CSV in-memory and send it as a Telegram document."""
     import csv
@@ -800,9 +824,10 @@ async def _handle_export_command(
     if update.effective_message is None:
         return
 
-    today = today_in_tz(
-        update.application.bot_data["settings"].timezone
-    )
+    if timezone is None:
+        from app.config.settings import get_settings
+        timezone = get_settings().timezone
+    today = today_in_tz(timezone)
     start: _date | None = None
     period_label = "mes en curso"
     raw_text = (update.effective_message.text or "").split()

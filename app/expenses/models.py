@@ -6,16 +6,19 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.database import Base
@@ -79,6 +82,9 @@ class Expense(Base):
     revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+    latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7), nullable=True)
+    longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7), nullable=True)
+    location_recorded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -99,6 +105,12 @@ class Expense(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "(latitude IS NULL AND longitude IS NULL AND location_recorded_at IS NULL) OR "
+            "(latitude IS NOT NULL AND longitude IS NOT NULL AND location_recorded_at IS NOT NULL "
+            "AND latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)",
+            name="ck_expenses_location",
+        ),
         Index("ix_expenses_user_date", "telegram_user_id", "expense_date"),
         Index("ix_expenses_user_category", "telegram_user_id", "category_id"),
         Index("ix_expenses_user_currency", "telegram_user_id", "currency"),
@@ -122,3 +134,34 @@ class Expense(Base):
             f"<Expense id={self.id} name={self.name!r} "
             f"amount={self.amount} {self.currency} date={self.expense_date}>"
         )
+
+
+class ExpenseChange(Base):
+    """Durable undo stack for normal expense edits, never system mirrors.
+
+    Snapshots and original revisions remain immutable. ``expected_revision``
+    advances only when an immediately following change is undone, allowing
+    a safe multi-step undo without decrementing the expense revision.
+    """
+
+    __tablename__ = "expense_changes"
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expense_id: Mapped[int] = mapped_column(ForeignKey("expenses.id", ondelete="CASCADE"), nullable=False)
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    before_snapshot: Mapped[dict] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False)
+    after_snapshot: Mapped[dict] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False)
+    before_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="pending", server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    undone_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("action IN ('amount','name','delete','restore','location')", name="ck_expense_changes_action"),
+        CheckConstraint("status IN ('pending','undone','expired')", name="ck_expense_changes_status"),
+        CheckConstraint("before_revision >= 1 AND after_revision > before_revision AND expected_revision >= after_revision", name="ck_expense_changes_revision"),
+        Index("ix_expense_changes_user_pending", "telegram_user_id", "status", "id"),
+        Index("ix_expense_changes_expense", "expense_id"),
+    )
