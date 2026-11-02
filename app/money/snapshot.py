@@ -94,7 +94,10 @@ def build_closing_snapshot(
     persisting the returned dict in the same transaction.
     """
     summary_with_carry = replace(
-        summary, carried_over_fixed=tuple(carried_over)
+        summary,
+        carried_over_fixed=tuple(carried_over),
+        daily_safe_to_spend=None,
+        remaining_days=None,
     )
     return serialize_snapshot(
         summary_with_carry, closed_at=closed_at, closed_by=closed_by
@@ -130,12 +133,13 @@ def ensure_snapshot_version(payload: dict[str, Any]) -> int:
         raise SnapshotVersionMismatchError(
             "closing_snapshot missing snapshot_version field"
         )
-    try:
-        version = int(raw)
-    except (TypeError, ValueError) as exc:
+    # JSON booleans and fractional numbers must not become version 1 via
+    # Python's int coercion: an unknown schema cannot be read as v1.
+    if type(raw) is not int:
         raise SnapshotVersionMismatchError(
             f"closing_snapshot snapshot_version is not an int: {raw!r}"
-        ) from exc
+        )
+    version = raw
     if version != CURRENT_SNAPSHOT_VERSION:
         raise SnapshotVersionMismatchError(
             f"closing_snapshot version {version} is not supported "

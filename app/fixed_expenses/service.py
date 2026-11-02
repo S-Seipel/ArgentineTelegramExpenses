@@ -21,10 +21,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date as _date
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Iterable, Optional
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -48,6 +50,17 @@ class FixedExpenseValidationError(ValueError):
 
 class FixedExpenseHasHistoricalCarryOverError(RuntimeError):
     """A snapshot still references this template and its payment history."""
+
+
+class MirrorRepairError(RuntimeError):
+    """A payment mirror cannot be repaired without risking another row."""
+
+
+@dataclass(frozen=True)
+class MirrorRepairResult:
+    scanned: int
+    repaired: int
+    remaining_violations: int
 
 
 _ALLOWED_METHODS = {
@@ -503,6 +516,185 @@ class FixedExpenseService:
         # payment.expense_id is preserved on purpose: see docstring.
 
         return True
+
+    def repair_mirrors(self, user_id: int) -> MirrorRepairResult:
+        """Repair the five fixed-payment invariants reported by MoneyEngine.
+
+        Lock templates in ID order, the same lock mark_paid takes, before
+        detecting or changing payments. The caller owns the transaction and
+        must roll it back if an ambiguous repair raises.
+        """
+        from app.money.engine import MoneyEngine
+
+        session = self.repo.session
+        # Preserve changes already made by this transaction before refreshing
+        # the locked rows. expire_all() must never silently discard them.
+        session.flush()
+        fixed_ids = session.execute(
+            select(FixedExpense.id)
+            .where(FixedExpense.telegram_user_id == user_id)
+            .order_by(FixedExpense.id)
+        ).scalars().all()
+        for fixed_id in fixed_ids:
+            self.repo.get_by_id_for_update(user_id, fixed_id)
+
+        session.expire_all()
+        scanned = session.execute(
+            select(func.count(FixedExpensePayment.id))
+            .join(FixedExpense, FixedExpense.id == FixedExpensePayment.fixed_expense_id)
+            .where(
+                FixedExpense.telegram_user_id == user_id,
+                FixedExpensePayment.paid_at.is_not(None),
+                FixedExpensePayment.skipped.is_(False),
+            )
+        ).scalar_one()
+        violations = MoneyEngine(session).detect_invariant_violations(user_id)
+        for violation in violations:
+            template = self.repo.get_by_id(user_id, violation.fixed_expense_id)
+            if template is None:
+                raise MirrorRepairError("El gasto fijo ya no pertenece al usuario.")
+            payment = self.repo.get_payment_for_update(
+                template.id, violation.month_year
+            )
+            if payment is None or payment.id != violation.fixed_payment_id:
+                raise MirrorRepairError("El pago cambió durante la reparación.")
+            self._repair_one_mirror(user_id, template, payment)
+
+        session.flush()
+        remaining = len(MoneyEngine(session).detect_invariant_violations(user_id))
+        if remaining:
+            raise MirrorRepairError("Quedan pagos con espejo inconsistente.")
+        return MirrorRepairResult(
+            scanned=int(scanned), repaired=len(violations),
+            remaining_violations=0,
+        )
+
+    def _repair_one_mirror(
+        self, user_id: int, template: FixedExpense, payment: FixedExpensePayment
+    ) -> None:
+        session = self.repo.session
+        key = fixed_payment_source_key(template.id, payment.month_year)
+        expense_repo = ExpenseRepository(session)
+        canonical = expense_repo.get_by_source_key(user_id, key, include_deleted=True)
+        linked = session.get(Expense, payment.expense_id) if payment.expense_id else None
+
+        if linked is not None and linked.telegram_user_id != user_id:
+            raise MirrorRepairError("El pago apunta a un gasto de otro usuario.")
+        if canonical is not None and canonical.telegram_user_id != user_id:
+            raise MirrorRepairError("La identidad del espejo pertenece a otro usuario.")
+
+        if linked is not None and linked is not canonical:
+            other_link = session.execute(
+                select(FixedExpensePayment.id).where(
+                    FixedExpensePayment.expense_id == linked.id,
+                    FixedExpensePayment.id != payment.id,
+                )
+            ).first()
+            if other_link:
+                raise MirrorRepairError("Un gasto está vinculado a otro pago.")
+
+        if canonical is not None and canonical is not linked:
+            if canonical.source_type != "fixed_payment":
+                raise MirrorRepairError("La identidad está ocupada por otro gasto.")
+            if linked is not None and linked.source_type == "fixed_payment" and linked.deleted_at is None:
+                raise MirrorRepairError("Hay dos espejos activos para el pago.")
+            mirror = canonical
+        elif linked is not None and (
+            linked.source_type == "fixed_payment" or linked.source_key == key
+        ):
+            if linked.source_type != "fixed_payment" and not linked.original_message.startswith(
+                f"[gastofijo #{template.id}]"
+            ):
+                raise MirrorRepairError("El gasto no es un espejo del pago fijo.")
+            mirror = linked
+        elif linked is not None and linked.source_type != "fixed_payment":
+            # An ordinary user expense is never repurposed as a system mirror.
+            mirror = None
+        else:
+            mirror = canonical
+
+        if mirror is None:
+            name, amount, currency, paid_on = self._historical_mirror_values(
+                user_id, template, payment
+            )
+            mirror = self._resolve_or_create_expense(
+                user_id=user_id, amount=amount, currency=currency,
+                name=name, category_id=template.category_id, paid_on=paid_on,
+                source_key=key,
+                original_message=f"[gastofijo #{template.id}] {name} (reparado)",
+            )
+        else:
+            if mirror.source_key not in (None, key) and mirror.source_type != "fixed_payment":
+                raise MirrorRepairError("La identidad del gasto es ambigua.")
+            mirror.source_type = "fixed_payment"
+            mirror.source_key = key
+            mirror.deleted_at = None
+            mirror.revision = (mirror.revision or 1) + 1
+
+        payment.expense_id = mirror.id
+        session.flush()
+
+    def _historical_mirror_values(
+        self, user_id: int, template: FixedExpense, payment: FixedExpensePayment
+    ) -> tuple[str, Decimal, str, _date]:
+        """Prefer frozen carry-over data; reject conflicting historical rows."""
+        from app.money.models import FinancialCycle
+        from app.money.snapshot import ensure_snapshot_version
+
+        session = self.repo.session
+        matches: list[dict] = []
+        snapshots = session.execute(
+            select(FinancialCycle.closing_snapshot).where(
+                FinancialCycle.telegram_user_id == user_id,
+                FinancialCycle.status == "closed",
+                FinancialCycle.closing_snapshot.is_not(None),
+            )
+        ).scalars()
+        for snapshot in snapshots:
+            ensure_snapshot_version(snapshot)
+            matches.extend(
+                entry for entry in snapshot.get("carried_over_fixed", ())
+                if isinstance(entry, dict)
+                and entry.get("fixed_id") == template.id
+                and entry.get("original_month_year") == payment.month_year
+            )
+        if matches:
+            first = matches[0]
+            fields = ("name", "expected_amount", "currency", "due_date")
+            if any(tuple(row.get(k) for k in fields) != tuple(first.get(k) for k in fields)
+                   for row in matches[1:]):
+                raise MirrorRepairError("Los registros históricos del pago discrepan.")
+            name = str(first["name"])
+            amount = Decimal(str(first["expected_amount"]))
+            currency = str(first["currency"])
+        else:
+            # SQLite drops offsets. The template timestamp is written by
+            # the database in UTC; paid_at comes from the configured business
+            # timezone. Normalize both before deciding whether a later edit
+            # makes template values unsafe as historical evidence.
+            if template.updated_at and payment.paid_at:
+                from app.config.settings import get_settings
+
+                template_time = template.updated_at
+                if template_time.tzinfo is None:
+                    template_time = template_time.replace(tzinfo=timezone.utc)
+                payment_time = payment.paid_at
+                if payment_time.tzinfo is None:
+                    payment_time = payment_time.replace(
+                        tzinfo=ZoneInfo(get_settings().timezone)
+                    )
+                if template_time > payment_time:
+                    raise MirrorRepairError(
+                        "No hay valores históricos suficientes para reparar."
+                    )
+            name = template.name
+            amount = Decimal(template.expected_amount)
+            currency = template.currency
+        if payment.actual_amount is not None:
+            amount = Decimal(payment.actual_amount)
+        if payment.paid_at is None or amount <= 0:
+            raise MirrorRepairError("El pago carece de fecha o monto válido.")
+        return name, amount, currency, payment.paid_at.date()
 
     # ------------------------------------------------------------------
     # helpers

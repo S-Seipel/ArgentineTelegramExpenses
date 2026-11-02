@@ -400,12 +400,9 @@ def main() -> int:
     print("[pg] alembic downgrade 0012_cycle_foundation")
     down_ok = _alembic_downgrade("0012_cycle_foundation")
     if not down_ok:
-        print(
-            "[pg] downgrade to 0012 failed; skipping the re-upgrade leg."
-        )
-    else:
-        print("[pg] alembic upgrade head (re-upgrade)")
-        _alembic_upgrade_head()
+        raise RuntimeError("alembic downgrade to 0012 failed")
+    print("[pg] alembic upgrade head (re-upgrade)")
+    _alembic_upgrade_head()
     print("[pg] concurrent ensure_current_cycle")
     _concurrent_ensure_current_cycle()
     print("[pg] all checks passed")

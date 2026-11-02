@@ -197,7 +197,15 @@ class MoneyStateService:
         """Return the cycle if it exists, belongs to ``user_id`` and
         is open. Raise otherwise.
         """
-        cycle = self.session.get(FinancialCycle, cycle_id)
+        # Share the cycle row lock with close_cycle. Refresh even when this
+        # Session cached an earlier "open" object before another writer closed
+        # it; checking the identity-map object alone is not a concurrency gate.
+        cycle = self.session.execute(
+            select(FinancialCycle)
+            .where(FinancialCycle.id == cycle_id)
+            .with_for_update(of=FinancialCycle)
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
         if cycle is None:
             raise CycleNotFoundError(
                 f"Cycle {cycle_id} not found"
@@ -211,6 +219,10 @@ class MoneyStateService:
                 f"Cycle {cycle_id} is closed (status={cycle.status!r}); "
                 "historical state is immutable"
             )
+        # Preserve this transaction's own pending money changes before the
+        # fresh per-row reads below. Never flush a mutation before checking
+        # the current, locked lifecycle state.
+        self.session.flush()
         return cycle
 
     # ==================================================================
@@ -247,6 +259,7 @@ class MoneyStateService:
                 CycleIncome.currency == currency,
                 CycleIncome.deleted_at.is_(None),
             )
+            .execution_options(populate_existing=True)
         ).scalar_one_or_none()
 
         if existing is not None:
@@ -275,6 +288,7 @@ class MoneyStateService:
             # fall through to the re-read + update path. We do not
             # touch ``row`` again — it has been detached by rollback.
             self.session.rollback()
+            self._require_open_cycle(user_id, cycle_id)
         # Re-read after rollback to capture the canonical row. After a
         # concurrent insert we end up here; on the happy path the just-
         # flushed row is still in the session so this read returns it.
@@ -285,6 +299,7 @@ class MoneyStateService:
                 CycleIncome.currency == currency,
                 CycleIncome.deleted_at.is_(None),
             )
+            .execution_options(populate_existing=True)
         ).scalar_one()
         if canonical.amount != amount:
             canonical.amount = amount
@@ -363,6 +378,7 @@ class MoneyStateService:
             self.session.refresh(row)
         except IntegrityError:
             self.session.rollback()
+            self._require_open_cycle(user_id, cycle_id)
             canonical = self._find_extra(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
@@ -407,6 +423,9 @@ class MoneyStateService:
         # mutation is allowed. ``_require_open_cycle`` raises
         # ``CycleClosedError`` on closed cycles.
         self._require_open_cycle(user_id, row.cycle_id)
+        row = self._find_extra_by_id(user_id, extra_id, refresh=True)
+        if row is None or row.deleted_at is not None:
+            raise ExtraIncomeNotFoundError(f"extra income {extra_id} not found")
         changed = False
         if amount is not None:
             amount = _validate_amount_positive_or_zero(amount, name="amount")
@@ -441,6 +460,9 @@ class MoneyStateService:
                 f"extra income {extra_id} not found"
             )
         self._require_open_cycle(user_id, row.cycle_id)
+        row = self._find_extra_by_id(user_id, extra_id, refresh=True)
+        if row is None:
+            raise ExtraIncomeNotFoundError(f"extra income {extra_id} not found")
         if row.deleted_at is not None:
             row.revision = (row.revision or 1) + 1
             row.updated_at = _now_utc()
@@ -466,11 +488,12 @@ class MoneyStateService:
                 CycleIncome.source_key == source_key,
                 FinancialCycle.telegram_user_id == user_id,
             )
+            .execution_options(populate_existing=True)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
     def _find_extra_by_id(
-        self, user_id: int, extra_id: int
+        self, user_id: int, extra_id: int, *, refresh: bool = False
     ) -> Optional[CycleIncome]:
         stmt = (
             select(CycleIncome)
@@ -480,6 +503,7 @@ class MoneyStateService:
                 CycleIncome.kind == "extra",
                 FinancialCycle.telegram_user_id == user_id,
             )
+            .execution_options(populate_existing=refresh)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
@@ -536,7 +560,7 @@ class MoneyStateService:
             new_pct = None
             new_amt = amt.quantize(Decimal("0.01"))
 
-        existing = self.session.get(SavingsTarget, (cycle_id, currency))
+        existing = self.session.get(SavingsTarget, (cycle_id, currency), populate_existing=True)
         if existing is None:
             row = SavingsTarget(
                 cycle_id=cycle_id,
@@ -585,7 +609,7 @@ class MoneyStateService:
             )
 
         new_amount = amount.quantize(Decimal("0.01"))
-        existing = self.session.get(SavingsReserved, (cycle_id, currency))
+        existing = self.session.get(SavingsReserved, (cycle_id, currency), populate_existing=True)
         if existing is None:
             row = SavingsReserved(
                 cycle_id=cycle_id, currency=currency, amount=new_amount
@@ -625,7 +649,7 @@ class MoneyStateService:
             )
 
         delta = amount.quantize(Decimal("0.01"))
-        existing = self.session.get(SavingsReserved, (cycle_id, currency))
+        existing = self.session.get(SavingsReserved, (cycle_id, currency), populate_existing=True)
         if existing is None:
             row = SavingsReserved(
                 cycle_id=cycle_id, currency=currency, amount=Decimal("0.00")
@@ -713,6 +737,7 @@ class MoneyStateService:
             self.session.refresh(row)
         except IntegrityError:
             self.session.rollback()
+            self._require_open_cycle(user_id, cycle_id)
             canonical = self._find_realization(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
@@ -744,6 +769,9 @@ class MoneyStateService:
                 f"savings realization {realization_id} not found"
             )
         self._require_open_cycle(user_id, row.cycle_id)
+        row = self._find_realization_by_id(user_id, realization_id, refresh=True)
+        if row is None or row.deleted_at is not None:
+            raise SavingsRealizationNotFoundError(f"savings realization {realization_id} not found")
         changed = False
         if amount is not None:
             amount = _validate_amount_positive_or_zero(amount, name="amount")
@@ -775,6 +803,9 @@ class MoneyStateService:
                 f"savings realization {realization_id} not found"
             )
         self._require_open_cycle(user_id, row.cycle_id)
+        row = self._find_realization_by_id(user_id, realization_id, refresh=True)
+        if row is None:
+            raise SavingsRealizationNotFoundError(f"savings realization {realization_id} not found")
         if row.deleted_at is not None:
             row.revision = (row.revision or 1) + 1
             row.updated_at = _now_utc()
@@ -803,11 +834,12 @@ class MoneyStateService:
                 SavingsRealization.source_key == source_key,
                 FinancialCycle.telegram_user_id == user_id,
             )
+            .execution_options(populate_existing=True)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
     def _find_realization_by_id(
-        self, user_id: int, realization_id: int
+        self, user_id: int, realization_id: int, *, refresh: bool = False
     ) -> Optional[SavingsRealization]:
         stmt = (
             select(SavingsRealization)
@@ -819,6 +851,7 @@ class MoneyStateService:
                 SavingsRealization.id == realization_id,
                 FinancialCycle.telegram_user_id == user_id,
             )
+            .execution_options(populate_existing=refresh)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 

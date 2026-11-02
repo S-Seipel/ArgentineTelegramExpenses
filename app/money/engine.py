@@ -28,7 +28,7 @@ savings_committed_c  = max(savings_reserved_c, savings_realized_c)
 realized_expenses_c  = SUM(expenses.amount WHERE live AND user AND date IN cycle AND c)
                         − fixed_payment mirrors (counted via the payment row)
 pending_fixed_c      = sum(expected_amount of unresolved fixed occurrences)
-pending_recurring_c  = 0 in R2 (F1 ledger)
+pending_recurring_c  = unresolved explicitly opted-in recurring occurrences
 pending_reserved_c   = pending_fixed_c + pending_recurring_c
 available_c          = gross_income_c − savings_committed_c − realized_expenses_c
                        − pending_reserved_c
@@ -65,6 +65,7 @@ from app.money.dto import (
 from app.money.fixed_obligations import (
     resolve_current_obligations,
 )
+from app.money.recurring_obligations import resolve_pending_recurring_obligations
 from app.money.models import (
     CycleIncome,
     FinancialCycle,
@@ -329,7 +330,9 @@ class MoneyEngine:
 
         obligations = resolve_current_obligations(self.session, user_id, cycle)
         pending_fixed = MoneyByCurrency(obligations.pending_by_currency)
-        pending_recurring = MoneyByCurrency()
+        pending_recurring = MoneyByCurrency(
+            resolve_pending_recurring_obligations(self.session, user_id, cycle)
+        )
         pending_reserved = pending_fixed.union(pending_recurring)
 
         available = _available_to_spend(
@@ -354,10 +357,10 @@ class MoneyEngine:
             daily = None
 
         warnings: list[str] = []
-        if realized.total() is not None and reserved_row.total() is not None:
-            if realized.total() > reserved_row.total():
-                warnings.append("savings_realized_exceeds_reserved")
-        if available.total() is not None and available.total() < 0:
+        if any(realized.get(currency) > reserved_row.get(currency)
+               for currency in realized.currencies()):
+            warnings.append("savings_realized_exceeds_reserved")
+        if any(amount < 0 for _, amount in available.items()):
             warnings.append("available_negative")
         if gross.is_empty():
             warnings.append("no_income_recorded")

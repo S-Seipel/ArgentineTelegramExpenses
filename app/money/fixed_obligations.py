@@ -119,6 +119,9 @@ def resolve_current_obligations(
     carried_over: list[CarriedOverFixedOccurrence] = []
     prev_cycle = _previous_cycle(session, user_id, cycle)
     if prev_cycle is not None and prev_cycle.closing_snapshot:
+        from app.money.snapshot import ensure_snapshot_version
+
+        ensure_snapshot_version(prev_cycle.closing_snapshot)
         for entry in prev_cycle.closing_snapshot.get("carried_over_fixed", []):
             occ = CarriedOverFixedOccurrence(
                 fixed_id=int(entry["fixed_id"]),

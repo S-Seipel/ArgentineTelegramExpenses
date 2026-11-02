@@ -3,7 +3,28 @@
 Proposed improvements for the bot, organized by **value vs effort**. Pick
 from the top of the list when picking up new work.
 
-Last reviewed: 2026-09-09.
+Financial phases reviewed: 2026-11-02. The feature ideas below retain their
+original 2026-09-09 prioritization and are not a completion checklist.
+
+## Financial phases
+
+| Phase | Scope | State |
+|---|---|---|
+| F0 | Expense identity, exact money, fixed-payment mirrors, reminders, dates and migrations | Closed |
+| F1 R1 | Payday configuration and cycle bootstrap | Closed |
+| F1 R2 | Read-only MoneyEngine, cycle closing, rollover and snapshots | Closed |
+| F1 R3 | Income, extras and savings mutations | Closed |
+| F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Implemented locally |
+| F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Implemented locally; migration 0014 required |
+
+F1.5 forecasts the cycle and retains one overdue occurrence per recurring
+template; it does not accumulate forgotten monthly installments as debt.
+Closed snapshots remain immutable. Ordinary reminders reserve no money.
+
+The earlier F1.1/F2+/F3+ references are design ideas, without an accepted
+implementation breakdown. They are not additional R blocks of F1. There is
+no automatic legacy-budget migration, currency conversion or independent
+cycle calendar per currency in the implemented scope.
 
 ---
 

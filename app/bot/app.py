@@ -83,6 +83,7 @@ def build_application(
                 "recurrente_del",
                 "recurrente_off",
                 "recurrente_on",
+                "recurrente_obligacion",
             ],
             _command_handler,
         )
@@ -93,7 +94,7 @@ def build_application(
                 "config_payday", "cycle", "disponible", "gastar_diario",
                 "extra_editar", "extra_borrar", "target", "reservar",
                 "ahorro_realizado", "ahorro_editar", "ahorro_borrar",
-                "liberar",
+                "liberar", "repair_fixed_payments",
             ],
             _command_handler,
         )

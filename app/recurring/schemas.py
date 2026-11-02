@@ -32,3 +32,5 @@ class RecurringOut:
     next_due_date: date
     last_notified_at: datetime | None
     is_active: bool
+    is_obligation: bool = False
+    obligation_due_date: date | None = None

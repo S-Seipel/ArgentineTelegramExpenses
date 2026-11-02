@@ -33,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
+
 PG_HOST = os.environ.get("F1_PG_HOST", "localhost")
 PG_PORT = os.environ.get("F1_PG_PORT", "15434")
 PG_USER = os.environ.get("F1_PG_USER", "agent_os")
@@ -164,8 +166,8 @@ def _check_unique_extra_source_key_survives_soft_delete() -> None:
                     "UNIQUE constraint failed to reject duplicate "
                     "source_key after soft-delete"
                 )
-            except Exception:
-                pass
+            except IntegrityError as exc:
+                assert exc.orig.sqlstate == "23505", exc
             finally:
                 trans.rollback()
     finally:
@@ -208,8 +210,8 @@ def _check_unique_realization_source_key_survives_soft_delete() -> None:
                 raise RuntimeError(
                     "savings_realizations UNIQUE failed after soft-delete"
                 )
-            except Exception:
-                pass
+            except IntegrityError as exc:
+                assert exc.orig.sqlstate == "23505", exc
             finally:
                 trans.rollback()
     finally:
@@ -233,8 +235,8 @@ def _check_savings_target_xor() -> None:
                 raise RuntimeError(
                     "savings_targets XOR CHECK allowed both NULL"
                 )
-            except Exception:
-                pass
+            except IntegrityError as exc:
+                assert exc.orig.sqlstate == "23514", exc
             finally:
                 trans.rollback()
     finally:
@@ -260,8 +262,8 @@ def _check_extra_requires_source_key() -> None:
                 raise RuntimeError(
                     "extra row accepted without source_key"
                 )
-            except Exception:
-                pass
+            except IntegrityError as exc:
+                assert exc.orig.sqlstate == "23514", exc
             finally:
                 trans.rollback()
     finally:

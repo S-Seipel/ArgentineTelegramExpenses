@@ -73,6 +73,8 @@ class RecurringRepository:
                 RecurringExpense.telegram_user_id == user_id,
                 RecurringExpense.id == recurring_id,
             )
+            .with_for_update(of=RecurringExpense)
+            .execution_options(populate_existing=True)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
@@ -222,6 +224,15 @@ class RecurringRepository:
         row.telegram_message_id = None
         row.sent_at = None
 
+    def reopen_reminder(self, row: RecurringReminder) -> None:
+        """Schedule another delivery without changing occurrence identity."""
+        row.status = "pending"
+        row.resolved_at = None
+        row.delivery_status = "pending"
+        row.telegram_message_id = None
+        row.sent_at = None
+        row.last_attempt_at = None
+
     @staticmethod
     def _to_out(row: RecurringExpense) -> RecurringOut:
         cat = getattr(row, "category", None)
@@ -238,4 +249,6 @@ class RecurringRepository:
             next_due_date=row.next_due_date,
             last_notified_at=row.last_notified_at,
             is_active=row.is_active,
+            is_obligation=row.is_obligation,
+            obligation_due_date=row.obligation_due_date,
         )

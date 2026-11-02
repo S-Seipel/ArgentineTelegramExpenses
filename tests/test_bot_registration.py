@@ -36,7 +36,8 @@ def test_f1_commands_are_registered_on_application():
         "config_payday", "cycle", "disponible", "gastar_diario",
         "ingreso", "extra", "extra_editar", "extra_borrar", "target",
         "reservar", "ahorro_realizado", "ahorro_editar", "ahorro_borrar",
-        "liberar",
+        "liberar", "repair_fixed_payments",
+        "recurrente_obligacion",
     }
     assert f1_commands <= registered.keys()
     assert all(registered[name] is _command_handler for name in f1_commands)

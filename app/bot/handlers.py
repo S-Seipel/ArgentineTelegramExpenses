@@ -136,6 +136,7 @@ async def handle_command(
         "/recurrente_del",
         "/recurrente_off",
         "/recurrente_on",
+        "/recurrente_obligacion",
     ):
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         with session_scope() as session:
@@ -178,6 +179,29 @@ async def handle_command(
         await update.effective_message.reply_text(
             _format_search_results(query, results)
         )
+        return
+
+    if command == "/repair_fixed_payments":
+        from app.fixed_expenses.service import MirrorRepairError
+
+        await update.effective_message.chat.send_action(ChatAction.TYPING)
+        try:
+            with session_scope() as session:
+                result = FixedExpenseService(
+                    FixedExpenseRepository(session)
+                ).repair_mirrors(user_id)
+        except MirrorRepairError:
+            logger.warning("Fixed-payment repair needs manual review for user %s", user_id)
+            reply = "⚠️ No pude reparar todos los pagos fijos con seguridad. Revisá los datos."
+        except Exception:
+            logger.exception("Fixed-payment repair failed")
+            reply = "⚠️ No pude revisar los pagos fijos ahora."
+        else:
+            reply = (
+                f"✅ Reparé {result.repaired} espejos de pagos fijos."
+                if result.repaired else "✅ Los pagos fijos están consistentes."
+            )
+        await update.effective_message.reply_text(reply)
         return
 
     if command in (
@@ -544,11 +568,14 @@ async def _maybe_handle_reminder_reply(
 
         if normalized in ("posponer", "mañana", "manana"):
             service.postpone_occurrence(
-                user_id=user_id, recurring_id=recurring_id, commit=False
+                user_id=user_id, recurring_id=recurring_id,
+                occurrence_date=reminder.occurrence_date if reminder is not None else None,
+                today=today,
+                commit=False,
             )
-            if reminder is not None:
+            if reminder is not None and not template_obj.is_obligation:
                 repo.resolve_reminder(reminder)
-            else:
+            elif reminder is None:
                 deps.runtime.pending_reminders.pop(user_id, None)
             template_after = repo.get_by_id_for_update(user_id, recurring_id)
             return (
@@ -571,6 +598,7 @@ async def _maybe_handle_reminder_reply(
                 user_id=user_id,
                 recurring_id=recurring_id,
                 today=today,
+                occurrence_date=reminder.occurrence_date if reminder is not None else None,
                 commit=False,
             )
             if template_after is None:
@@ -837,6 +865,22 @@ def _handle_recurring_command(
     if command == "/recurrentes":
         return _recurrentes_list(user_id, service)
 
+    if command == "/recurrente_obligacion":
+        if len(args) != 2 or args[1].lower() not in {"on", "off"}:
+            return "❓ Uso: `/recurrente_obligacion <id> on|off`. Usá `/recurrentes` para ver los IDs."
+        try:
+            recurring_id = int(args[0])
+        except ValueError:
+            return "❓ El ID tiene que ser un número entero."
+        item = service.set_obligation(user_id, recurring_id, args[1].lower() == "on")
+        if item is None:
+            return f"🤷 No encontré el recurrente #{recurring_id}."
+        state = (
+            "Ahora descuenta su compromiso pendiente del disponible."
+            if item.is_obligation else "Queda como recordatorio; no reserva dinero."
+        )
+        return f"🔁 *{item.name}*: {state}"
+
     if command == "/recurrente_add":
         if len(args) < 3:
             return (
@@ -961,6 +1005,7 @@ def _recurrentes_list(user_id: int, service: RecurringService) -> str:
     lines = ["🔁 *Tus gastos recurrentes*", ""]
     for r in items:
         status = "" if r.is_active else " _(pausado)_"
+        planning = "obligación" if r.is_obligation else "solo recordatorio"
         if r.frequency == "yearly" and r.month_of_year is not None:
             month_names = [
                 "", "ene", "feb", "mar", "abr", "may", "jun",
@@ -975,10 +1020,11 @@ def _recurrentes_list(user_id: int, service: RecurringService) -> str:
         lines.append(
             f"`#{r.id}` {r.name} — "
             f"{format_currency_amount(r.amount, r.currency)} — "
-            f"{when} — próx: {format_date_short(r.next_due_date)}{status}"
+            f"{when} — próx: {format_date_short(r.next_due_date)} — {planning}{status}"
         )
     lines.append("")
     lines.append("`/recurrente_del <id>` elimina · `/recurrente_off <id>` pausa · `/recurrente_on <id>` reactiva")
+    lines.append("`/recurrente_obligacion <id> on|off` incluye o quita del disponible")
     return "\n".join(lines)
 
 
@@ -1334,19 +1380,17 @@ def _handle_cycle_read_command(
     """
     from app.money import CycleService
 
-    with session_scope() as session:
-        cycle_service = CycleService(session)
-        engine = MoneyEngine(session)
-        try:
+    try:
+        with session_scope() as session:
+            cycle_service = CycleService(session)
+            engine = MoneyEngine(session)
             cycle = cycle_service.ensure_current_cycle(user_id, today)
-        except Exception as exc:  # noqa: BLE001
-            return (
-                "⚠️ No pude resolver tu ciclo actual. "
-                f"Detalle: {exc}"
+            summary = engine.get_cycle_summary(
+                user_id, cycle.id, today=today
             )
-        summary = engine.get_cycle_summary(
-            user_id, cycle.id, today=today
-        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not load financial cycle for user %s", user_id)
+        return _cycle_failure_message(exc)
 
     if command == "/cycle":
         return _format_cycle_summary(summary)
@@ -1355,6 +1399,35 @@ def _handle_cycle_read_command(
     if command == "/gastar_diario":
         return _format_daily(summary)
     return "Comando no reconocido."
+
+
+def _cycle_failure_message(exc: Exception) -> str:
+    from app.money import CycleCatchUpLimitExceeded, SnapshotVersionMismatchError
+
+    if isinstance(exc, LookupError):
+        return "📅 No hay un ciclo abierto para hoy. El anterior ya está cerrado o el siguiente todavía no comenzó."
+    if isinstance(exc, SnapshotVersionMismatchError):
+        return "⚠️ No pude leer el ciclo: el historial tiene un formato no compatible."
+    if isinstance(exc, CycleCatchUpLimitExceeded):
+        return "⚠️ Hay demasiados ciclos pendientes de actualizar. Revisá el historial antes de continuar."
+    return "⚠️ No pude resolver tu ciclo actual. Volvé a intentarlo."
+
+
+def _cycle_summary_currencies(summary) -> list[str]:
+    """Currencies with financial data, even when their available balance is zero."""
+    fields = (
+        "base_income", "extra_income", "gross_income", "savings_target",
+        "savings_reserved", "savings_realized", "savings_committed",
+        "realized_expenses", "pending_fixed_obligations",
+        "pending_recurring_obligations", "pending_reserved_obligations",
+        "available_to_spend", "daily_safe_to_spend",
+    )
+    return sorted({
+        currency
+        for field in fields
+        if (value := getattr(summary, field)) is not None
+        for currency in value.currencies()
+    })
 
 
 def _format_cycle_summary(summary) -> str:
@@ -1366,13 +1439,14 @@ def _format_cycle_summary(summary) -> str:
         f"{summary.end_date.isoformat()}) — {summary.status}"
     )
     lines: list[str] = [label, ""]
+    currencies = _cycle_summary_currencies(summary)
 
     def line_for(title: str, mc) -> str:
-        if mc.is_empty():
+        if not currencies:
             return f"• {title}: —"
         bits = ", ".join(
-            f"{format_currency_amount(amount)} {cur}"
-            for cur, amount in mc.items()
+            format_currency_amount(mc.get(cur), cur)
+            for cur in currencies
         )
         return f"• {title}: {bits}"
 
@@ -1387,11 +1461,14 @@ def _format_cycle_summary(summary) -> str:
     lines.append(
         line_for("Pendientes fijos", summary.pending_fixed_obligations)
     )
+    lines.append(
+        line_for("Pendientes recurrentes", summary.pending_recurring_obligations)
+    )
     lines.append(line_for("Disponible", summary.available_to_spend))
     if summary.carried_over_fixed:
         bits = ", ".join(
-            f"{occ.name} {format_currency_amount(occ.expected_amount)}"
-            f" {occ.currency} ({occ.original_month_year})"
+            f"{occ.name} {format_currency_amount(occ.expected_amount, occ.currency)}"
+            f" ({occ.original_month_year})"
             for occ in summary.carried_over_fixed
         )
         lines.append("")
@@ -1410,14 +1487,15 @@ def _format_available(summary) -> str:
             "🔒 El ciclo está cerrado. "
             "Los números son los del snapshot; no cambian."
         )
-    if summary.available_to_spend.is_empty():
+    currencies = _cycle_summary_currencies(summary)
+    if not currencies:
         return (
             "💸 Aún no tengo datos suficientes para calcular tu "
             "disponible. Cargá un ingreso o un gasto para empezar."
         )
     bits = ", ".join(
-        f"{format_currency_amount(amount)} {currency}"
-        for currency, amount in summary.available_to_spend.items()
+        format_currency_amount(summary.available_to_spend.get(currency), currency)
+        for currency in currencies
     )
     return f"💰 Disponible en este ciclo: {bits}"
 
@@ -1429,11 +1507,12 @@ def _format_daily(summary) -> str:
         return "🔒 Ciclo cerrado: no hay diario para mostrar."
     if summary.daily_safe_to_spend is None:
         return "📅 El ciclo ya cerró; no hay diario para hoy."
-    if summary.daily_safe_to_spend.is_empty():
+    currencies = _cycle_summary_currencies(summary)
+    if not currencies:
         return "💸 Sin ingresos registrados este ciclo."
     bits = ", ".join(
-        f"{format_currency_amount(amount)} {currency}"
-        for currency, amount in summary.daily_safe_to_spend.items()
+        format_currency_amount(summary.daily_safe_to_spend.get(currency), currency)
+        for currency in currencies
     )
     days = summary.remaining_days or 0
     return (
@@ -1477,17 +1556,14 @@ def _resolve_current_cycle_id_or_message(user_id: int, today) -> tuple[int | Non
     always implicitly about the open one. Failures map to user-friendly
     Spanish strings.
     """
-    from app.money import CycleCatchUpLimitExceeded, CycleService
+    from app.money import CycleService
 
-    with session_scope() as s:
-        try:
+    try:
+        with session_scope() as s:
             cycle = CycleService(s).ensure_current_cycle(user_id, today)
-        except CycleCatchUpLimitExceeded as exc:
-            return None, (
-                "⚠️ Detecté muchos ciclos cerrados sin cerrar; "
-                "avisale al admin para revisar el estado. "
-                f"Detalle: {exc}"
-            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not resolve cycle for money mutation by user %s", user_id)
+        return None, _cycle_failure_message(exc)
     return cycle.id, None
 
 

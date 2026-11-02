@@ -111,26 +111,54 @@ async def _try_send_for_user(
         return
 
     for template in due:
+        occurrence_date = (
+            template.obligation_due_date or template.next_due_date
+            if template.is_obligation else template.next_due_date
+        )
+        delivery_attempt = None
         try:
             with session_scope() as session:
                 repo = RecurringRepository(session)
+                # Refresh under the same template lock used by replies. A
+                # payment after the initial due query may already have moved
+                # this template to its next occurrence.
+                current = repo.get_by_id_for_update(user_id, template.id)
+                if current is None or not current.is_active or current.next_due_date > today:
+                    continue
+                template = current
+                occurrence_date = (
+                    template.obligation_due_date or template.next_due_date
+                    if template.is_obligation else template.next_due_date
+                )
                 reminder = repo.get_reminder(
-                    user_id, template.id, template.next_due_date
+                    user_id, template.id, occurrence_date
                 )
                 if reminder is None:
                     reminder = repo.get_or_create_reminder(
-                        user_id, template.id, template.next_due_date
+                        user_id, template.id, occurrence_date
                     )
+                if reminder.status != "pending":
+                    continue
                 if not repo.claim_reminder(reminder):
                     continue
+                delivery_attempt = reminder.attempt_count
             text = _format_reminder(template)
             message = await bot_app.bot.send_message(chat_id=user_id, text=text)
             with session_scope() as session:
                 repo = RecurringRepository(session)
+                repo.get_by_id_for_update(user_id, template.id)
                 reminder = repo.get_reminder(
-                    user_id, template.id, template.next_due_date
+                    user_id, template.id, occurrence_date
                 )
-                if reminder is not None:
+                # Snooze/payment may have changed this occurrence while
+                # send_message was in flight. Never overwrite that newer
+                # response or suppress the explicitly requested re-delivery.
+                if (
+                    reminder is not None
+                    and reminder.status == "pending"
+                    and reminder.delivery_status == "sending"
+                    and reminder.attempt_count == delivery_attempt
+                ):
                     repo.mark_reminder_sent(reminder, message.message_id)
         except Exception:
             logger.exception(
@@ -140,10 +168,16 @@ async def _try_send_for_user(
             )
             with session_scope() as session:
                 repo = RecurringRepository(session)
+                repo.get_by_id_for_update(user_id, template.id)
                 reminder = repo.get_reminder(
-                    user_id, template.id, template.next_due_date
+                    user_id, template.id, occurrence_date
                 )
-                if reminder is not None and reminder.delivery_status != "sent":
+                if (
+                    reminder is not None
+                    and reminder.status == "pending"
+                    and reminder.delivery_status == "sending"
+                    and reminder.attempt_count == delivery_attempt
+                ):
                     repo.mark_reminder_delivery_failed(reminder)
 
     last_fired_for[user_id] = day_key

@@ -380,6 +380,7 @@ class CycleService:
             return MoneyEngine(self.session).get_cycle_summary(
                 user_id, cycle_id
             )
+        self.session.flush()
 
         # ``get_cycle_summary`` issues a fresh SELECT on the same row;
         # the cycle's FOR UPDATE lock is owned by this transaction, so
@@ -388,10 +389,10 @@ class CycleService:
             user_id, cycle_id
         )
 
-        if not _pending_is_zero(summary.pending_fixed_obligations):
+        if not _pending_is_zero(summary.pending_reserved_obligations):
             if not force:
                 raise CycleHasPendingError(
-                    _amounts_copy(summary.pending_fixed_obligations)
+                    _amounts_copy(summary.pending_reserved_obligations)
                 )
 
         previous_carried_over = self._previous_carried_over(cycle)
@@ -466,11 +467,39 @@ class CycleService:
 
         open_cycle = self._latest_open_cycle(user_id)
         if open_cycle is None:
-            view = self.open_initial_cycle(user_id, today)
-            return self._require_cycle(user_id, view.cycle_id)
+            latest = self._latest_cycle_any_status(user_id)
+            if latest is None:
+                view = self.open_initial_cycle(user_id, today)
+                return self._require_cycle(user_id, view.cycle_id)
+            if today <= latest.end_date:
+                raise LookupError(
+                    "El ciclo actual ya está cerrado; el próximo comienza "
+                    f"{(latest.end_date + timedelta(days=1)).isoformat()}."
+                )
+            # A manual close leaves no open row. Resume from that closed
+            # cycle's natural successor, preserving its frozen snapshot.
+            next_day = latest.end_date + timedelta(days=1)
+            window = cycle_window_for(next_day, latest.payday_day)
+            new_cycle = self._try_insert_open_cycle(
+                user_id=user_id,
+                cycle_index=self._next_cycle_index(user_id),
+                start_date=window.start_date,
+                end_date=window.end_date,
+                payday_day=latest.payday_day,
+            )
+            if new_cycle is not None:
+                self.session.commit()
+            else:
+                self.session.rollback()
+            return self._rollover_once(user_id, today, attempt=attempt + 1)
 
         if open_cycle.start_date <= today <= open_cycle.end_date:
             return open_cycle
+        if today < open_cycle.start_date:
+            raise LookupError(
+                "El próximo ciclo comienza "
+                f"{open_cycle.start_date.isoformat()}; todavía no está activo."
+            )
 
         # Close the expired cycle. Pending is NOT a blocker here; the
         # snapshot captures whatever carries forward.
@@ -519,7 +548,8 @@ class CycleService:
                 FinancialCycle.telegram_user_id == user_id,
                 FinancialCycle.id == cycle_id,
             )
-            .with_for_update()
+            .with_for_update(of=FinancialCycle)
+            .execution_options(populate_existing=True)
         )
         cycle = self.session.execute(stmt).scalar_one_or_none()
         if cycle is None:
@@ -611,15 +641,12 @@ class CycleService:
         prev = self.session.execute(stmt).scalar_one_or_none()
         if prev is None or prev.closing_snapshot is None:
             return ()
-        try:
-            from app.money.snapshot import (
-                deserialize_carried_over,
-                ensure_snapshot_version,
-            )
+        from app.money.snapshot import (
+            deserialize_carried_over,
+            ensure_snapshot_version,
+        )
 
-            ensure_snapshot_version(prev.closing_snapshot)
-        except Exception:
-            return ()
+        ensure_snapshot_version(prev.closing_snapshot)
         return deserialize_carried_over(
             prev.closing_snapshot.get("carried_over_fixed", [])
         )

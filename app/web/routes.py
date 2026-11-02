@@ -300,6 +300,51 @@ async def api_recurring_upcoming(
         return {"items": recurring_upcoming(s, user_id, today)}
 
 
+def _recurring_to_payload(item) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "amount": str(item.amount),
+        "currency": item.currency,
+        "is_active": item.is_active,
+        "is_obligation": item.is_obligation,
+        "next_due_date": item.next_due_date.isoformat(),
+        "obligation_due_date": (
+            item.obligation_due_date.isoformat() if item.obligation_due_date else None
+        ),
+    }
+
+
+@router.get("/api/recurring")
+async def api_recurring_templates(user_id: int = Depends(_current_user_id)):
+    from app.recurring.repository import RecurringRepository
+    from app.recurring.service import RecurringService
+
+    with session_scope() as session:
+        items = RecurringService(RecurringRepository(session)).list(user_id)
+        return {"items": [_recurring_to_payload(item) for item in items]}
+
+
+@router.patch("/api/recurring/{recurring_id}/obligation")
+async def api_recurring_obligation(
+    recurring_id: int,
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+):
+    from app.recurring.repository import RecurringRepository
+    from app.recurring.service import RecurringService
+
+    if set(payload) != {"is_obligation"} or type(payload["is_obligation"]) is not bool:
+        raise HTTPException(status_code=400, detail="is_obligation debe ser true o false.")
+    with session_scope() as session:
+        item = RecurringService(RecurringRepository(session)).set_obligation(
+            user_id, recurring_id, payload["is_obligation"]
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="Recurrente no encontrado.")
+        return {"item": _recurring_to_payload(item)}
+
+
 @router.get("/api/fixed-expenses")
 async def api_fixed_expenses(
     user_id: int = Depends(_current_user_id),
@@ -308,6 +353,30 @@ async def api_fixed_expenses(
     with session_scope() as s:
         bills = fixed_expenses_current_month(s, user_id, today)
     return {"items": bills}
+
+
+@router.post("/api/fixed-expenses/repair-mirrors")
+async def api_repair_fixed_expense_mirrors(
+    user_id: int = Depends(_current_user_id),
+):
+    from app.fixed_expenses.repository import FixedExpenseRepository
+    from app.fixed_expenses.service import FixedExpenseService, MirrorRepairError
+
+    try:
+        with session_scope() as session:
+            result = FixedExpenseService(
+                FixedExpenseRepository(session)
+            ).repair_mirrors(user_id)
+    except MirrorRepairError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mirror_repair_ambiguous", "message": str(exc)},
+        ) from exc
+    return {
+        "scanned": result.scanned,
+        "repaired": result.repaired,
+        "remaining_violations": result.remaining_violations,
+    }
 
 
 @router.post("/api/fixed-expenses")
@@ -584,7 +653,33 @@ def _summary_to_payload(
             "payday_day": summary.payday_day,
             "status": summary.status,
         }
+    # MoneyByCurrency omits zero entries. Preserve that domain contract while
+    # making zero explicit for currencies this summary actually contains.
+    # A null daily allowance remains unavailable; it must never become zero.
+    money = payload["money"]
+    currencies = sorted({
+        currency
+        for values in money.values()
+        if isinstance(values, dict)
+        for currency in values
+    })
+    for values in money.values():
+        if isinstance(values, dict):
+            for currency in currencies:
+                values.setdefault(currency, "0.00")
     return payload
+
+
+def _cycle_lifecycle_http_error(exc: Exception) -> HTTPException:
+    from app.money import CycleCatchUpLimitExceeded, SnapshotVersionMismatchError
+
+    if isinstance(exc, SnapshotVersionMismatchError):
+        code, message = "unsupported_snapshot_version", "El historial usa un formato no compatible."
+    elif isinstance(exc, CycleCatchUpLimitExceeded):
+        code, message = "cycle_catch_up_limit_exceeded", "Hay demasiados ciclos pendientes de actualizar."
+    else:
+        code, message = "cycle_not_current", "No hay un ciclo abierto para hoy. El ciclo anterior ya cerró o el siguiente todavía no comenzó."
+    return HTTPException(status_code=409, detail={"code": code, "message": message})
 
 
 @router.get("/api/cycle-summary")
@@ -603,6 +698,7 @@ async def api_cycle_summary(
         CycleCatchUpLimitExceeded,
         CycleService,
         MoneyEngine,
+        SnapshotVersionMismatchError,
     )
 
     with session_scope() as s:
@@ -611,17 +707,56 @@ async def api_cycle_summary(
         if cycle_id is None:
             try:
                 cycle = cycle_service.ensure_current_cycle(user_id, today)
-            except CycleCatchUpLimitExceeded as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "cycle_catch_up_limit_exceeded",
-                        "message": str(exc),
-                    },
-                ) from exc
+            except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
+                raise _cycle_lifecycle_http_error(exc) from exc
             cycle_id = cycle.id
-        summary = engine.get_cycle_summary(user_id, cycle_id, today=today)
+        try:
+            summary = engine.get_cycle_summary(user_id, cycle_id, today=today)
+        except SnapshotVersionMismatchError as exc:
+            raise _cycle_lifecycle_http_error(exc) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "cycle_not_found", "message": "Ciclo no encontrado."
+            }) from exc
         return _summary_to_payload(summary)
+
+
+@router.get("/api/cycle-history")
+async def api_cycle_history(
+    user_id: int = Depends(_current_user_id),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Read closed cycles solely from their immutable v1 snapshots."""
+    from sqlalchemy import select
+
+    from app.money.models import FinancialCycle
+    from app.money.engine import SnapshotVersionMismatchError
+    from app.money.snapshot import ensure_snapshot_version
+
+    with session_scope() as session:
+        cycles = session.execute(
+            select(FinancialCycle).where(
+                FinancialCycle.telegram_user_id == user_id,
+                FinancialCycle.status == "closed",
+            ).order_by(FinancialCycle.cycle_index.desc()).limit(limit)
+        ).scalars().all()
+        engine = MoneyEngine(session)
+        try:
+            items = []
+            for cycle in cycles:
+                ensure_snapshot_version(cycle.closing_snapshot)
+                items.append(_summary_to_payload(
+                    engine.get_cycle_summary(user_id, cycle.id)
+                ))
+        except SnapshotVersionMismatchError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "unsupported_snapshot_version",
+                    "message": str(exc),
+                },
+            ) from exc
+    return {"items": items}
 
 
 @router.post("/api/cycle/{cycle_id}/close")
@@ -667,20 +802,15 @@ async def api_cycle_ensure(
     from app.money import (
         CycleCatchUpLimitExceeded,
         CycleService,
+        SnapshotVersionMismatchError,
     )
 
     with session_scope() as s:
         cycle_service = CycleService(s)
         try:
             cycle = cycle_service.ensure_current_cycle(user_id, today)
-        except CycleCatchUpLimitExceeded as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "cycle_catch_up_limit_exceeded",
-                    "message": str(exc),
-                },
-            ) from exc
+        except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
+            raise _cycle_lifecycle_http_error(exc) from exc
     return {
         "cycle": {
             "id": cycle.id,
@@ -711,6 +841,7 @@ def _resolve_open_cycle(
         CycleService,
         FinancialCycle,
         MoneyStateError,
+        SnapshotVersionMismatchError,
     )
 
     with session_scope() as s:
@@ -718,14 +849,8 @@ def _resolve_open_cycle(
         if cycle_id is None:
             try:
                 return cycle_service.ensure_current_cycle(user_id, today)
-            except CycleCatchUpLimitExceeded as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "cycle_catch_up_limit_exceeded",
-                        "message": str(exc),
-                    },
-                ) from exc
+            except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
+                raise _cycle_lifecycle_http_error(exc) from exc
         cycle = s.get(FinancialCycle, cycle_id)
         if cycle is None:
             raise HTTPException(
@@ -1648,6 +1773,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="grid" id="kpis"></div>
 
+    <div class="panel" id="active-cycle-panel">
+      <h2>Ciclo activo</h2>
+      <div id="active-cycle">Cargando…</div>
+    </div>
+
     <div class="row">
        <div class="panel" id="recurring-panel">
         <h2 id="trend-title">Tendencia</h2>
@@ -1655,7 +1785,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="panel">
         <h2 id="category-title">Por categoría</h2>
-        <div class="chart-wrap tall"><canvas id="category-chart"></canvas></div>
+        <div id="category-charts"></div>
       </div>
     </div>
 
@@ -1665,7 +1795,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="budgets-list"></div>
       </div>
       <div class="panel">
-        <h2>Próximos recurrentes</h2>
+        <h2>Recurrentes</h2>
         <div id="recurring-list"></div>
       </div>
     </div>
@@ -1818,7 +1948,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 const fmt = new Intl.NumberFormat('es-AR');
 const currency = (n, c) => '$ ' + fmt.format(n) + ' ' + c;
 const monthlyDashboard = location.pathname === '/dashboard/mensual';
-let trendChart, categoryChart;
+let trendChart;
+let categoryCharts = [];
 let currentPeriod = 'month';
 let selectedMonth = null;
 let latestMonth = null;
@@ -1901,7 +2032,82 @@ async function getJSON(url) {
   return r.json();
 }
 
+async function refreshActiveCycle() {
+  const target = document.getElementById('active-cycle');
+  try {
+    const current = await getJSON('/api/cycle/current');
+    if (!current.cycle) {
+      target.innerHTML = '<p>No hay un ciclo activo para hoy.</p>' +
+        '<button type="button" onclick="ensureActiveCycle(this)">Abrir o actualizar ciclo</button>';
+      return;
+    }
+    const summary = await getJSON('/api/cycle-summary?cycle_id=' + encodeURIComponent(current.cycle.id));
+    const money = summary.money || {};
+    const fields = [
+      ['income', 'Ingreso base'], ['extra', 'Ingresos extra'],
+      ['gross_income', 'Ingreso bruto'], ['savings_target', 'Meta de ahorro'],
+      ['savings_reserved', 'Ahorro reservado'], ['savings_realized', 'Ahorro realizado'],
+      ['savings_committed', 'Ahorro comprometido'], ['realized_expenses', 'Gastos realizados'],
+      ['pending_reserved_obligations', 'Obligaciones pendientes'],
+      ['available_to_spend', 'Disponible'], ['daily_safe_to_spend', 'Gasto diario seguro'],
+    ];
+    const currencies = new Set(fields.flatMap(([key]) => Object.keys(money[key] || {})));
+    const range = escapeHTML(summary.start_date) + ' → ' + escapeHTML(summary.end_date);
+    if (!currencies.size) {
+      target.innerHTML = '<p>' + range + '</p><p>Aún no hay ingresos ni movimientos en este ciclo.</p>';
+      return;
+    }
+    const incomeState = (money.warnings || []).includes('no_income_recorded')
+      ? '<p>Aún no registraste ingresos en este ciclo.</p>' : '';
+    target.innerHTML = '<p>' + range + '</p>' + incomeState + '<div class="grid">' +
+      [...currencies].sort().map(currency =>
+        '<div class="panel"><h3>' + escapeHTML(currency) + '</h3>' +
+        fields.map(([key, label]) => {
+          const value = money[key] && money[key][currency];
+          return '<div style="display:flex;justify-content:space-between;gap:12px;margin:6px 0">' +
+            '<span>' + label + '</span><strong style="white-space:nowrap">' +
+            (value == null ? 'No disponible' : escapeHTML(value) + ' ' + escapeHTML(currency)) +
+            '</strong></div>';
+        }).join('') + '</div>'
+      ).join('') + '</div>';
+  } catch (err) {
+    target.textContent = 'No se pudo cargar el ciclo activo.';
+  }
+}
+
+async function ensureActiveCycle(button) {
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/cycle/ensure', {method: 'POST'});
+    if (!response.ok) throw new Error('cycle ensure ' + response.status);
+    await refreshActiveCycle();
+  } catch (err) {
+    document.getElementById('active-cycle').textContent =
+      'No se pudo actualizar el ciclo. Volvé a intentarlo.';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function toggleRecurringObligation(id, enabled, button) {
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/recurring/' + encodeURIComponent(id) + '/obligation', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({is_obligation: enabled}),
+    });
+    if (!response.ok) throw new Error('recurring obligation ' + response.status);
+    await refresh();
+  } catch (err) {
+    button.textContent = 'No se pudo guardar. Reintentar';
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function refresh() {
+  if (!monthlyDashboard) refreshActiveCycle();
   const subtitle = document.getElementById('subtitle');
   subtitle.classList.add('refreshing');
 
@@ -1929,7 +2135,7 @@ async function refresh() {
           getJSON('/api/trend' + periodParam),
           getJSON('/api/recent?limit=10'),
           getJSON('/api/budgets' + periodParam),
-          getJSON('/api/recurring/upcoming'),
+          getJSON('/api/recurring'),
           getJSON('/api/comparison' + periodParam),
           getJSON('/api/projection' + periodParam),
           getJSON('/api/fixed-expenses'),
@@ -1990,26 +2196,18 @@ async function refresh() {
 
   // Trend chart
   if (trendChart) trendChart.destroy();
-  const tLabels = trend.points.map(p => p.date.slice(5));
-  const tData = trend.points.map(p => p.amount);
-  const trendGradient = (ctx) => {
-    const chart = ctx.chart;
-    const {ctx: c, chartArea} = chart;
-    if (!chartArea) return 'rgba(52, 211, 153, 0.15)';
-    const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
-    g.addColorStop(0, 'rgba(52, 211, 153, 0.45)');
-    g.addColorStop(1, 'rgba(52, 211, 153, 0)');
-    return g;
-  };
+  const trendSeries = Object.entries(trend.points_by_currency || {});
+  const timeline = trendSeries.length ? trendSeries[0][1] : (trend.points || []);
+  const trendColors = palette(trendSeries.length);
   trendChart = new Chart(document.getElementById('trend-chart'), {
     type: 'line',
     data: {
-      labels: tLabels,
-      datasets: [{
-        label: 'ARS',
-        data: tData,
-        borderColor: '#34d399',
-        backgroundColor: trendGradient,
+      labels: timeline.map(p => p.date.slice(5)),
+      datasets: trendSeries.map(([cur, points], index) => ({
+        label: cur,
+        data: points.map(p => p.amount),
+        borderColor: trendColors[index],
+        backgroundColor: trendColors[index] + '22',
         borderWidth: 2,
         fill: true,
         tension: 0.4,
@@ -2018,16 +2216,21 @@ async function refresh() {
         pointHoverBackgroundColor: '#34d399',
         pointHoverBorderColor: '#fff',
         pointHoverBorderWidth: 2,
-      }],
+      })),
     },
     options: chartOpts(),
   });
 
   // Category pie/donut
-  const cats = summary.by_category || [];
-  if (categoryChart) categoryChart.destroy();
-  if (cats.length) {
-    categoryChart = new Chart(document.getElementById('category-chart'), {
+  categoryCharts.forEach(chart => chart.destroy());
+  categoryCharts = [];
+  const categoryTarget = document.getElementById('category-charts');
+  const categoryGroups = Object.entries(summary.by_category_by_currency || {});
+  categoryTarget.innerHTML = categoryGroups.length ? categoryGroups.map(([cur], index) =>
+    '<h3>' + escapeHTML(cur) + '</h3><div class="chart-wrap tall"><canvas id="category-chart-' + index + '"></canvas></div>'
+  ).join('') : '<div class="subtitle">Sin gastos en este período.</div>';
+  categoryGroups.forEach(([cur, cats], index) => {
+    categoryCharts.push(new Chart(document.getElementById('category-chart-' + index), {
       type: 'doughnut',
       data: {
         labels: cats.map(c => c.name),
@@ -2059,16 +2262,8 @@ async function refresh() {
           },
         },
       },
-    });
-  } else {
-    document.getElementById('category-chart').replaceWith(
-      Object.assign(document.createElement('div'), {
-        className: 'subtitle',
-        style: 'padding: 40px; text-align: center',
-        textContent: 'Sin gastos en este período.',
-      })
-    );
-  }
+    }));
+  });
 
   // Repeated expenses grouped by normalized name, category and currency.
   const groupedDiv = document.getElementById('grouped-list');
@@ -2117,96 +2312,59 @@ async function refresh() {
   // Recurring upcoming
   const rDiv = document.getElementById('recurring-list');
   if (recurring.items.length === 0) {
-    rDiv.innerHTML = '<div class="subtitle">Sin vencimientos en los próximos 7 días.</div>';
+    rDiv.innerHTML = '<div class="subtitle">No hay recurrentes activos. Podés crearlos desde Telegram.</div>';
   } else {
     rDiv.innerHTML = recurring.items.map(r =>
       `<div class="budget-row">
-         <div><strong>${r.name}</strong> — ${currency(r.amount, r.currency)}</div>
-         <div class="subtitle">vence ${r.next_due_date}</div>
+         <div><strong>${escapeHTML(r.name)}</strong> — ${currency(r.amount, r.currency)}</div>
+         <div class="subtitle">Próximo aviso: ${escapeHTML(r.next_due_date)} · ${r.is_obligation ? 'Descuenta del disponible' : 'Solo recordatorio'}</div>
+         ${r.is_obligation && r.obligation_due_date ? '<div class="subtitle">Compromiso: ' + escapeHTML(r.obligation_due_date) + '</div>' : ''}
+         <button type="button" aria-label="${r.is_obligation ? 'Quitar' : 'Descontar'} ${escapeHTML(r.name)} del disponible"
+           onclick="toggleRecurringObligation(${r.id}, ${!r.is_obligation}, this)">${r.is_obligation ? 'Quitar del disponible' : 'Descontar del disponible'}</button>
        </div>`).join('');
   }
 
-  // Comparison
+  // Comparison uses server-produced amounts and percentages per currency.
   const cDiv = document.getElementById('comparison-list');
-  if (comparison.by_category.length === 0) {
-    cDiv.innerHTML = '<div class="subtitle">Sin datos comparables.</div>';
-  } else {
-    const dClass = comparison.delta_pct == null ? 'delta-flat'
-                 : comparison.delta_pct > 0 ? 'delta-up'
-                 : comparison.delta_pct < 0 ? 'delta-down' : 'delta-flat';
-    const dArrow = comparison.delta_pct == null ? '·'
-                 : comparison.delta_pct > 0 ? '↑' : comparison.delta_pct < 0 ? '↓' : '·';
-    const dSign = comparison.delta_pct == null ? ''
-                 : (comparison.delta_pct > 0 ? '+' : '');
-    const top = `
-      <div style="display:flex; flex-direction:column; gap:6px; padding:6px 0 4px">
-        <div><strong>${comparison.current.label}</strong>
-             <span style="color:var(--muted); margin-left:6px">${currency(comparison.current.total, 'ARS')}</span></div>
-        <div><strong>${comparison.previous.label}</strong>
-             <span style="color:var(--muted); margin-left:6px">${currency(comparison.previous.total, 'ARS')}</span></div>
-        <div class="${dClass}" style="font-size:28px; font-weight:600; margin-top:8px">
-          ${dArrow} ${dSign}${comparison.delta_pct == null ? '—' : comparison.delta_pct.toFixed(1) + '%'}
-        </div>
-      </div>`;
-    const rows = comparison.by_category.slice(0, 6).map(r => {
-      const cls = r.diff_pct == null ? 'delta-flat'
-                : r.diff_pct > 0 ? 'delta-up'
-                : r.diff_pct < 0 ? 'delta-down' : 'delta-flat';
-      const arrow = r.diff_pct == null ? '' : r.diff_pct > 0 ? '↑' : r.diff_pct < 0 ? '↓' : '';
-      const sign = r.diff_pct == null ? '' : r.diff_pct > 0 ? '+' : '';
-      return `<tr>
-        <td>${r.category}</td>
-        <td class="amount">$${fmt.format(r.current)}</td>
-        <td class="amount">$${fmt.format(r.previous)}</td>
-        <td class="${cls}">${arrow} ${sign}${r.diff_pct == null ? '—' : r.diff_pct.toFixed(1) + '%'}</td>
-      </tr>`;
-    }).join('');
-    const moreCount = Math.max(0, comparison.by_category.length - 6);
-    const footer = moreCount > 0
-      ? `<div class="subtitle" style="margin-top:8px; text-align:right">+${moreCount} más…</div>`
-      : '';
-    cDiv.innerHTML = top + `
-      <table style="margin-top:18px">
-        <thead><tr><th>Categoría</th>
-                   <th style="text-align:right">${comparison.current.label}</th>
-                   <th style="text-align:right">${comparison.previous.label}</th>
-                   <th style="text-align:right">Δ</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>${footer}`;
-  }
+  const comparisonGroups = Object.entries(comparison.by_category_by_currency || {});
+  cDiv.innerHTML = comparisonGroups.length ? comparisonGroups.map(([cur, items]) => {
+    const delta = comparison.delta_pct_by_currency[cur];
+    const rows = items.slice(0, 6).map(row => `<tr>
+      <td>${escapeHTML(row.category)}</td>
+      <td class="amount">${currency(row.current, cur)}</td>
+      <td class="amount">${currency(row.previous, cur)}</td>
+      <td>${row.diff_pct == null ? '—' : fmt.format(row.diff_pct) + '%'}</td>
+    </tr>`).join('');
+    return `<section style="margin-bottom:20px">
+      <h3>${escapeHTML(cur)}</h3>
+      <div>${escapeHTML(comparison.current.label)}: ${currency(comparison.current_total_by_currency[cur] || 0, cur)}</div>
+      <div>${escapeHTML(comparison.previous.label)}: ${currency(comparison.previous_total_by_currency[cur] || 0, cur)}</div>
+      <div class="subtitle">Variación: ${delta == null ? 'Sin base de comparación' : fmt.format(delta) + '%'}</div>
+      <table style="margin-top:12px"><thead><tr><th>Categoría</th><th>Actual</th><th>Anterior</th><th>Δ</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+    </section>`;
+  }).join('') : '<div class="subtitle">Sin datos comparables.</div>';
 
-  // Projection
+  // Projection values also come from the server, with no mixed-currency total.
   const pDiv = document.getElementById('projection-card');
+  const projectionCurrencies = Object.keys(projection.projected_total_by_currency || {});
   if (projection.applies === false) {
-    pDiv.innerHTML = '<div class="subtitle">La proyección aplica solo a períodos en curso (semana, mes, año). Para hoy ya tenés el total cerrado.</div>';
-  } else if (projection.previous_total === 0 && projection.spent === 0) {
+    pDiv.innerHTML = '<div class="subtitle">La proyección aplica solo a períodos en curso (semana, mes, año).</div>';
+  } else if (!projectionCurrencies.length) {
     pDiv.innerHTML = '<div class="subtitle">Sin datos suficientes para proyectar.</div>';
   } else {
-    const dCls = projection.delta_vs_previous_pct == null ? 'delta-flat'
-              : projection.delta_vs_previous_pct > 0 ? 'delta-up'
-              : projection.delta_vs_previous_pct < 0 ? 'delta-down' : 'delta-flat';
-    const arrow = projection.delta_vs_previous_pct == null ? '·'
-                : projection.delta_vs_previous_pct > 0 ? '↑'
-                : projection.delta_vs_previous_pct < 0 ? '↓' : '·';
-    const sign = projection.delta_vs_previous_pct == null ? ''
-              : (projection.delta_vs_previous_pct > 0 ? '+' : '');
-    pDiv.innerHTML = `
-      <div style="display:flex; flex-direction:column; gap:6px; padding:6px 0 4px">
-        <div class="subtitle" style="font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted)">Gastado</div>
-        <div class="big" style="font-size:32px">$${fmt.format(projection.spent)}</div>
-        <div class="subtitle">
-          Día ${projection.days_elapsed} de ${projection.days_in_period}
-        </div>
-      </div>
-      <div style="height:1px; background:rgba(255,255,255,0.06); margin:18px 0"></div>
-      <div style="display:flex; flex-direction:column; gap:6px">
-        <div class="subtitle" style="font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted)">Proyección fin de período</div>
-        <div class="big" style="color:var(--accent); font-size:32px">$${fmt.format(projection.projected_total)}</div>
-        <div class="${dCls}" style="margin-top:4px; font-size:18px; font-weight:500">
-          ${arrow} ${sign}${projection.delta_vs_previous_pct == null ? '—' : projection.delta_vs_previous_pct.toFixed(1) + '%'}
-          vs período anterior
-        </div>
-      </div>`;
+    pDiv.innerHTML = projectionCurrencies.map(cur => {
+      const delta = projection.delta_vs_previous_pct_by_currency[cur];
+      return `<section style="margin-bottom:20px">
+        <h3>${escapeHTML(cur)}</h3>
+        <div class="subtitle">Gastado</div>
+        <div class="big" style="font-size:28px">${currency(projection.spent_by_currency[cur] || 0, cur)}</div>
+        <div class="subtitle">Día ${projection.days_elapsed} de ${projection.days_in_period}</div>
+        <div class="subtitle" style="margin-top:14px">Proyección fin de período</div>
+        <div class="big" style="color:var(--accent);font-size:28px">${currency(projection.projected_total_by_currency[cur], cur)}</div>
+        <div class="subtitle">${delta == null ? 'Sin base de comparación' : fmt.format(delta) + '% vs período anterior'}</div>
+      </section>`;
+    }).join('');
   }
 
   // Recent expenses table (last 10)
@@ -2543,6 +2701,7 @@ function escapeHTML(s) {
 }
 
 if (monthlyDashboard) {
+  document.getElementById('active-cycle-panel').style.display = 'none';
   document.getElementById('page-title').innerHTML =
     '<span class="emoji">📅</span> Resumen mensual';
   document.getElementById('period-bar').style.display = 'none';

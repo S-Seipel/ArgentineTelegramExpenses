@@ -196,6 +196,31 @@ class RecurringService:
             return None
         return self.repo.set_active(obj, is_active, commit=commit)
 
+    def set_obligation(
+        self,
+        user_id: int,
+        recurring_id: int,
+        is_obligation: bool,
+        *,
+        commit: bool = True,
+    ) -> RecurringExpense | None:
+        """Opt a reminder into planning, preserving its current occurrence."""
+        if not isinstance(is_obligation, bool):
+            raise RecurringValidationError("La obligación debe activarse o desactivarse.")
+        obj = self.repo.get_by_id_for_update(user_id, recurring_id)
+        if obj is None:
+            return None
+        if is_obligation and (not obj.is_obligation or obj.obligation_due_date is None):
+            obj.obligation_due_date = obj.next_due_date
+        elif not is_obligation:
+            obj.obligation_due_date = None
+        obj.is_obligation = is_obligation
+        self.repo.session.flush()
+        if commit:
+            self.repo.session.commit()
+            self.repo.session.refresh(obj)
+        return obj
+
     def register_occurrence(
         self,
         user_id: int,
@@ -218,7 +243,11 @@ class RecurringService:
         original_message = (
             f"[recurrente #{template_obj.id}] {template_obj.name}"
         )
-        occurrence_date = occurrence_date or today
+        explicit_occurrence = occurrence_date is not None
+        canonical_due = template_obj.obligation_due_date or template_obj.next_due_date
+        occurrence_date = occurrence_date or (
+            canonical_due if template_obj.is_obligation else today
+        )
         source_key = recurring_occurrence_source_key(
             recurring_id, occurrence_date
         )
@@ -227,8 +256,15 @@ class RecurringService:
             user_id, source_key, include_deleted=True
         )
         if existing is not None:
-            updated = template_obj
-            return updated, existing
+            # A retried old reminder cannot advance the next occurrence or
+            # silently restore an expense the user explicitly deleted.
+            return template_obj, existing if existing.deleted_at is None else None
+
+        if template_obj.is_obligation:
+            if occurrence_date != canonical_due:
+                return template_obj, None
+            if not explicit_occurrence and canonical_due > today:
+                return template_obj, None
 
         expense_service = ExpenseService(expense_repo)
         outcome = expense_service.register_many(
@@ -254,12 +290,18 @@ class RecurringService:
             return template_obj, None
         saved = outcome.saved[0]
 
-        next_due = advance_due_date(
-            today,
-            template_obj.frequency,
-            day_of_month=template_obj.day_of_month,
-            month_of_year=template_obj.month_of_year,
-        )
+        if template_obj.is_obligation:
+            next_due = self._advance_obligation(template_obj, occurrence_date, today)
+            reminder = self.repo.get_reminder(user_id, recurring_id, occurrence_date)
+            if reminder is not None:
+                self.repo.resolve_reminder(reminder)
+        else:
+            next_due = advance_due_date(
+                today,
+                template_obj.frequency,
+                day_of_month=template_obj.day_of_month,
+                month_of_year=template_obj.month_of_year,
+            )
         updated = self.repo.update_next_due(
             template_obj, next_due, notified=True, commit=commit
         )
@@ -271,18 +313,30 @@ class RecurringService:
         recurring_id: int,
         today: date,
         *,
+        occurrence_date: date | None = None,
         commit: bool = True,
     ) -> RecurringExpense | None:
         """Advance to next period without registering."""
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
         if template_obj is None or not template_obj.is_active:
             return None
-        next_due = advance_due_date(
-            today,
-            template_obj.frequency,
-            day_of_month=template_obj.day_of_month,
-            month_of_year=template_obj.month_of_year,
-        )
+        if template_obj.is_obligation:
+            canonical_due = template_obj.obligation_due_date or template_obj.next_due_date
+            if occurrence_date is not None and occurrence_date != canonical_due:
+                return template_obj
+            if occurrence_date is None and canonical_due > today:
+                return template_obj
+            next_due = self._advance_obligation(template_obj, canonical_due, today)
+            reminder = self.repo.get_reminder(user_id, recurring_id, canonical_due)
+            if reminder is not None:
+                self.repo.resolve_reminder(reminder)
+        else:
+            next_due = advance_due_date(
+                today,
+                template_obj.frequency,
+                day_of_month=template_obj.day_of_month,
+                month_of_year=template_obj.month_of_year,
+            )
         return self.repo.update_next_due(
             template_obj, next_due, notified=True, commit=commit
         )
@@ -292,16 +346,65 @@ class RecurringService:
         user_id: int,
         recurring_id: int,
         *,
+        occurrence_date: date | None = None,
+        today: date | None = None,
         commit: bool = True,
     ) -> RecurringExpense | None:
         template_obj = self.repo.get_by_id_for_update(user_id, recurring_id)
         if template_obj is None or not template_obj.is_active:
             return None
-        new_due = postpone_due_date(template_obj.next_due_date)
+        if template_obj.is_obligation:
+            canonical_due = template_obj.obligation_due_date or template_obj.next_due_date
+            if occurrence_date is None or occurrence_date != canonical_due:
+                return template_obj
+            reminder = self.repo.get_reminder(user_id, recurring_id, canonical_due)
+            if reminder is not None:
+                self.repo.reopen_reminder(reminder)
+        reminder_date = template_obj.next_due_date
+        if template_obj.is_obligation and today is not None:
+            reminder_date = max(reminder_date, today)
+        new_due = postpone_due_date(reminder_date)
         template_obj.next_due_date = new_due
+        self.repo.session.flush()
         if commit:
             self.session_commit()
         return template_obj
+
+    def _advance_obligation(
+        self, template: RecurringExpense, occurrence_date: date, today: date
+    ) -> date:
+        # One overdue obligation survives, rather than inventing all monthly
+        # debts between its due date and the user's eventual response. Future
+        # scheduled occurrences remain predictable and keep their own identity.
+        next_due = first_occurrence(
+            max(today, occurrence_date) + timedelta(days=1),
+            template.frequency,
+            template.day_of_month,
+            template.month_of_year,
+        )
+        # A clamped payday cycle can contain two monthly occurrences. If
+        # both were already reserved in this open cycle, a late payment of
+        # the first must not silently discard the second reservation.
+        from sqlalchemy import select
+        from app.money.models import FinancialCycle
+
+        window = self.repo.session.execute(
+            select(FinancialCycle.start_date, FinancialCycle.end_date).where(
+                FinancialCycle.telegram_user_id == template.telegram_user_id,
+                FinancialCycle.status == "open",
+                FinancialCycle.start_date <= today,
+                FinancialCycle.end_date >= today,
+            )
+        ).one_or_none()
+        natural_next = advance_due_date(
+            occurrence_date, template.frequency,
+            day_of_month=template.day_of_month,
+            month_of_year=template.month_of_year,
+        )
+        if window is not None and window.start_date <= occurrence_date <= natural_next <= window.end_date:
+            next_due = natural_next
+        template.obligation_due_date = next_due
+        return next_due
 
     def session_commit(self) -> None:
         self.repo.session.commit()

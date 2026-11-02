@@ -228,27 +228,72 @@ y los vas tildando a medida que los pagás.
 /salte NETFLIX           # este mes no lo pagás
 ```
 
-**Income / Extra del mes:**
+**Ingresos y disponible del ciclo:**
 ```
 /ingreso 1100000
 /extra 75000
+/disponible
 ```
 
-**Resumen del mes:**
-```
-/liberado
-→ 📊 Resumen del mes 2026-09
-  💵 Ingreso:    $ 1.100.000
-  ➕ Extra:       $ 75.000
-  📉 Gastos fijos: $ 145.000
-     (esperado $ 150.000)
-  💰 Liberado:   $ 1.030.000
+`/liberado` conserva el resumen mensual anterior y sus datos históricos.
+Los nuevos `/ingreso` y `/extra` alimentan el ciclo financiero, sin sincronizar
+el presupuesto mensual anterior. Para planificar usá `/disponible` y el panel
+**Ciclo activo** del dashboard.
+
+### Planificación por ciclo financiero (F1)
+
+Configurá el día de cobro con `/config_payday <día>`. El ciclo va de un
+cobro al siguiente; `/cycle` muestra sus fechas y montos. `/ingreso` fija el
+ingreso base, `/extra` registra ingresos adicionales, `/target` define la meta
+de ahorro, `/reservar` aparta ahorro y `/ahorro_realizado` registra lo ahorrado.
+`/disponible` y `/gastar_diario` leen el Money Engine para el ciclo activo.
+El disponible descuenta ahorro comprometido, gastos realizados y obligaciones
+fijas pendientes; puede ser negativo. ARS y USD se muestran por separado,
+sin conversión ni suma entre monedas.
+
+`/liberado` conserva su cálculo mensual **legacy**. Para planificación por
+ciclo usá `/disponible`. `/repair_fixed_payments` revisa y repara los espejos
+de pagos fijos inconsistentes; informa si no había nada que reparar.
+
+El dashboard local y privado incluye **Ciclo activo** con los valores del
+Money Engine por moneda. `GET /api/cycle-history` devuelve únicamente ciclos
+cerrados desde sus snapshots inmutables; el gasto diario histórico es `null`.
+Si no hay ciclo para hoy, **Abrir o actualizar ciclo** lo crea o actualiza
+mediante una acción explícita. Un disponible de cero se muestra como cero;
+un gasto diario no disponible se identifica por separado. Las inversiones se
+gestionan fuera de la aplicación.
+
+### Compromisos recurrentes (F1.5)
+
+Cada recurrente nuevo o existente continúa como **solo recordatorio** hasta
+que lo incluyas expresamente en la planificación:
+
+```text
+/recurrentes
+/recurrente_obligacion 3 on
+/disponible
+/recurrente_obligacion 3 off
 ```
 
-El dashboard tiene una sección "Gastos fijos" con KPI cards de Ingreso,
-Extra, Pagado y **Liberado** en vivo.
+Con `on`, su vencimiento pendiente dentro del ciclo descuenta del disponible.
+Una ocurrencia atrasada se conserva una sola vez, sin acumular automáticamente
+cuotas de los meses omitidos. Confirmar el pago cambia lo pendiente por un
+gasto real, sin contarlo dos veces. Responder **no** salta la ocurrencia y
+libera su reserva. Resolver una deuda atrasada puede dejar visible
+el siguiente vencimiento del ciclo. **Posponer** mueve el aviso, conserva la identidad del vencimiento y
+no libera dinero, incluso al cruzar el fin del ciclo. Pausar o quitar la
+obligación deja de reservar dinero. ARS y USD permanecen separados.
 
-### Gastos recurrentes
+F1.5 ofrece una previsión del ciclo: en el siguiente conserva un único
+vencimiento atrasado por recurrente. Las previsiones adicionales del ciclo
+anterior no se convierten automáticamente en cuotas adeudadas acumuladas.
+El historial cerrado conserva los importes previstos al momento del cierre.
+
+El panel **Recurrentes** permite activar o quitar cada compromiso del
+disponible. `GET /api/recurring` lista los recurrentes activos y
+`PATCH /api/recurring/{id}/obligation` acepta `{"is_obligation": true|false}`.
+Al actualizar una instalación existente ejecutá `alembic upgrade head` antes
+de iniciar la app: F1.5 agrega la migración `0014_recurring_obligations`.
 
 ### Audios (voice notes)
 
@@ -320,7 +365,8 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-Los tests **no necesitan Ollama corriendo** ni PostgreSQL: usan SQLite en memoria y un `StubAIService` que devuelve respuestas guionadas. La suite actual corre 344 tests en segundos.
+Los tests normales **no necesitan Ollama corriendo** ni PostgreSQL: usan
+SQLite en memoria y un `StubAIService` que devuelve respuestas guionadas.
 
 ### Suite de integración contra PostgreSQL real
 
@@ -343,8 +389,8 @@ DATABASE_URL=postgresql+psycopg://expenses:expenses@localhost:5432/expenses \
 ```
 
 La CI tiene un job dedicado (`.github/workflows/ci-postgres.yml`) que
-lo corre contra un service container de `postgres:15-alpine`. La suite
-tiene 11 tests y tarda ~6 segundos.
+lo corre contra un service container de `postgres:15-alpine`. Incluye
+comprobaciones de integridad y carreras entre operaciones simultáneas.
 
 ---
 

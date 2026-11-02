@@ -116,9 +116,8 @@ opcional y por defecto es `1`. Métodos válidos: `transferencia`, `efectivo`,
 | `/pague <nombre>` | Marca un gasto fijo como pagado por el monto esperado. |
 | `/pague <nombre> <monto_real>` | Marca como pagado con el monto real. |
 | `/salte <nombre>` | Saltea ese gasto fijo durante el mes actual. |
-| `/ingreso <monto>` | Define el ingreso del mes actual. |
-| `/extra <monto>` | Define el ingreso extra del mes actual. |
 | `/liberado` | Muestra ingreso, extra, gastos fijos y monto liberado. |
+| `/repair_fixed_payments` | Repara espejos inconsistentes de pagos fijos. |
 
 Ejemplo:
 
@@ -127,10 +126,59 @@ Ejemplo:
 /pague CASA
 /pague GYM 65000
 /salte NETFLIX
-/ingreso 1100000
-/extra 75000
 /liberado
 ```
+
+`/liberado` conserva el cálculo mensual legacy y sus datos históricos.
+`/ingreso` y `/extra` ahora alimentan el ciclo financiero, sin sincronizar
+ese presupuesto anterior. Para el disponible del ciclo usá `/disponible`.
+
+## Ciclo financiero F1
+
+`/config_payday <día>` fija el día de cobro; el ciclo termina antes del
+siguiente cobro. `/cycle` muestra el ciclo activo. `/disponible` y
+`/gastar_diario` consultan el Money Engine, con ARS y USD independientes:
+no hay conversión ni total combinado. El disponible puede ser negativo.
+
+| Comando | Uso |
+|---|---|
+| `/config_payday <día>` | Configura el día de cobro. |
+| `/cycle` | Muestra fechas y estado del ciclo. |
+| `/ingreso <monto>` | Fija el ingreso base del ciclo. |
+| `/extra <monto> [nota]` | Registra ingreso extra. |
+| `/target <porcentaje o monto>` | Define la meta de ahorro. |
+| `/reservar <monto>` | Fija el ahorro reservado. |
+| `/ahorro_realizado <monto> [nota]` | Registra ahorro realizado. |
+| `/disponible` | Muestra el disponible del ciclo. |
+| `/gastar_diario` | Muestra el gasto diario seguro, si está disponible. |
+| `/repair_fixed_payments` | Repara espejos de pagos fijos y muestra el resultado. |
+
+El dashboard local contiene **Ciclo activo**, separado por moneda. La API
+`GET /api/cycle-history` expone sólo ciclos cerrados desde sus snapshots,
+con gasto diario histórico `null`. Un saldo cero se muestra como cero.
+Cuando no hay ciclo para hoy, **Abrir o actualizar ciclo** permite abrirlo o
+actualizarlo explícitamente. Las inversiones se gestionan fuera de la app.
+
+## Compromisos recurrentes F1.5
+
+| Comando | Uso |
+|---|---|
+| `/recurrente_obligacion <id> on` | Descuenta el compromiso pendiente de ese recurrente del disponible. |
+| `/recurrente_obligacion <id> off` | Lo deja como recordatorio, sin reserva de dinero. |
+
+Los recurrentes existentes y nuevos empiezan como **solo recordatorio**.
+`/recurrentes` muestra cuáles son obligaciones. Un vencimiento atrasado se
+conserva una sola vez, sin acumular cuotas de los meses omitidos. Responder
+**sí** registra el pago sin duplicar el gasto; **no** salta la ocurrencia y
+libera la reserva de esa ocurrencia. Resolver una atrasada puede dejar visible
+el siguiente vencimiento del ciclo. **Posponer** conserva el vencimiento y el dinero reservado,
+aunque el aviso pase al ciclo siguiente. Pausar también deja de reservar.
+Al cambiar de ciclo se conserva un solo vencimiento atrasado por recurrente:
+las previsiones del ciclo anterior no se acumulan como cuotas adeudadas.
+
+El dashboard permite activar o quitar compromisos en **Recurrentes**.
+La API los lista en `GET /api/recurring` y modifica el indicador mediante
+`PATCH /api/recurring/{id}/obligation` con `{"is_obligation": true|false}`.
 
 Los nombres y IDs se obtienen de `/gastosfijos`. Para modificar o eliminar
 recurrentes, presupuestos o gastos fijos, primero listalos para consultar el

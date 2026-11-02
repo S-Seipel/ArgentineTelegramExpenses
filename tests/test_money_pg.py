@@ -308,14 +308,9 @@ def main() -> int:
     print("[pg] alembic downgrade 0011_recurring_reminders")
     down_ok = _alembic_downgrade("0011_recurring_reminders")
     if not down_ok:
-        print(
-            "[pg] downgrade to 0011 failed; skipping the re-upgrade leg. "
-            "This is a pre-existing F0 condition (the migration chain "
-            "predates R1)."
-        )
-    else:
-        print("[pg] alembic upgrade head (re-upgrade)")
-        _alembic_upgrade_head()
+        raise RuntimeError("alembic downgrade to 0011 failed")
+    print("[pg] alembic upgrade head (re-upgrade)")
+    _alembic_upgrade_head()
     print("[pg] concurrent open_initial_cycle")
     _concurrent_open_initial_cycle()
     print("[pg] all checks passed")
