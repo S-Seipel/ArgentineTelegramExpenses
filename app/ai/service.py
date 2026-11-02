@@ -1,4 +1,4 @@
-"""Pure async AI service abstraction + Ollama implementation.
+"""Pure async AI service abstraction + provider implementations.
 
 The service is responsible ONLY for:
 
@@ -46,6 +46,8 @@ class AIServiceConfig:
     timeout: float
     max_retries: int
     timezone: str
+    provider: str = "Ollama"
+    api_key: str | None = None
     whisper_model_size: str = "base"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
@@ -90,8 +92,9 @@ class OllamaAIService:
                 headers={"Content-Type": "application/json"},
             )
             logger.info(
-                "OllamaAIService ready: url=%s model=%s whisper=%s/%s "
+                "%s ready: url=%s model=%s whisper=%s/%s "
                 "timeout=%s",
+                cfg.provider,
                 cfg.base_url,
                 cfg.model,
                 cfg.whisper_model_size,
@@ -206,9 +209,9 @@ class OllamaAIService:
                 raise
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 last_error = exc
-                logger.error("Ollama HTTP error: %s", exc)
+                logger.error("%s HTTP error: %s", self.cfg.provider, exc)
                 raise AIUnavailable(
-                    f"Ollama is unreachable at {self.cfg.base_url}: {exc}"
+                    f"{self.cfg.provider} is unreachable at {self.cfg.base_url}: {exc}"
                 ) from exc
             except AIError as exc:
                 last_error = exc
@@ -276,7 +279,7 @@ class OllamaAIService:
                 "top_p": 0.9,
                 "repeat_penalty": 1.1,
                 "num_ctx": 2048,
-                "num_predict": 512,
+                "num_predict": 1024,
             },
         }
         url = f"{self.cfg.base_url.rstrip('/')}/api/chat"
@@ -317,6 +320,81 @@ class OllamaAIService:
         return _extract_json(text)
 
 
+class MiniMaxAIService(OllamaAIService):
+    """MiniMax OpenAI-compatible chat service.
+
+    Whisper remains inherited and local; only text interpretation moves to
+    MiniMax. The API key is sent only in the server-side HTTP client.
+    """
+
+    def __init__(
+        self,
+        cfg: AIServiceConfig,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if not cfg.api_key:
+            raise ValueError("MINIMAX_API_KEY is required when AI_PROVIDER=minimax")
+        super().__init__(cfg, client=client)
+        if hasattr(self._client, "headers"):
+            self._client.headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    async def _call_model(self, system: str, user: str) -> Any:
+        import time
+
+        payload = {
+            "model": self.cfg.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_completion_tokens": 1024,
+            "thinking": {"type": "disabled"},
+            "reasoning_split": True,
+        }
+        url = f"{self.cfg.base_url.rstrip('/')}/chat/completions"
+        start = time.perf_counter()
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise AIUnavailable(
+                f"MiniMax is unreachable at {self.cfg.base_url}: {exc}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "MiniMax timeout after %.1fs", time.perf_counter() - start
+            )
+            raise AIUnavailable("MiniMax request timed out") from exc
+
+        elapsed = time.perf_counter() - start
+        if response.status_code != 200:
+            raise AIError(
+                f"MiniMax returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+
+        data = response.json()
+        choices = data.get("choices") or []
+        content = (
+            choices[0].get("message", {}).get("content")
+            if choices and isinstance(choices[0], dict)
+            else None
+        )
+        if not content:
+            raise AIError("MiniMax response did not contain content")
+
+        text = str(content).strip()
+        logger.info(
+            "MiniMax chat ok: %.2fs (prompt=%d, completion_tokens=%s)",
+            elapsed,
+            len(system) + len(user),
+            (data.get("usage") or {}).get("completion_tokens"),
+        )
+        return _extract_json(text)
+
+
 def _extract_json(text: str) -> Any:
     """Robust JSON extraction (handles stray markdown fences and chatter)."""
     text = text.strip()
@@ -347,13 +425,29 @@ def _extract_json(text: str) -> Any:
     raise AIError("Model did not return JSON")
 
 
-def build_default_ai_service(settings: Settings) -> OllamaAIService:
+def build_default_ai_service(settings: Settings) -> AIService:
+    if settings.ai_provider.lower() == "minimax":
+        cfg = AIServiceConfig(
+            base_url=settings.minimax_base_url,
+            model=settings.minimax_model,
+            timeout=settings.minimax_timeout,
+            max_retries=settings.minimax_max_retries,
+            timezone=settings.timezone,
+            provider="MiniMax",
+            api_key=settings.minimax_api_key,
+            whisper_model_size=settings.whisper_model_size,
+            whisper_device=settings.whisper_device,
+            whisper_compute_type=settings.whisper_compute_type,
+        )
+        return MiniMaxAIService(cfg)
+
     cfg = AIServiceConfig(
         base_url=settings.ollama_base_url,
         model=settings.ollama_model,
         timeout=settings.ollama_timeout,
         max_retries=settings.ollama_max_retries,
         timezone=settings.timezone,
+        provider="Ollama",
         whisper_model_size=settings.whisper_model_size,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,

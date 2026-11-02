@@ -12,11 +12,14 @@ import httpx
 import pytest
 
 from app.ai.schemas import AIError, parse_ai_response
+from app.ai.schemas import SpendingAnalysis
 from app.ai.service import (
     AIServiceConfig,
+    MiniMaxAIService,
     OllamaAIService,
     StubAIService,
     _extract_json,
+    build_default_ai_service,
 )
 from app.config.settings import Settings
 
@@ -190,6 +193,144 @@ async def test_ollama_service_retries_on_invalid_json_then_succeeds() -> None:
     parsed = await svc.interpret("gasté 10k en café")
     assert parsed.intent.expenses[0].name == "Café"
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_minimax_service_uses_openai_compatible_response() -> None:
+    class FakeClient:
+        headers = {}
+
+        async def post(self, url, json=None):
+            assert url == "https://api.minimax.io/v1/chat/completions"
+            assert self.headers["Authorization"] == "Bearer subscription-key"
+            assert json["thinking"] == {"type": "disabled"}
+
+            class Response:
+                status_code = 200
+                text = ""
+
+                def json(self):
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"type":"unknown","expenses":[]}'
+                                }
+                            }
+                        ]
+                    }
+
+            return Response()
+
+    cfg = AIServiceConfig(
+        base_url="https://api.minimax.io/v1",
+        model="MiniMax-M3",
+        timeout=1.0,
+        max_retries=0,
+        timezone="UTC",
+        provider="MiniMax",
+        api_key="subscription-key",
+    )
+    parsed = await MiniMaxAIService(cfg, client=FakeClient()).interpret("hola")
+    assert parsed.intent.type == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_default_service_can_select_minimax() -> None:
+    settings = Settings(
+        telegram_bot_token="t",
+        telegram_allowed_user_id=1,
+        database_url="sqlite:///:memory:",
+        ai_provider="minimax",
+        minimax_api_key="subscription-key",
+    )
+    service = build_default_ai_service(settings)
+    assert isinstance(service, MiniMaxAIService)
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_minimax_service_validates_spending_analysis() -> None:
+    class FakeClient:
+        headers = {}
+
+        async def post(self, url, json=None):
+            class Response:
+                status_code = 200
+                text = ""
+
+                def json(self):
+                    return {
+                        "choices": [{
+                            "message": {
+                                "content": (
+                                    '{"summary":"Bien",'
+                                    '"observations":["Café pesa mucho"],'
+                                    '"recommendations":[{"category":"Café",'
+                                    '"reason":"alto","action":"comparar precios"}],'
+                                    '"caveat":null}'
+                                )
+                            }
+                        }]
+                    }
+
+            return Response()
+
+    cfg = AIServiceConfig(
+        base_url="https://api.minimax.io/v1",
+        model="MiniMax-M3",
+        timeout=1.0,
+        max_retries=0,
+        timezone="UTC",
+        provider="MiniMax",
+        api_key="subscription-key",
+    )
+    result = await MiniMaxAIService(cfg, client=FakeClient()).analyze_spending(
+        '{"periodo_actual":{}}'
+    )
+    assert isinstance(result, SpendingAnalysis)
+    assert result.recommendations[0].action == "comparar precios"
+
+
+@pytest.mark.asyncio
+async def test_spending_analysis_retries_truncated_json() -> None:
+    class FakeClient:
+        headers = {}
+        calls = 0
+
+        async def post(self, url, json=None):
+            self.calls += 1
+
+            class Response:
+                status_code = 200
+                text = ""
+
+                def __init__(self, content):
+                    self._content = content
+
+                def json(self):
+                    return {"choices": [{"message": {"content": self._content}}]}
+
+            if self.calls == 1:
+                return Response('{"summary":"respuesta cortada"')
+            return Response(
+                '{"summary":"Ok", "observations":[], '
+                '"recommendations":[], "caveat":null}'
+            )
+
+    client = FakeClient()
+    cfg = AIServiceConfig(
+        base_url="https://api.minimax.io/v1",
+        model="MiniMax-M3",
+        timeout=1.0,
+        max_retries=1,
+        timezone="UTC",
+        provider="MiniMax",
+        api_key="subscription-key",
+    )
+    result = await MiniMaxAIService(cfg, client=client).analyze_spending("{}")
+    assert result.summary == "Ok"
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio

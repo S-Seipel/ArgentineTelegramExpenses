@@ -76,6 +76,10 @@ def resolve_query_spec(
     period = q.period
     days = q.days
     category = q.category
+    if category:
+        from app.categories.categories import normalize_category
+
+        category = normalize_category(category)
     currency = (q.currency or default_currency).upper()
     limit = q.limit or 10
     order_by = q.order_by or "date_desc"

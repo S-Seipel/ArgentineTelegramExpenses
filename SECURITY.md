@@ -13,8 +13,9 @@ security model assumes:
 
 - One Telegram user (`TELEGRAM_ALLOWED_USER_ID`) is the only legitimate operator.
 - The database and HTTP API are reachable only from `127.0.0.1` on the host.
-- The AI inference (Ollama, faster-whisper) runs locally; no expense data
-  leaves the host.
+- With `AI_PROVIDER=ollama`, text inference and faster-whisper run locally.
+  With `AI_PROVIDER=minimax`, expense messages are sent to MiniMax; voice
+  transcription still runs locally through faster-whisper.
 
 ## Hardening Recommendations (Production)
 

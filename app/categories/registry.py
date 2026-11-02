@@ -15,9 +15,10 @@ source of truth.
 from __future__ import annotations
 
 import logging
-import re
+import unicodedata
 import threading
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -148,14 +149,33 @@ def normalize_category(name: str | None) -> str:
         leaves = list(_LEAF_NAMES)
     if not leaves:
         return DEFAULT_CATEGORY
+    key = _category_key(cleaned)
     for leaf in leaves:
-        if leaf.lower() == cleaned.lower():
+        if _category_key(leaf) == key:
             return leaf
     low = cleaned.lower()
     for leaf in leaves:
         if low in leaf.lower() or leaf.lower() in low:
             return leaf
+
+    if len(key) >= 5:
+        ranked = sorted(
+            (
+                SequenceMatcher(None, key, _category_key(leaf)).ratio(),
+                leaf,
+            )
+            for leaf in leaves
+        )
+        best_score, best_leaf = ranked[-1]
+        second_score = ranked[-2][0] if len(ranked) > 1 else 0.0
+        if best_score >= 0.78 and best_score - second_score >= 0.06:
+            return best_leaf
     return DEFAULT_CATEGORY
+
+
+def _category_key(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(char for char in text if char.isalnum())
 
 
 def list_categories_text() -> str:

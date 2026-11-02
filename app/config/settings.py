@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     ollama_model: str = Field(default="qwen3:4b", alias="OLLAMA_MODEL")
     ollama_timeout: float = Field(default=90.0, alias="OLLAMA_TIMEOUT")
     ollama_max_retries: int = Field(default=1, alias="OLLAMA_MAX_RETRIES")
+
+    ai_provider: str = Field(default="ollama", alias="AI_PROVIDER")
+    minimax_base_url: str = Field(
+        default="https://api.minimax.io/v1", alias="MINIMAX_BASE_URL"
+    )
+    minimax_api_key: str = Field(default="", alias="MINIMAX_API_KEY")
+    minimax_model: str = Field(default="MiniMax-M3", alias="MINIMAX_MODEL")
+    minimax_timeout: float = Field(default=60.0, alias="MINIMAX_TIMEOUT")
+    minimax_max_retries: int = Field(default=1, alias="MINIMAX_MAX_RETRIES")
     whisper_model_size: str = Field(default="base", alias="WHISPER_MODEL_SIZE")
     whisper_device: str = Field(default="cpu", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(
@@ -47,7 +56,7 @@ class Settings(BaseSettings):
 
     def __repr__(self) -> str:
         return (
-            f"Settings(env={self.app_env}, model={self.ollama_model}, "
+            f"Settings(env={self.app_env}, provider={self.ai_provider}, "
             f"tz={self.timezone})"
         )
 

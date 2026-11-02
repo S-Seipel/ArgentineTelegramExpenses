@@ -50,6 +50,15 @@ def test_dashboard_html_returns(client):
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "Chart.js" in r.text or "chart.js" in r.text.lower()
+    assert "openCategoryModal" in r.text
+    assert "category-modal" in r.text
+
+
+def test_monthly_dashboard_html_returns(client):
+    r = client.get("/dashboard/mensual")
+    assert r.status_code == 200
+    assert "Resumen mensual" in r.text
+    assert "prev-month" in r.text
 
 
 def test_api_summary_empty(client):

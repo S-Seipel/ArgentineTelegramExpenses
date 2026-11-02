@@ -3,7 +3,7 @@
 [![CI](https://github.com/S-Seipel/ArgentineTelegramExpenses/actions/workflows/ci.yml/badge.svg)](https://github.com/S-Seipel/ArgentineTelegramExpenses/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Bot personal de Telegram para registrar y consultar gastos en lenguaje natural, usando un LLM local (Ollama) y PostgreSQL.
+Bot personal de Telegram para registrar y consultar gastos en lenguaje natural, usando MiniMax u Ollama y PostgreSQL.
 
 ```
 Usuario: "gasté 10k en un café"
@@ -21,7 +21,7 @@ Bot:    "☕ Gasto registrado
 - Registra gastos desde Telegram en lenguaje natural.
 - Detecta múltiples gastos en un solo mensaje.
 - Responde consultas (total del día, semana, mes, por categoría, gasto más grande, últimos N gastos, etc.).
-- Usa IA **local** vía [Ollama](https://ollama.com), no envía tus datos a la nube.
+- Usa IA configurable: MiniMax vía API o [Ollama](https://ollama.com) local.
 - Almacena todo en PostgreSQL con SQLAlchemy 2.x.
 - Aísla al usuario permitido vía `TELEGRAM_ALLOWED_USER_ID`.
 
@@ -39,7 +39,7 @@ app/
 │   ├── service.py       # Orquestación: AI -> validación -> DB -> respuesta
 │   └── specs.py         # /hoy /semana /mes /gastos -> QuerySpec
 ├── ai/
-│   ├── service.py       # OllamaAIService + StubAIService + retry de JSON
+│   ├── service.py       # MiniMax/Ollama + StubAIService + retry de JSON
 │   ├── schemas.py       # Pydantic models (ExpenseExtraction, Intent, QueryIntent)
 │   └── prompts.py       # Prompts estrictos (la IA NUNCA genera SQL)
 ├── expenses/
@@ -122,8 +122,10 @@ TELEGRAM_ALLOWED_USER_ID=987654321
 
 DATABASE_URL=postgresql+psycopg://expenses:expenses@postgres:5432/expenses
 
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=qwen3:4b
+AI_PROVIDER=minimax
+MINIMAX_BASE_URL=https://api.minimax.io/v1
+MINIMAX_API_KEY=tu_subscription_key
+MINIMAX_MODEL=MiniMax-M3
 
 TIMEZONE=America/Argentina/Buenos_Aires
 
@@ -151,6 +153,9 @@ docker compose exec app alembic upgrade head
 La migración `0001_create_expenses` crea la tabla `expenses` con todos los índices.
 
 ---
+
+Con `AI_PROVIDER=minimax`, la clave debe ser la **Subscription Key** del Token
+Plan de MiniMax. No la subas al repositorio.
 
 ## 5. Uso
 
@@ -240,6 +245,9 @@ Los nuevos `/ingreso` y `/extra` alimentan el ciclo financiero, sin sincronizar
 el presupuesto mensual anterior. Para planificar usá `/disponible` y el panel
 **Ciclo activo** del dashboard.
 
+El resumen visual mensual está en `/dashboard/mensual`. Abre el último mes
+cerrado y permite recorrer los meses con los botones anterior/siguiente.
+
 ### Planificación por ciclo financiero (F1)
 
 Configurá el día de cobro con `/config_payday <día>`. El ciclo va de un
@@ -247,6 +255,9 @@ cobro al siguiente; `/cycle` muestra sus fechas y montos. `/ingreso` fija el
 ingreso base, `/extra` registra ingresos adicionales, `/target` define la meta
 de ahorro, `/reservar` aparta ahorro y `/ahorro_realizado` registra lo ahorrado.
 `/disponible` y `/gastar_diario` leen el Money Engine para el ciclo activo.
+Cambiar `/config_payday` conserva el ciclo actual y el historial; se aplica
+al siguiente ciclo mediante un período de transición continuo, sin huecos
+ni solapamientos.
 El disponible descuenta ahorro comprometido, gastos realizados y obligaciones
 fijas pendientes; puede ser negativo. ARS y USD se muestran por separado,
 sin conversión ni suma entre monedas.

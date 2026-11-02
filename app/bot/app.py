@@ -66,6 +66,11 @@ def build_application(
         )
     )
     application.add_handler(
+        CommandHandler(
+            ["analisis", "analisis_mes", "consejos"], _command_handler
+        )
+    )
+    application.add_handler(
         CommandHandler(["borrar", "borrar_ultimo"], _command_handler)
     )
     application.add_handler(

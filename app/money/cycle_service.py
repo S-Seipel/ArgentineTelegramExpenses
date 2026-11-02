@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from app.money.cycle_resolution import (
     CycleWindow,
     cycle_window_for,
+    successor_window_for,
 )
 from app.money.dto import CycleSummary
 from app.money.engine import (
@@ -140,8 +141,12 @@ class CycleService:
     # ------------------------------------------------------------------
 
     def _payday_day(self, user_id: int) -> int:
-        row = self.settings.get(user_id)
-        return row.payday_day if row is not None else DEFAULT_PAYDAY_DAY
+        # Read the scalar from the database rather than a possibly cached
+        # UserSettings object: a different session may have changed payday.
+        day = self.session.execute(
+            select(UserSettings.payday_day).where(UserSettings.telegram_user_id == user_id)
+        ).scalar_one_or_none()
+        return day if day is not None else DEFAULT_PAYDAY_DAY
 
     # ------------------------------------------------------------------
     # read contract
@@ -476,16 +481,17 @@ class CycleService:
                     "El ciclo actual ya está cerrado; el próximo comienza "
                     f"{(latest.end_date + timedelta(days=1)).isoformat()}."
                 )
-            # A manual close leaves no open row. Resume from that closed
-            # cycle's natural successor, preserving its frozen snapshot.
+            # A manual close leaves no open row. The successor remains
+            # contiguous, applying the currently configured payday without
+            # changing the closed cycle or its frozen snapshot.
             next_day = latest.end_date + timedelta(days=1)
-            window = cycle_window_for(next_day, latest.payday_day)
+            window = successor_window_for(next_day, self._payday_day(user_id))
             new_cycle = self._try_insert_open_cycle(
                 user_id=user_id,
                 cycle_index=self._next_cycle_index(user_id),
                 start_date=window.start_date,
                 end_date=window.end_date,
-                payday_day=latest.payday_day,
+                payday_day=window.payday_day,
             )
             if new_cycle is not None:
                 self.session.commit()
@@ -516,14 +522,14 @@ class CycleService:
         just_closed = self._latest_cycle_any_status(user_id)
         assert just_closed is not None
         next_day = just_closed.end_date + timedelta(days=1)
-        window = cycle_window_for(next_day, just_closed.payday_day)
+        window = successor_window_for(next_day, self._payday_day(user_id))
         next_cycle_index = self._next_cycle_index(user_id)
         new_cycle = self._try_insert_open_cycle(
             user_id=user_id,
             cycle_index=next_cycle_index,
             start_date=window.start_date,
             end_date=window.end_date,
-            payday_day=just_closed.payday_day,
+            payday_day=window.payday_day,
         )
         if new_cycle is not None:
             self.session.commit()

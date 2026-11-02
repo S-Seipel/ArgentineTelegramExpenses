@@ -38,6 +38,11 @@ def test_normalize_category_falls_back_to_otros() -> None:
     assert normalize_category(None) == DEFAULT_CATEGORY
 
 
+def test_normalize_category_accepts_spacing_and_short_typo() -> None:
+    assert normalize_category("super mercado") == "Supermercado"
+    assert normalize_category("super merc") == "Supermercado"
+
+
 def test_categories_structure() -> None:
     tree = get_categories()
     assert "Comida" in tree

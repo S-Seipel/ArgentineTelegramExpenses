@@ -152,11 +152,17 @@ class ExpenseService:
         from app.categories.categories import (
             DEFAULT_CATEGORY,
             get_parent_of,
+            normalize_category,
         )
 
         category_id = ExpenseService._pick_category_id(
             session, name, get_parent_of
         )
+        if category_id is None:
+            name = normalize_category(name)
+            category_id = ExpenseService._pick_category_id(
+                session, name, get_parent_of
+            )
         if category_id is None:
             category_id = ExpenseService._pick_category_id(
                 session, DEFAULT_CATEGORY, get_parent_of

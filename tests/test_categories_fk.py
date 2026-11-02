@@ -20,7 +20,10 @@ def test_categories_table_seeded(in_memory_db):
             .all()
         )
     names = {r.name for r in rows}
-    for must in {"Comida", "Café", "Uber", "Otros", "Supermercado", "Comida rápida"}:
+    for must in {
+        "Comida", "Café", "Uber", "Otros", "Supermercado",
+        "Comida rápida", "Gastos fijos",
+    }:
         assert must in names, f"Missing seed category {must!r}"
 
 

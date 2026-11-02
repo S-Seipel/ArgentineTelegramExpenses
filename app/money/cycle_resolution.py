@@ -28,9 +28,9 @@ def payday_for(year: int, month: int, payday_day: int) -> date:
 class CycleWindow:
     """Business date window for one financial cycle.
 
-    Both bounds are inclusive dates. ``start_date`` equals the payday
-    that started the cycle; ``end_date`` equals the day before the next
-    payday — that is, the last day of the cycle.
+    Both bounds are inclusive dates. A natural cycle starts on payday.
+    A transition after a payday change instead starts immediately after
+    the previous cycle; both end the day before the next payday.
     """
 
     start_date: date
@@ -58,6 +58,25 @@ def cycle_window_for(today: date, payday_day: int) -> CycleWindow:
     return CycleWindow(
         start_date=candidate,
         end_date=next_start - timedelta(days=1),
+        payday_day=payday_day,
+    )
+
+
+def successor_window_for(start_date: date, payday_day: int) -> CycleWindow:
+    """Start contiguously and end before the next configured payday.
+
+    The next payday is strictly after ``start_date``. This preserves the
+    existing cycle's boundaries when payday changes, creates one transition
+    window, and then resumes natural windows without gaps or overlaps.
+    """
+    next_payday = payday_for(start_date.year, start_date.month, payday_day)
+    if next_payday <= start_date:
+        next_payday = payday_for(
+            *_next_month(start_date.year, start_date.month), payday_day
+        )
+    return CycleWindow(
+        start_date=start_date,
+        end_date=next_payday - timedelta(days=1),
         payday_day=payday_day,
     )
 

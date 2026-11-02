@@ -16,6 +16,7 @@ usar estos comandos cuando necesitás una acción específica.
 | `/desglose_hoy` | Desglose por categoría de hoy. |
 | `/desglose_semana` | Desglose por categoría de esta semana. |
 | `/desglose_mes` | Desglose por categoría del mes. |
+| `/analisis` | Opinión de la IA sobre tus gastos y posibles ajustes. |
 | `/buscar <texto>` | Busca gastos por nombre. |
 
 Ejemplo:
