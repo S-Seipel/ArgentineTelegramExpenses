@@ -66,3 +66,23 @@ usuario sintético. Viewport de 390 px sin desbordes y consola sin errores.
 
 Las pruebas guardan datos y evidencias sintéticas fuera del repositorio.
 Los backups y credenciales reales permanecen fuera de Git.
+
+## Despliegue local
+
+La instalación se actualizó con el código `1aa6aa7`, imagen `67a97fe0fd84`
+y esquema `0019_user_preferences`. Los fingerprints de todas las columnas
+anteriores quedaron idénticos tras migrar, arrancar y consultar la app.
+El calendario ARS sigue en el primer viernes y los conteos de ciclos,
+ingresos y ahorros permanecieron iguales.
+
+Sólo se inicializó el propietario existente, con español y voz apagada.
+No se autorizó ninguna otra persona. La configuración de entorno quedó
+idéntica, PostgreSQL conservó su contenedor y volumen, y se verificaron
+backups anteriores y posteriores al cambio.
+
+La app está saludable y funciona con el usuario no privilegiado original.
+Sus 107 archivos coinciden con la imagen validada. Telegram inició y mantuvo
+polling HTTP 200 sin conflictos ni errores de autenticación. Dashboard,
+herramientas, preferencias, usuarios, ubicaciones, ciclos y métricas
+respondieron correctamente. Una interpretación sintética con el proveedor
+MiniMax configurado reconoció 100 ARS sin escribir datos ni enviar mensajes.
