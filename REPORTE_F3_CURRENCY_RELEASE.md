@@ -82,3 +82,24 @@ compatibles, en lugar de borrar configuraciones para forzar el downgrade.
   sin desbordes. Guardar otro calendario no crea movimientos financieros.
 - El control previo a publicación no encontró credenciales reales ni dumps,
   bases de datos o `.env` entre los archivos de la versión.
+
+## Despliegue local verificado
+
+La instalación se actualizó el 2026-11-02 con el código `42ef891` y la imagen
+`a01254922042`, pasando de `0015_payday_calendar_rule` a
+`0017_currency_cycles`. PostgreSQL conservó su contenedor y volumen. Se
+verificaron backups anteriores y posteriores al cambio, y la configuración
+de entorno permaneció idéntica.
+
+Los fingerprints de todas las columnas anteriores quedaron iguales después
+de migrar, arrancar y consultar la app: se conservaron los 69 gastos, 7
+plantillas fijas, 6 pagos y demás registros existentes. El calendario ARS
+sigue en el primer viernes de cada mes. Los ciclos, ingresos y registros de
+ahorro permanecen vacíos, según la decisión de cargar los montos después.
+
+La app está saludable; Telegram inició y respondió polling con HTTP 200,
+sin conflicto ni fallo de autenticación. Dashboard general y mensual,
+calendario, historial, recurrentes y archivo mensual respondieron
+correctamente. El dashboard abierto en el navegador integrado mostró ARS,
+el estado sin ciclo y la configuración del primer viernes, sin errores de
+JavaScript. La automatización diaria de backups existente se conserva.

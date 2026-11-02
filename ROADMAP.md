@@ -15,10 +15,10 @@ original 2026-09-09 prioritization and are not a completion checklist.
 | F1 R2 | Read-only MoneyEngine, cycle closing, rollover and snapshots | Closed |
 | F1 R3 | Income, extras and savings mutations | Closed |
 | F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Running locally |
-| F1.1 | Archive previous monthly income in `monthly_budget_legacy`, preserving records and rejecting legacy writes | Implemented; release checks recorded separately |
-| F2 | Cycle commands and dashboard are the primary financial interface; `/liberado` aliases `/disponible` | Implemented; release checks recorded separately |
-| F3 | Independent payday settings, cycles, rollover and money isolation per currency | Implemented; release checks recorded separately |
-| F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Running locally on migration 0014 |
+| F1.1 | Archive previous monthly income in `monthly_budget_legacy`, preserving records and rejecting legacy writes | Running locally; introduced in migration 0016 |
+| F2 | Cycle commands and dashboard are the primary financial interface; `/liberado` aliases `/disponible` | Running locally |
+| F3 | Independent payday settings, cycles, rollover and money isolation per currency | Running locally on migration 0017 |
+| F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Running locally; introduced in migration 0014 |
 | Payday calendar | Fixed monthly day or the first selected weekday; first Friday is supported explicitly | Implemented and validated on migration 0015; rollout recorded separately |
 | Local backups | Manual copies and daily Buenos Aires schedule, checksums, isolated restore and seven-copy automatic retention | Installed locally; the daily job and its first verified copy passed |
 
