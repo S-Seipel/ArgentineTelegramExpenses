@@ -520,6 +520,58 @@ async def api_month_summary(
         return month_summary_dashboard(s, user_id, today)
 
 
+def _payday_to_payload(config) -> dict:
+    rule = getattr(config, "pay_rule", "fixed_day")
+    weekday = getattr(config, "payday_weekday", None)
+    days = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+    label = (
+        f"primer {days[weekday]} de cada mes"
+        if rule == "first_weekday" else f"día {config.payday_day} de cada mes"
+    )
+    return {
+        "payday_day": config.payday_day,
+        "pay_rule": rule,
+        "payday_weekday": weekday,
+        "payday_ordinal": 1 if rule == "first_weekday" else None,
+        "payday_label": label,
+    }
+
+
+@router.get("/api/settings/payday")
+async def api_payday_settings(user_id: int = Depends(_current_user_id)):
+    from app.money import UserSettingsService
+
+    with session_scope() as session:
+        config = UserSettingsService(session).get_settings(user_id)
+        return {"payday": _payday_to_payload(config)}
+
+
+@router.patch("/api/settings/payday")
+async def api_update_payday_settings(
+    payload: dict,
+    user_id: int = Depends(_current_user_id),
+    settings: Settings = Depends(get_settings),
+):
+    from app.money import UserSettingsService
+
+    allowed = {"pay_rule", "payday_day", "payday_weekday"}
+    if not payload or set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="Configuración de cobro inválida.")
+    rule = payload.get("pay_rule", "fixed_day")
+    try:
+        with session_scope() as session:
+            config = UserSettingsService(session).set_payday_rule(
+                user_id, rule, payday_day=payload.get("payday_day"),
+                weekday=payload.get("payday_weekday"), timezone=settings.timezone,
+            )
+            return {
+                "payday": _payday_to_payload(config),
+                "message": "Calendario guardado. Los ciclos abiertos conservan sus fechas; el cambio se aplica al próximo ciclo.",
+            }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Usá un día fijo de 1 a 31 o el primer día de semana elegido (0=lunes, 6=domingo).") from exc
+
+
 @router.get("/api/cycle/current")
 async def api_cycle_current(
     user_id: int = Depends(_current_user_id),
@@ -538,7 +590,7 @@ async def api_cycle_current(
             "cycle_index": view.cycle_index,
             "start_date": view.start_date.isoformat(),
             "end_date": view.end_date.isoformat(),
-            "payday_day": view.payday_day,
+            **_payday_to_payload(view),
             "status": view.status,
         }
     }
@@ -565,8 +617,7 @@ async def api_cycle_open(
             detail={
                 "code": "cycle_rollover_required",
                 "message": (
-                    "El usuario ya tiene un ciclo cerrado. R2 implementa"
-                    " el rollover."
+                    "Ya existe historial. Usá la acción de actualizar ciclo."
                 ),
                 "latest_cycle_index": exc.latest_cycle_index,
             },
@@ -577,7 +628,7 @@ async def api_cycle_open(
             "cycle_index": view.cycle_index,
             "start_date": view.start_date.isoformat(),
             "end_date": view.end_date.isoformat(),
-            "payday_day": view.payday_day,
+            **_payday_to_payload(view),
             "status": view.status,
         }
     }
@@ -603,7 +654,7 @@ def _summary_to_payload(
         "status": summary.status,
         "start_date": summary.start_date.isoformat(),
         "end_date": summary.end_date.isoformat(),
-        "payday_day": summary.payday_day,
+        **_payday_to_payload(summary),
         "snapshot_version": summary.snapshot_version,
         "money": {
             "income": summary.base_income.to_dict(),
@@ -650,7 +701,7 @@ def _summary_to_payload(
             "cycle_index": summary.cycle_index,
             "start_date": summary.start_date.isoformat(),
             "end_date": summary.end_date.isoformat(),
-            "payday_day": summary.payday_day,
+            **_payday_to_payload(summary),
             "status": summary.status,
         }
     # MoneyByCurrency omits zero entries. Preserve that domain contract while
@@ -817,7 +868,7 @@ async def api_cycle_ensure(
             "cycle_index": cycle.cycle_index,
             "start_date": cycle.start_date.isoformat(),
             "end_date": cycle.end_date.isoformat(),
-            "payday_day": cycle.payday_day,
+            **_payday_to_payload(cycle),
             "status": cycle.status,
         }
     }
@@ -1776,6 +1827,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="panel" id="active-cycle-panel">
       <h2>Ciclo activo</h2>
       <div id="active-cycle">Cargando…</div>
+      <details style="margin-top:18px;padding-top:14px;border-top:1px solid var(--glass-border)">
+        <summary style="cursor:pointer">Configurar calendario de cobro</summary>
+        <p id="payday-current-setting" class="subtitle" style="margin-top:10px">Cargando configuración…</p>
+        <form id="payday-form" onsubmit="savePaydaySettings(event)" style="display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-top:12px">
+          <label style="flex:1 1 180px">Calendario
+            <select id="payday-rule" class="fx-input" onchange="updatePaydayFields()">
+              <option value="fixed_day">Día fijo del mes</option>
+              <option value="first_weekday">Primer día de semana del mes</option>
+            </select>
+          </label>
+          <label id="payday-day-field" style="flex:1 1 100px">Día del mes
+            <input id="payday-day" class="fx-input" type="number" min="1" max="31" step="1" value="1" required>
+          </label>
+          <label id="payday-weekday-field" hidden style="flex:1 1 140px">Día de semana
+            <select id="payday-weekday" class="fx-input" disabled>
+              <option value="0">Lunes</option><option value="1">Martes</option>
+              <option value="2">Miércoles</option><option value="3">Jueves</option>
+              <option value="4" selected>Viernes</option><option value="5">Sábado</option>
+              <option value="6">Domingo</option>
+            </select>
+          </label>
+          <button id="payday-save" type="submit" class="fx-btn fx-btn-primary">Guardar calendario</button>
+        </form>
+        <p id="payday-status" class="subtitle" role="status" style="margin-top:10px">Los ciclos ya abiertos conservan sus fechas. Guardar no abre un ciclo ni registra ingresos.</p>
+      </details>
     </div>
 
     <div class="row">
@@ -2032,6 +2108,52 @@ async function getJSON(url) {
   return r.json();
 }
 
+function updatePaydayFields() {
+  const fixed = document.getElementById('payday-rule').value === 'fixed_day';
+  document.getElementById('payday-day-field').hidden = !fixed;
+  document.getElementById('payday-day').disabled = !fixed;
+  document.getElementById('payday-weekday-field').hidden = fixed;
+  document.getElementById('payday-weekday').disabled = fixed;
+}
+
+async function refreshPaydaySettings() {
+  try {
+    const {payday} = await getJSON('/api/settings/payday');
+    document.getElementById('payday-rule').value = payday.pay_rule;
+    document.getElementById('payday-day').value = payday.payday_day;
+    document.getElementById('payday-weekday').value = payday.payday_weekday == null ? 4 : payday.payday_weekday;
+    document.getElementById('payday-current-setting').textContent = 'Configuración: ' + payday.payday_label + '.';
+    updatePaydayFields();
+  } catch (err) {
+    document.getElementById('payday-current-setting').textContent = 'No se pudo cargar el calendario de cobro.';
+  }
+}
+
+async function savePaydaySettings(event) {
+  event.preventDefault();
+  const button = document.getElementById('payday-save');
+  const status = document.getElementById('payday-status');
+  const rule = document.getElementById('payday-rule').value;
+  const payload = {pay_rule: rule};
+  if (rule === 'fixed_day') payload.payday_day = Number(document.getElementById('payday-day').value);
+  else payload.payday_weekday = Number(document.getElementById('payday-weekday').value);
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/settings/payday', {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error('payday settings ' + response.status);
+    const result = await response.json();
+    await refreshPaydaySettings();
+    await refreshActiveCycle();
+    status.textContent = result.message;
+  } catch (err) {
+    status.textContent = 'No se pudo guardar el calendario. Revisá los valores y volvé a intentarlo.';
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function refreshActiveCycle() {
   const target = document.getElementById('active-cycle');
   try {
@@ -2053,13 +2175,14 @@ async function refreshActiveCycle() {
     ];
     const currencies = new Set(fields.flatMap(([key]) => Object.keys(money[key] || {})));
     const range = escapeHTML(summary.start_date) + ' → ' + escapeHTML(summary.end_date);
+    const calendar = '<p class="subtitle">Cobro del ciclo: ' + escapeHTML(summary.payday_label) + '.</p>';
     if (!currencies.size) {
-      target.innerHTML = '<p>' + range + '</p><p>Aún no hay ingresos ni movimientos en este ciclo.</p>';
+      target.innerHTML = '<p>' + range + '</p>' + calendar + '<p>Aún no hay ingresos ni movimientos en este ciclo.</p>';
       return;
     }
     const incomeState = (money.warnings || []).includes('no_income_recorded')
       ? '<p>Aún no registraste ingresos en este ciclo.</p>' : '';
-    target.innerHTML = '<p>' + range + '</p>' + incomeState + '<div class="grid">' +
+    target.innerHTML = '<p>' + range + '</p>' + calendar + incomeState + '<div class="grid">' +
       [...currencies].sort().map(currency =>
         '<div class="panel"><h3>' + escapeHTML(currency) + '</h3>' +
         fields.map(([key, label]) => {
@@ -2743,6 +2866,7 @@ document.querySelectorAll('#period-bar button').forEach(btn => {
   });
 });
 
+if (!monthlyDashboard) refreshPaydaySettings();
 refresh().catch(err => {
   console.error(err);
   document.getElementById('subtitle').textContent = 'Error: ' + err.message;

@@ -52,6 +52,10 @@ class UserSettings(Base):
     payday_day: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+    pay_rule: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="fixed_day", server_default="fixed_day"
+    )
+    payday_weekday: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     timezone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -67,6 +71,12 @@ class UserSettings(Base):
         CheckConstraint(
             "payday_day BETWEEN 1 AND 31",
             name="ck_user_settings_payday_day_range",
+        ),
+        CheckConstraint(
+            "(pay_rule = 'fixed_day' AND payday_weekday IS NULL) OR "
+            "(pay_rule = 'first_weekday' AND payday_weekday IS NOT NULL "
+            "AND payday_weekday BETWEEN 0 AND 6)",
+            name="ck_user_settings_payday_rule",
         ),
     )
 
@@ -99,6 +109,11 @@ class FinancialCycle(Base):
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     payday_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Frozen calendar metadata: settings changes affect future cycles only.
+    pay_rule: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="fixed_day", server_default="fixed_day"
+    )
+    payday_weekday: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="open", server_default="open"
     )
@@ -134,6 +149,12 @@ class FinancialCycle(Base):
         CheckConstraint(
             "end_date >= start_date",
             name="ck_financial_cycles_date_range",
+        ),
+        CheckConstraint(
+            "(pay_rule = 'fixed_day' AND payday_weekday IS NULL) OR "
+            "(pay_rule = 'first_weekday' AND payday_weekday IS NOT NULL "
+            "AND payday_weekday BETWEEN 0 AND 6)",
+            name="ck_financial_cycles_payday_rule",
         ),
         Index(
             "ix_financial_cycles_user_status_end",

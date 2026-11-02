@@ -26,3 +26,12 @@ dist/
 __pypackages__/
 .mypy_cache/
 .ruff_cache/
+
+# Database dumps contain private financial data; never commit them.
+*.dump
+*.dump.partial
+*.dump.*.partial
+backups/
+
+# Browser QA artifacts are local, not application source.
+.playwright-mcp/

@@ -1341,7 +1341,7 @@ def _handle_config_payday_command(
     timezone: str,
     user_id: int = 0,
 ) -> str:
-    """Handle ``/config_payday <day>`` (R1).
+    """Configure a fixed monthly day or the first weekday of each month.
 
     Lazily creates the user_settings row, persisting ``payday_day`` (and
     the global timezone as a fallback) on the first call.
@@ -1349,12 +1349,31 @@ def _handle_config_payday_command(
     if not args:
         return (
             "❓ Decime el día de cobro. Ej: `/config_payday 5`.\n"
-            "Valores válidos: 1-31."
+            "Valores válidos: 1-31 o `primer_viernes`."
+        )
+    if len(args) != 1:
+        return "❓ Usá `/config_payday <1-31>` o `/config_payday primer_viernes`."
+    first_weekdays = {
+        "primer_lunes": 0, "primer_martes": 1,
+        "primer_miercoles": 2, "primer_miércoles": 2,
+        "primer_jueves": 3, "primer_viernes": 4,
+        "primer_sabado": 5, "primer_sábado": 5,
+        "primer_domingo": 6, "first_friday": 4,
+    }
+    weekday = first_weekdays.get(args[0].lower())
+    if weekday is not None:
+        with session_scope() as session:
+            config = UserSettingsService(session).set_payday_rule(
+                user_id, "first_weekday", weekday=weekday, timezone=timezone
+            )
+        return (
+            f"📅 Cobro configurado: {_payday_description(config)}.\n"
+            "Los ciclos ya abiertos conservan sus fechas; el cambio se aplica al próximo ciclo."
         )
     try:
         day = int(args[0])
     except ValueError:
-        return "❓ El día tiene que ser un número entero entre 1 y 31."
+        return "❓ El día tiene que ser un número entero entre 1 y 31 o `primer_viernes`."
     try:
         with session_scope() as session:
             UserSettingsService(session).set_payday_day(
@@ -1362,7 +1381,17 @@ def _handle_config_payday_command(
             )
     except ValueError:
         return "❓ El día tiene que estar entre 1 y 31."
-    return f"📅 Día de cobro configurado: día *{day}* del mes."
+    return (
+        f"📅 Día de cobro configurado: día *{day}* del mes.\n"
+        "Los ciclos ya abiertos conservan sus fechas; el cambio se aplica al próximo ciclo."
+    )
+
+
+def _payday_description(config) -> str:
+    if getattr(config, "pay_rule", "fixed_day") == "first_weekday":
+        days = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+        return f"primer {days[config.payday_weekday]} de cada mes"
+    return f"día {config.payday_day} de cada mes"
 
 
 def _handle_cycle_read_command(
@@ -1438,7 +1467,7 @@ def _format_cycle_summary(summary) -> str:
         f"({summary.start_date.isoformat()} → "
         f"{summary.end_date.isoformat()}) — {summary.status}"
     )
-    lines: list[str] = [label, ""]
+    lines: list[str] = [label, f"💵 Cobro: {_payday_description(summary)}", ""]
     currencies = _cycle_summary_currencies(summary)
 
     def line_for(title: str, mc) -> str:

@@ -136,7 +136,8 @@ ese presupuesto anterior. Para el disponible del ciclo usá `/disponible`.
 
 ## Ciclo financiero F1
 
-`/config_payday <día>` fija el día de cobro; el ciclo termina antes del
+`/config_payday <día>` fija un día del mes y `/config_payday primer_viernes`
+configura el primer viernes de cada mes; el ciclo termina antes del
 siguiente cobro. `/cycle` muestra el ciclo activo. `/disponible` y
 `/gastar_diario` consultan el Money Engine, con ARS y USD independientes:
 no hay conversión ni total combinado. El disponible puede ser negativo.
@@ -144,6 +145,7 @@ no hay conversión ni total combinado. El disponible puede ser negativo.
 | Comando | Uso |
 |---|---|
 | `/config_payday <día>` | Configura el día de cobro. |
+| `/config_payday primer_viernes` | Cobra el primer viernes de cada mes, según el calendario real. |
 | `/cycle` | Muestra fechas y estado del ciclo. |
 | `/ingreso <monto>` | Fija el ingreso base del ciclo. |
 | `/extra <monto> [nota]` | Registra ingreso extra. |
@@ -159,6 +161,11 @@ El dashboard local contiene **Ciclo activo**, separado por moneda. La API
 con gasto diario histórico `null`. Un saldo cero se muestra como cero.
 Cuando no hay ciclo para hoy, **Abrir o actualizar ciclo** permite abrirlo o
 actualizarlo explícitamente. Las inversiones se gestionan fuera de la app.
+El calendario también se configura desde **Ciclo activo → Configurar
+calendario de cobro**. Guardarlo conserva los ciclos abiertos y el historial;
+se aplica al próximo ciclo y no abre ciclos ni registra ingresos. La API
+`GET/PATCH /api/settings/payday` usa `pay_rule=fixed_day` con `payday_day`,
+o `pay_rule=first_weekday` con `payday_weekday=4` para el primer viernes.
 
 ## Compromisos recurrentes F1.5
 

@@ -16,6 +16,8 @@ original 2026-09-09 prioritization and are not a completion checklist.
 | F1 R3 | Income, extras and savings mutations | Closed |
 | F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Running locally |
 | F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Running locally on migration 0014 |
+| Payday calendar | Fixed monthly day or the first selected weekday; first Friday is supported explicitly | Implemented and validated on migration 0015; rollout recorded separately |
+| Local backups | Manual copies and daily Buenos Aires schedule, checksums, isolated restore and seven-copy automatic retention | Installed locally; the daily job and its first verified copy passed |
 
 The existing local installation was updated on 2026-11-02. Telegram polling,
 the dashboard, and the configured text provider were checked after startup.
@@ -23,19 +25,35 @@ Whisper's cached model runs as the non-root app user; silent audio is rejected
 without inventing a transcription. The existing environment configuration
 was preserved. Original database records and currency totals were unchanged.
 
-Release validation: 667 normal tests on the Python 3.12 runtime image,
-31 PostgreSQL tests plus the R1/R2/R3 concurrency scripts, and zero known
-Python dependency vulnerabilities in that image. Database upgrade from the
-previous installation was rehearsed on an isolated restored backup first.
+Release validation includes the normal suite on the Python 3.12 runtime
+image, PostgreSQL migration and concurrency tests, runtime dependency
+auditing, browser checks and a rehearsal on an isolated restored backup.
+Exact results are recorded per release rather than freezing a test count
+in this roadmap.
 
 F1.5 forecasts the cycle and retains one overdue occurrence per recurring
 template; it does not accumulate forgotten monthly installments as debt.
 Closed snapshots remain immutable. Ordinary reminders reserve no money.
 
-The earlier F1.1/F2+/F3+ references are design ideas, without an accepted
-implementation breakdown. They are not additional R blocks of F1. There is
-no automatic legacy-budget migration, currency conversion or independent
-cycle calendar per currency in the implemented scope.
+The user chose **planning only** for the earlier F1.1/F2/F3 ideas on
+2026-11-02. They are not additional R blocks of F1, and this release does
+not implement their migrations, deprecations or compatibility changes:
+
+- **F1.1 — Legacy history:** define an optional, explicit archival path for
+  MonthlyBudget, with a preview and recovery plan. Preserve existing data
+  and `/liberado` while the migration remains a proposal.
+- **F2 — Command transition:** plan how the newer cycle commands could
+  become the primary interface, with compatibility tests and a clear
+  transition for users. Do not remove or silently rewire legacy commands.
+- **F3 — Independent calendars:** evaluate whether different currencies
+  need separate payday schedules, define their interactions and test
+  isolation. Keep the current shared cycle and separate ARS/USD amounts
+  until that scope is defined; no currency conversion is implied.
+
+The implemented calendar supports a real first Friday of each month in
+the existing cycle model. Changing its rule preserves already-open and
+closed cycles and applies to their contiguous successors; it does not
+introduce the independent per-currency calendars considered for F3.
 
 ---
 
@@ -172,12 +190,17 @@ Things to clean up while we have time.
   `app/bot/handlers.py:42`.
 - Without this, commands silently fail in groups.
 
-### 4.2 Backup automation
+### 4.2 Backup automation — implemented
 **Value:** protects the DB against accidental wipe.
 **Effort:** ~1h.
 
-- Daily `pg_dump` to a timestamped file in a `backups` volume.
-- Keep last 7 days, delete older.
+- Host-side custom-format `pg_dump` backups in the user's private
+  Application Support directory, validated with `pg_restore --list` and SHA-256.
+- Daily 03:00 Buenos Aires cutoff with login/wake catch-up; a lightweight
+  LaunchAgent checks every 15 minutes while the script prevents duplicates.
+- Retain the latest seven valid automatic copies; manual copies remain
+  outside retention. Restore drills use a disposable database, never an
+  automatic replacement of the live database. See README for commands.
 
 ### 4.3 Metric export (Prometheus)
 **Value:** observability if you ever scale past 1 user.

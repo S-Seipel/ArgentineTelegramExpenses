@@ -250,7 +250,8 @@ cerrado y permite recorrer los meses con los botones anterior/siguiente.
 
 ### Planificación por ciclo financiero (F1)
 
-Configurá el día de cobro con `/config_payday <día>`. El ciclo va de un
+Configurá un día fijo con `/config_payday <día>` o el primer viernes de
+cada mes con `/config_payday primer_viernes`. El ciclo va de un
 cobro al siguiente; `/cycle` muestra sus fechas y montos. `/ingreso` fija el
 ingreso base, `/extra` registra ingresos adicionales, `/target` define la meta
 de ahorro, `/reservar` aparta ahorro y `/ahorro_realizado` registra lo ahorrado.
@@ -258,6 +259,18 @@ de ahorro, `/reservar` aparta ahorro y `/ahorro_realizado` registra lo ahorrado.
 Cambiar `/config_payday` conserva el ciclo actual y el historial; se aplica
 al siguiente ciclo mediante un período de transición continuo, sin huecos
 ni solapamientos.
+La regla del primer viernes usa el calendario real: por ejemplo,
+6 de noviembre → 3 de diciembre de 2026. El primer viernes siguiente es
+el 4 de diciembre; el historial conserva la regla con la que abrió cada ciclo.
+El panel **Ciclo activo → Configurar calendario de cobro** permite guardar
+la misma configuración sin usar Telegram. Guardar el calendario no abre
+un ciclo ni registra ingresos; los montos se cargan por separado.
+La API `GET/PATCH /api/settings/payday` consulta y guarda `pay_rule`:
+`fixed_day` con `payday_day` de 1 a 31, o `first_weekday` con
+`payday_weekday` de 0 (lunes) a 6 (domingo). El primer viernes es
+`{"pay_rule":"first_weekday","payday_weekday":4}`; su ordinal siempre es 1.
+Las instalaciones existentes deben ejecutar `alembic upgrade head` para
+aplicar `0015_payday_calendar_rule` antes de iniciar esta versión.
 El disponible descuenta ahorro comprometido, gastos realizados y obligaciones
 fijas pendientes; puede ser negativo. ARS y USD se muestran por separado,
 sin conversión ni suma entre monedas.
@@ -485,6 +498,99 @@ docker compose exec app alembic upgrade head
 
 ---
 
+## Backups locales
+
+Los scripts de `scripts/` usan Python 3.11 o superior y el contenedor
+PostgreSQL existente; no modifican los gastos para hacer una copia.
+El destino predeterminado es
+`~/Library/Application Support/telegram-expenses/backups`.
+
+**Copia manual:**
+
+```bash
+python3 scripts/backup_database.py
+```
+
+La salida indica el archivo `.dump`, tamaño y SHA-256. Cada copia se crea
+como archivo temporal, se valida con `pg_restore --list` y se publica junto
+con un JSON de metadatos. Los directorios usan permisos `0700`; las copias,
+metadatos y estado usan `0600`. No subas `.env`, dumps ni el directorio de
+backups a Git.
+
+**Modo automático e instalación en macOS:**
+
+```bash
+# Ejecutar una comprobación automática del corte diario, sin instalar un job.
+python3 scripts/backup_database.py --scheduled
+
+# Revisar el plan; no instala ni activa nada.
+python3 scripts/install_backups.py
+
+# Generar un plist para revisar antes de instalar.
+python3 scripts/install_backups.py --output /tmp/telegram-expenses-backup.plist
+plutil -lint /tmp/telegram-expenses-backup.plist
+
+# Copiar el script y el LaunchAgent a ubicaciones persistentes, sin activarlo.
+python3 scripts/install_backups.py --install
+
+# Instalar y activar expresamente el LaunchAgent.
+python3 scripts/install_backups.py --install --enable
+```
+
+El instalador fija el contexto Docker activo para que el trabajo use el
+mismo entorno después de reiniciar sesión. El LaunchAgent
+`com.telegram-expenses.database-backup` comprueba cada 15 minutos y al
+iniciar sesión si corresponde ejecutar `backup_database.py --scheduled`.
+El script permite **una copia automática por corte diario de las 03:00 de
+Buenos Aires**, independientemente de la zona horaria de la Mac. Si el
+equipo estaba dormido o Docker no estaba disponible, recupera el último
+corte pendiente al volver a ejecutarse; no genera una copia por cada
+comprobación ni acumula ejecuciones de todos los días omitidos.
+
+Se conservan las **últimas siete copias automáticas válidas**; la retención
+no elimina copias manuales. Se vuelve a verificar el SHA-256 antes de dar
+por cumplido un corte y antes de aplicar retención. El archivo
+`backup-status.json`, dentro del destino, registra el último resultado.
+Los logs del LaunchAgent quedan en la carpeta hermana `logs`.
+
+**Ensayo de restauración en una base descartable:**
+
+Elegí una copia y compará `shasum -a 256` con el campo `sha256` del JSON
+acompañante. Este ejemplo crea otro contenedor, sin publicar puertos ni
+usar el volumen de la base real:
+
+```bash
+TGE_BACKUP="/ruta/a/la/copia.dump"
+shasum -a 256 "$TGE_BACKUP"
+
+docker run --detach --name telegram_expenses_restore_check \
+  --env POSTGRES_USER=expenses \
+  --env POSTGRES_PASSWORD=restore-check-only \
+  --env POSTGRES_DB=expenses_restore \
+  postgres:15-alpine
+
+# Esperar a que esta comprobación indique que la base está lista.
+docker exec telegram_expenses_restore_check \
+  pg_isready --username expenses --dbname expenses_restore
+
+docker exec -i telegram_expenses_restore_check \
+  pg_restore --exit-on-error --no-owner --no-privileges \
+  --username expenses --dbname expenses_restore < "$TGE_BACKUP"
+
+docker exec telegram_expenses_restore_check \
+  psql --username expenses --dbname expenses_restore \
+  --command "SELECT version_num FROM alembic_version;"
+
+# Eliminar únicamente el contenedor y volumen descartables de este ensayo.
+docker rm --force --volumes telegram_expenses_restore_check
+```
+
+La automatización crea y valida copias; **no restaura ni reemplaza la base
+real automáticamente**. Una restauración real requiere elegir la copia y
+el destino por separado, después de validar el ensayo.
+
+---
+
 ## 11. Problemas comunes
 
 ### `telegram.error.InvalidToken`
@@ -544,7 +650,9 @@ docker compose exec app alembic upgrade head
 
 ## 13. Privacidad
 
-- Toda la IA corre local con Ollama, nada sale a internet.
+- Con `AI_PROVIDER=ollama`, la interpretación del texto y la transcripción
+  de voz son locales. Con `AI_PROVIDER=minimax`, los mensajes y el contexto
+  de análisis se envían a MiniMax; la transcripción de voz sigue siendo local.
 - Postgres **no** se expone al host (`127.0.0.1:5432`).
 - Ollama **no** se expone al host.
 - El bot sólo responde a tu `TELEGRAM_ALLOWED_USER_ID`.

@@ -344,7 +344,7 @@ def _help_text() -> str:
         "/liberado — resumen mensual legacy\n"
         "/repair_fixed_payments — reparar espejos de pagos fijos\n"
         "*Ciclo:*\n"
-        "/config_payday <día> — día de cobro\n"
+        "/config_payday <día|primer_viernes> — calendario de cobro\n"
         "/cycle — resumen completo del ciclo activo\n"
         "/disponible — disponible para gastar este ciclo\n"
         "/gastar_diario — gasto diario sugerido\n"

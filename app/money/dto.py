@@ -199,6 +199,8 @@ class CycleSummary:
     carried_over_fixed: tuple[CarriedOverFixedOccurrence, ...] = field(
         default_factory=tuple
     )
+    pay_rule: str = "fixed_day"
+    payday_weekday: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

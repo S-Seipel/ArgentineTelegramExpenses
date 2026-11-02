@@ -73,6 +73,22 @@ class UserSettingsService:
             user_id, payday_day, timezone=timezone
         )
 
+    def set_payday_rule(
+        self, user_id: int, pay_rule: str, *, weekday: Optional[int] = None,
+        payday_day: Optional[int] = None, timezone: Optional[str] = None,
+    ) -> UserSettings:
+        return self.repo.upsert_payday_rule(
+            user_id, pay_rule, weekday=weekday,
+            payday_day=payday_day, timezone=timezone,
+        )
+
+    def set_first_weekday(
+        self, user_id: int, weekday: int = 4, *, timezone: Optional[str] = None,
+    ) -> UserSettings:
+        return self.set_payday_rule(
+            user_id, "first_weekday", weekday=weekday, timezone=timezone,
+        )
+
 
 class CycleRolloverRequired(RuntimeError):
     """Raised when the user has history but no open cycle for ``today``.
@@ -118,6 +134,8 @@ class CurrentCycleView:
     end_date: date
     payday_day: int
     status: str
+    pay_rule: str = "fixed_day"
+    payday_weekday: Optional[int] = None
 
 
 class CycleService:
@@ -141,12 +159,19 @@ class CycleService:
     # ------------------------------------------------------------------
 
     def _payday_day(self, user_id: int) -> int:
-        # Read the scalar from the database rather than a possibly cached
-        # UserSettings object: a different session may have changed payday.
-        day = self.session.execute(
-            select(UserSettings.payday_day).where(UserSettings.telegram_user_id == user_id)
-        ).scalar_one_or_none()
-        return day if day is not None else DEFAULT_PAYDAY_DAY
+        return self._payday_config(user_id)["payday_day"]
+
+    def _payday_config(self, user_id: int) -> dict:
+        # Read scalars rather than a possibly cached UserSettings object.
+        row = self.session.execute(
+            select(UserSettings.payday_day, UserSettings.pay_rule, UserSettings.payday_weekday)
+            .where(UserSettings.telegram_user_id == user_id)
+        ).one_or_none()
+        return {
+            "payday_day": row.payday_day if row else DEFAULT_PAYDAY_DAY,
+            "pay_rule": row.pay_rule if row else "fixed_day",
+            "payday_weekday": row.payday_weekday if row else None,
+        }
 
     # ------------------------------------------------------------------
     # read contract
@@ -166,6 +191,8 @@ class CycleService:
             start_date=open_cycle.start_date,
             end_date=open_cycle.end_date,
             payday_day=open_cycle.payday_day,
+            pay_rule=open_cycle.pay_rule,
+            payday_weekday=open_cycle.payday_weekday,
         )
         if not window.contains(today):
             return None
@@ -176,6 +203,8 @@ class CycleService:
             end_date=open_cycle.end_date,
             payday_day=open_cycle.payday_day,
             status=open_cycle.status,
+            pay_rule=open_cycle.pay_rule,
+            payday_weekday=open_cycle.payday_weekday,
         )
 
     # ------------------------------------------------------------------
@@ -221,8 +250,7 @@ class CycleService:
                 return current
             raise CycleRolloverRequired(user_id, latest, today)
 
-        payday_day = self._payday_day(user_id)
-        window = cycle_window_for(today, payday_day)
+        window = cycle_window_for(today, **self._payday_config(user_id))
         opened_at = datetime.now(timezone.utc)
 
         try:
@@ -231,7 +259,9 @@ class CycleService:
                 cycle_index=1,
                 start_date=window.start_date,
                 end_date=window.end_date,
-                payday_day=payday_day,
+                payday_day=window.payday_day,
+                pay_rule=window.pay_rule,
+                payday_weekday=window.payday_weekday,
                 opened_at=opened_at,
             )
             self.session.commit()
@@ -247,6 +277,8 @@ class CycleService:
             end_date=row.end_date,
             payday_day=row.payday_day,
             status=row.status,
+            pay_rule=row.pay_rule,
+            payday_weekday=row.payday_weekday,
         )
 
     def _reset_session(self) -> None:
@@ -485,13 +517,15 @@ class CycleService:
             # contiguous, applying the currently configured payday without
             # changing the closed cycle or its frozen snapshot.
             next_day = latest.end_date + timedelta(days=1)
-            window = successor_window_for(next_day, self._payday_day(user_id))
+            window = successor_window_for(next_day, **self._payday_config(user_id))
             new_cycle = self._try_insert_open_cycle(
                 user_id=user_id,
                 cycle_index=self._next_cycle_index(user_id),
                 start_date=window.start_date,
                 end_date=window.end_date,
                 payday_day=window.payday_day,
+                pay_rule=window.pay_rule,
+                payday_weekday=window.payday_weekday,
             )
             if new_cycle is not None:
                 self.session.commit()
@@ -522,7 +556,7 @@ class CycleService:
         just_closed = self._latest_cycle_any_status(user_id)
         assert just_closed is not None
         next_day = just_closed.end_date + timedelta(days=1)
-        window = successor_window_for(next_day, self._payday_day(user_id))
+        window = successor_window_for(next_day, **self._payday_config(user_id))
         next_cycle_index = self._next_cycle_index(user_id)
         new_cycle = self._try_insert_open_cycle(
             user_id=user_id,
@@ -530,6 +564,8 @@ class CycleService:
             start_date=window.start_date,
             end_date=window.end_date,
             payday_day=window.payday_day,
+            pay_rule=window.pay_rule,
+            payday_weekday=window.payday_weekday,
         )
         if new_cycle is not None:
             self.session.commit()
@@ -613,6 +649,8 @@ class CycleService:
         start_date: date,
         end_date: date,
         payday_day: int,
+        pay_rule: str = "fixed_day",
+        payday_weekday: Optional[int] = None,
     ) -> Optional[FinancialCycle]:
         obj = FinancialCycle(
             telegram_user_id=user_id,
@@ -620,6 +658,8 @@ class CycleService:
             start_date=start_date,
             end_date=end_date,
             payday_day=payday_day,
+            pay_rule=pay_rule,
+            payday_weekday=payday_weekday,
             status="open",
             opened_at=datetime.now(timezone.utc),
         )

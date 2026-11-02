@@ -25,7 +25,7 @@ class UserSettingsRepository:
     def get(self, user_id: int) -> Optional[UserSettings]:
         stmt = select(UserSettings).where(
             UserSettings.telegram_user_id == user_id
-        )
+        ).execution_options(populate_existing=True)
         return self.session.execute(stmt).scalar_one_or_none()
 
     def get_or_default(self, user_id: int) -> UserSettings:
@@ -40,6 +40,8 @@ class UserSettingsRepository:
         return UserSettings(
             telegram_user_id=user_id,
             payday_day=DEFAULT_PAYDAY_DAY,
+            pay_rule="fixed_day",
+            payday_weekday=None,
             timezone=None,
         )
 
@@ -55,18 +57,42 @@ class UserSettingsRepository:
         Lazily creates the row the first time payday is configured.
         Returns the freshly committed row.
         """
-        if payday_day < 1 or payday_day > 31:
-            raise ValueError("payday_day must be between 1 and 31")
+        return self.upsert_payday_rule(
+            user_id, "fixed_day", payday_day=payday_day, timezone=timezone
+        )
+
+    def upsert_payday_rule(
+        self, user_id: int, pay_rule: str, *, weekday: Optional[int] = None,
+        payday_day: Optional[int] = None, timezone: Optional[str] = None,
+    ) -> UserSettings:
+        """Persist a valid monthly calendar without opening a financial cycle."""
+        if pay_rule == "fixed_day":
+            if type(payday_day) is not int or not 1 <= payday_day <= 31:
+                raise ValueError("payday_day must be between 1 and 31")
+            if weekday is not None:
+                raise ValueError("fixed_day must not specify weekday")
+        elif pay_rule == "first_weekday":
+            if type(weekday) is not int or not 0 <= weekday <= 6:
+                raise ValueError("weekday must be between 0 (Monday) and 6 (Sunday)")
+            if payday_day is not None:
+                raise ValueError("first_weekday must not specify payday_day")
+        else:
+            raise ValueError("pay_rule must be fixed_day or first_weekday")
         row = self.get(user_id)
         if row is None:
             row = UserSettings(
                 telegram_user_id=user_id,
-                payday_day=payday_day,
+                payday_day=payday_day if payday_day is not None else DEFAULT_PAYDAY_DAY,
+                pay_rule=pay_rule,
+                payday_weekday=weekday,
                 timezone=timezone,
             )
             self.session.add(row)
         else:
-            row.payday_day = payday_day
+            if payday_day is not None:
+                row.payday_day = payday_day
+            row.pay_rule = pay_rule
+            row.payday_weekday = weekday
             if timezone is not None:
                 row.timezone = timezone
         self.session.commit()
@@ -142,6 +168,8 @@ class FinancialCycleRepository:
         end_date: date,
         payday_day: int,
         opened_at: datetime,
+        pay_rule: str = "fixed_day",
+        payday_weekday: Optional[int] = None,
     ) -> FinancialCycle:
         """Insert one open cycle. Caller owns the transaction.
 
@@ -155,6 +183,8 @@ class FinancialCycleRepository:
             start_date=start_date,
             end_date=end_date,
             payday_day=payday_day,
+            pay_rule=pay_rule,
+            payday_weekday=payday_weekday,
             status="open",
             opened_at=opened_at,
         )
