@@ -23,8 +23,8 @@ USER = 123456
 
 def _cycle(today=date(2026, 10, 15), payday=1, income="1000", currency="ARS"):
     with session_scope() as s:
-        UserSettingsService(s).set_payday_day(USER, payday)
-        cycle_id = CycleService(s).open_initial_cycle(USER, today).cycle_id
+        UserSettingsService(s).set_payday_day(USER, payday, currency=currency)
+        cycle_id = CycleService(s).open_initial_cycle(USER, today, currency=currency).cycle_id
         MoneyStateService(s).set_income(USER, cycle_id, currency, Decimal(income))
     return cycle_id
 
@@ -351,26 +351,36 @@ def test_passage_of_time_does_not_release_reserved_occurrences(in_memory_db):
 
 def test_currency_partition_and_negative_available(in_memory_db):
     cycle_id = _cycle()
+    usd_cycle = _cycle(currency="USD", income="0")
     _recurring(amount="125.75")
     _recurring(amount="20.01", currency="USD")
     summary = _summary(cycle_id)
-    assert summary.pending_recurring_obligations.to_dict() == {"ARS": "125.75", "USD": "20.01"}
-    assert summary.available_to_spend.to_dict() == {"ARS": "874.25", "USD": "-20.01"}
-    assert "available_negative" in summary.warnings
+    usd = _summary(usd_cycle)
+    assert summary.pending_recurring_obligations.to_dict() == {"ARS": "125.75"}
+    assert usd.pending_recurring_obligations.to_dict() == {"USD": "20.01"}
+    assert summary.available_to_spend.to_dict() == {"ARS": "874.25"}
+    assert usd.available_to_spend.to_dict() == {"USD": "-20.01"}
+    assert "available_negative" not in summary.warnings
+    assert "available_negative" in usd.warnings
 
 
 def test_multi_currency_savings_warning_compares_each_currency(in_memory_db):
     cycle_id = _cycle()
+    usd_cycle = _cycle(currency="USD", income="0")
     with session_scope() as s:
         state = MoneyStateService(s)
         state.set_savings_reserved(USER, cycle_id, "ARS", Decimal("100"))
-        state.set_savings_reserved(USER, cycle_id, "USD", Decimal("10"))
+        state.set_savings_reserved(USER, usd_cycle, "USD", Decimal("10"))
         state.record_savings_realized(USER, cycle_id, "ARS", Decimal("50"), "save-ars")
-        state.record_savings_realized(USER, cycle_id, "USD", Decimal("20"), "save-usd")
+        state.record_savings_realized(USER, usd_cycle, "USD", Decimal("20"), "save-usd")
     summary = _summary(cycle_id)
-    assert "savings_realized_exceeds_reserved" in summary.warnings
-    assert "available_negative" in summary.warnings
-    assert summary.available_to_spend.to_dict() == {"ARS": "900.00", "USD": "-20.00"}
+    usd = _summary(usd_cycle)
+    assert "savings_realized_exceeds_reserved" not in summary.warnings
+    assert "savings_realized_exceeds_reserved" in usd.warnings
+    assert "available_negative" not in summary.warnings
+    assert "available_negative" in usd.warnings
+    assert summary.available_to_spend.to_dict() == {"ARS": "900.00"}
+    assert usd.available_to_spend.to_dict() == {"USD": "-20.00"}
 
 
 def test_close_requires_force_and_history_never_recomputes(in_memory_db):

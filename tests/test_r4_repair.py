@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.database.database import session_scope
 from app.expenses.models import Expense
-from app.fixed_expenses.models import FixedExpensePayment
+from app.fixed_expenses.models import FixedExpense, FixedExpensePayment
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.service import (
     FixedExpenseDraft,
@@ -63,6 +63,18 @@ def test_repair_is_user_scoped(in_memory_db):
         result = FixedExpenseService(FixedExpenseRepository(session)).repair_mirrors(1)
         assert (result.scanned, result.repaired) == (0, 0)
         assert len(MoneyEngine(session).detect_invariant_violations(2)) == 1
+
+
+def test_repair_checks_all_currencies_when_default_diagnostic_is_ars(in_memory_db):
+    _setup_paid_payment_without_expense_id(1)
+    with session_scope() as session:
+        session.execute(select(FixedExpense)).scalar_one().currency = "USD"
+    with session_scope() as session:
+        assert MoneyEngine(session).detect_invariant_violations(1) == []
+        assert len(MoneyEngine(session).detect_invariant_violations(1, currency="USD")) == 1
+        result = FixedExpenseService(FixedExpenseRepository(session)).repair_mirrors(1)
+        assert result.repaired == 1
+        assert MoneyEngine(session).detect_invariant_violations(1, currency=None) == []
 
 
 def test_repair_preserves_frozen_carry_over_values(in_memory_db):

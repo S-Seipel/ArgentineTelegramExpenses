@@ -15,6 +15,9 @@ original 2026-09-09 prioritization and are not a completion checklist.
 | F1 R2 | Read-only MoneyEngine, cycle closing, rollover and snapshots | Closed |
 | F1 R3 | Income, extras and savings mutations | Closed |
 | F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Running locally |
+| F1.1 | Archive previous monthly income in `monthly_budget_legacy`, preserving records and rejecting legacy writes | Implemented; release checks recorded separately |
+| F2 | Cycle commands and dashboard are the primary financial interface; `/liberado` aliases `/disponible` | Implemented; release checks recorded separately |
+| F3 | Independent payday settings, cycles, rollover and money isolation per currency | Implemented; release checks recorded separately |
 | F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Running locally on migration 0014 |
 | Payday calendar | Fixed monthly day or the first selected weekday; first Friday is supported explicitly | Implemented and validated on migration 0015; rollout recorded separately |
 | Local backups | Manual copies and daily Buenos Aires schedule, checksums, isolated restore and seven-copy automatic retention | Installed locally; the daily job and its first verified copy passed |
@@ -35,25 +38,17 @@ F1.5 forecasts the cycle and retains one overdue occurrence per recurring
 template; it does not accumulate forgotten monthly installments as debt.
 Closed snapshots remain immutable. Ordinary reminders reserve no money.
 
-The user chose **planning only** for the earlier F1.1/F2/F3 ideas on
-2026-11-02. They are not additional R blocks of F1, and this release does
-not implement their migrations, deprecations or compatibility changes:
+F1.1/F2/F3 extend F1; they are not additional R blocks. Migration 0016
+renames the old monthly table without copying its amounts into cycle
+income. Its compatibility API remains read-only. Migration 0017 introduces
+currency calendars and independent cycle identities. Each currency has its
+own current cycle, closing snapshot, successor and pending obligations.
+Existing closed mixed-currency snapshots remain unchanged and readable.
+There is no currency conversion or combined ARS/USD total.
 
-- **F1.1 — Legacy history:** define an optional, explicit archival path for
-  MonthlyBudget, with a preview and recovery plan. Preserve existing data
-  and `/liberado` while the migration remains a proposal.
-- **F2 — Command transition:** plan how the newer cycle commands could
-  become the primary interface, with compatibility tests and a clear
-  transition for users. Do not remove or silently rewire legacy commands.
-- **F3 — Independent calendars:** evaluate whether different currencies
-  need separate payday schedules, define their interactions and test
-  isolation. Keep the current shared cycle and separate ARS/USD amounts
-  until that scope is defined; no currency conversion is implied.
-
-The implemented calendar supports a real first Friday of each month in
-the existing cycle model. Changing its rule preserves already-open and
-closed cycles and applies to their contiguous successors; it does not
-introduce the independent per-currency calendars considered for F3.
+The first-Friday calendar in ARS remains configured. An explicit calendar
+change affects only that currency's successors, preserving open and closed
+cycle dates. Saving a calendar does not create a cycle or enter income.
 
 ---
 

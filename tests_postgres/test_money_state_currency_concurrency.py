@@ -25,15 +25,15 @@ def pg_cycle(pg_database_url):
         connection.execute(text("CREATE SCHEMA public"))
     run_alembic("upgrade", "head", database_url=pg_database_url)
     with Session(engine) as session:
-        cycle = FinancialCycle(
-            telegram_user_id=1, cycle_index=1,
+        cycles = {currency: FinancialCycle(
+            telegram_user_id=1, cycle_index=1, currency=currency,
             start_date=date(2026, 10, 1), end_date=date(2026, 10, 31),
             payday_day=1, status="open",
-        )
-        session.add(cycle)
+        ) for currency in ("ARS", "USD")}
+        session.add_all(cycles.values())
         session.commit()
-        cycle_id = cycle.id
-    yield engine, cycle_id
+        cycle_ids = {currency: cycle.id for currency, cycle in cycles.items()}
+    yield engine, cycle_ids
     engine.dispose()
 
 
@@ -47,7 +47,7 @@ def pg_cycle(pg_database_url):
 def test_concurrent_source_key_conflicting_currency(
     pg_cycle, method, model
 ):
-    engine, cycle_id = pg_cycle
+    engine, cycle_ids = pg_cycle
     barrier = Barrier(2)
 
     def record(currency):
@@ -55,7 +55,7 @@ def test_concurrent_source_key_conflicting_currency(
             barrier.wait(timeout=10)
             try:
                 row = getattr(MoneyStateService(session), method)(
-                    user_id=1, cycle_id=cycle_id, currency=currency,
+                    user_id=1, cycle_id=cycle_ids[currency], currency=currency,
                     amount=Decimal("10"), source_key="race",
                 )
                 return "ok", row.currency
@@ -70,7 +70,7 @@ def test_concurrent_source_key_conflicting_currency(
     winner_currency = next(currency for outcome, currency in results if outcome == "ok")
     with Session(engine) as session:
         rows = session.execute(
-            select(model).where(model.cycle_id == cycle_id, model.source_key == "race")
+            select(model).where(model.cycle_id.in_(cycle_ids.values()), model.source_key == "race")
         ).scalars().all()
         assert len(rows) == 1
         assert rows[0].currency == winner_currency

@@ -113,7 +113,7 @@ def test_first_friday_35_day_cycle_rolls_over_once_under_concurrent_callers(fres
         UserSettingsService(session).set_first_weekday(
             42, weekday=4, timezone="America/Argentina/Buenos_Aires"
         )
-        cycle = CycleService(session).open_initial_cycle(42, date(2026, 10, 2))
+        cycle = CycleService(session).open_initial_cycle(42, date(2026, 10, 2), currency="USD")
         cycle_id = cycle.cycle_id
         assert (cycle.start_date, cycle.end_date) == (date(2026, 10, 2), date(2026, 11, 5))
         assert (cycle.end_date - cycle.start_date).days + 1 == 35
@@ -125,7 +125,7 @@ def test_first_friday_35_day_cycle_rolls_over_once_under_concurrent_callers(fres
 
     def ensure():
         with factory() as session:
-            return CycleService(session).ensure_current_cycle(42, date(2026, 11, 6)).id
+            return CycleService(session).ensure_current_cycle(42, date(2026, 11, 6), currency="USD").id
 
     with ThreadPoolExecutor(max_workers=12) as pool:
         futures = [pool.submit(ensure) for _ in range(12)]
@@ -143,6 +143,6 @@ def test_first_friday_35_day_cycle_rolls_over_once_under_concurrent_callers(fres
         frozen = deepcopy(closed.closing_snapshot)
         assert frozen["money"]["income"] == {"USD": "350.00"}
         assert frozen["money"]["daily_safe_to_spend"] is None
-        CycleService(session).ensure_current_cycle(42, date(2026, 11, 7))
+        CycleService(session).ensure_current_cycle(42, date(2026, 11, 7), currency="USD")
         session.refresh(closed)
         assert closed.closing_snapshot == frozen

@@ -35,7 +35,7 @@ def test_reading_default_calendar_is_read_only(client):
     assert response.json()["payday"] == {
         "pay_rule": "fixed_day", "payday_day": 1,
         "payday_weekday": None, "payday_ordinal": None,
-        "payday_label": "día 1 de cada mes",
+        "payday_label": "día 1 de cada mes", "currency": "ARS", "inherited": False,
     }
     with session_scope() as session:
         assert session.query(UserSettings).count() == 0
@@ -132,3 +132,105 @@ def test_first_friday_history_keeps_calendar_after_settings_change(client):
     assert history[0]["payday_label"] == "primer viernes de cada mes"
     assert history[0]["start_date"] == "2026-11-06"
     assert history[0]["end_date"] == "2026-12-03"
+
+
+def test_telegram_currency_calendars_are_independent_without_creating_cycles(client):
+    user = get_settings().telegram_allowed_user_id
+    ars = _handle_config_payday_command(["primer_viernes", "ARS"], timezone="UTC", user_id=user)
+    usd = _handle_config_payday_command(["15", "usd"], timezone="UTC", user_id=user)
+    assert "ARS" in ars and "USD" in usd
+    assert client.get("/api/settings/payday").json()["payday"]["payday_weekday"] == 4
+    usd_settings = client.get("/api/settings/payday?currency=USD").json()["payday"]
+    assert usd_settings["currency"] == "USD"
+    assert usd_settings["payday_day"] == 15 and usd_settings["pay_rule"] == "fixed_day"
+    _assert_no_cycle_or_income()
+
+
+@pytest.mark.parametrize("args", [["primer_viernes", "USDD"], ["15", "12"], ["15", "USD", "extra"]])
+def test_telegram_rejects_invalid_currency_without_writing(client, args):
+    user = get_settings().telegram_allowed_user_id
+    reply = _handle_config_payday_command(args, timezone="UTC", user_id=user)
+    assert "❓" in reply
+    with session_scope() as session:
+        assert session.query(UserSettings).count() == 0
+    _assert_no_cycle_or_income()
+
+
+@pytest.mark.parametrize("endpoint,method,payload", [
+    ("/api/settings/payday?currency=USDD", "get", None),
+    ("/api/cycle/current?currency=USDD", "get", None),
+    ("/api/cycle/ensure?currency=USDD", "post", None),
+    ("/api/cycle/open?currency=USDD", "post", None),
+    ("/api/settings/payday", "patch", {**FIRST_FRIDAY, "currency": "USDD"}),
+    ("/api/cycles/income", "post", {"amount": "100", "currency": "USDD"}),
+])
+def test_invalid_api_currency_does_not_create_financial_history(client, endpoint, method, payload):
+    response = client.request(method, endpoint, json=payload)
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "invalid_currency"
+    _assert_no_cycle_or_income()
+
+
+def test_api_settings_query_currency_and_body_agree_without_writing_cycle(client):
+    result = client.patch("/api/settings/payday?currency=USD", json={"payday_day": 15})
+    assert result.status_code == 200
+    assert result.json()["payday"]["currency"] == "USD"
+    assert client.get("/api/settings/payday").json()["payday"]["payday_day"] == 1
+    conflict = client.patch("/api/settings/payday?currency=USD", json={"payday_day": 10, "currency": "ARS"})
+    assert conflict.status_code == 400
+    assert client.get("/api/settings/payday?currency=USD").json()["payday"]["payday_day"] == 15
+    _assert_no_cycle_or_income()
+
+
+@pytest.mark.parametrize("command", ["/cycle", "/disponible", "/liberado", "/gastar_diario"])
+def test_telegram_cycle_read_rejects_invalid_currency_before_open(client, command):
+    reply = _handle_cycle_read_command(command, user_id=get_settings().telegram_allowed_user_id, today=TODAY, args=["USDD"])
+    assert "❓" in reply
+    _assert_no_cycle_or_income()
+
+
+def test_archived_monthly_income_is_read_only_and_explicitly_legacy(client):
+    from decimal import Decimal
+    from app.fixed_expenses.models import MonthlyBudget
+
+    with session_scope() as session:
+        session.add(MonthlyBudget(
+            telegram_user_id=get_settings().telegram_allowed_user_id,
+            month_year="2025-09", income=Decimal("123"), extra=Decimal("4"),
+        ))
+    result = client.get("/api/month-summary?month_year=2025-09")
+    assert result.status_code == 200
+    archived = result.json()
+    assert archived["month_year"] == "2025-09"
+    assert archived["income"] == 123 and archived["extra"] == 4
+    assert archived["source"] == "monthly_budget_legacy"
+    assert archived["read_only"] is True and archived["currency"] == "ARS"
+    _assert_no_cycle_or_income()
+
+
+@pytest.mark.parametrize("month", ["2026-00", "2026-13", "0000-09", "2026-9", "unknown"])
+def test_invalid_archive_month_is_a_client_error_without_financial_writes(client, month):
+    assert client.get("/api/month-summary", params={"month_year": month}).status_code == 400
+    _assert_no_cycle_or_income()
+
+
+@pytest.mark.parametrize("endpoint,payload", [
+    ("income", {"amount": "-1"}),
+    ("income", {"amount": "NaN"}),
+    ("income", {"amount": "Infinity"}),
+    ("income", {}),
+    ("income", {"amount": "100", "cycle_id": "bad"}),
+    ("extra", {"amount": "10"}),
+    ("extra", {"amount": "0", "source_key": "bad-zero"}),
+    ("savings/reserved", {"amount": "-1"}),
+    ("savings/release", {"amount": "0"}),
+    ("savings/realized", {"amount": "10"}),
+    ("savings/target", {}),
+    ("savings/target", {"target_pct": ".2", "target_amount": "10"}),
+    ("savings/target", {"target_pct": "1.1"}),
+    ("savings/target", {"target_amount": "-1"}),
+])
+def test_invalid_money_request_does_not_open_cycle_or_create_income(client, endpoint, payload):
+    response = client.post("/api/cycles/" + endpoint, json={**payload, "currency": "USD"})
+    assert response.status_code == 400, response.text
+    _assert_no_cycle_or_income()

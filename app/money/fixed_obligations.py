@@ -38,6 +38,7 @@ from app.fixed_expenses.models import (
 )
 from app.money.dto import CarriedOverFixedOccurrence
 from app.money.models import FinancialCycle
+from app.money.repository import cycle_currency_scope
 
 
 def occurrence_month_year(due_date: date) -> str:
@@ -123,6 +124,8 @@ def resolve_current_obligations(
 
         ensure_snapshot_version(prev_cycle.closing_snapshot)
         for entry in prev_cycle.closing_snapshot.get("carried_over_fixed", []):
+            if str(entry["currency"]).upper() != cycle.currency:
+                continue
             occ = CarriedOverFixedOccurrence(
                 fixed_id=int(entry["fixed_id"]),
                 name=str(entry["name"]),
@@ -183,6 +186,7 @@ def resolve_current_obligations(
         session.execute(
             select(FixedExpense).where(
                 FixedExpense.telegram_user_id == user_id,
+                FixedExpense.currency == cycle.currency,
                 FixedExpense.is_active.is_(True),
             )
         ).scalars()
@@ -260,6 +264,8 @@ def resolve_carry_over_for_close(
 
     blocked_fixed_ids: set[int] = set()
     for occ in previous_carried_over:
+        if occ.currency.upper() != cycle.currency:
+            continue
         payment = _lookup_payment(
             session, occ.fixed_id, occ.original_month_year
         )
@@ -273,6 +279,7 @@ def resolve_carry_over_for_close(
         session.execute(
             select(FixedExpense).where(
                 FixedExpense.telegram_user_id == user_id,
+                FixedExpense.currency == cycle.currency,
                 FixedExpense.is_active.is_(True),
             )
         ).scalars()
@@ -312,6 +319,7 @@ def _previous_cycle(
         select(FinancialCycle)
         .where(
             FinancialCycle.telegram_user_id == user_id,
+            cycle_currency_scope(cycle.currency),
             FinancialCycle.cycle_index < cycle.cycle_index,
         )
         .order_by(FinancialCycle.cycle_index.desc())

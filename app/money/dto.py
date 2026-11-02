@@ -201,6 +201,8 @@ class CycleSummary:
     )
     pay_rule: str = "fixed_day"
     payday_weekday: Optional[int] = None
+    currency: str = "ARS"
+    legacy_mixed_currency: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Repository for fixed expenses + payments + monthly budget."""
+"""Repository for fixed expenses, payments and archived monthly income."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -216,25 +216,8 @@ class FixedExpenseRepository:
         extra: Decimal | None = None,
         note: str | None = None,
     ) -> MonthlyBudget:
-        existing = self.get_budget(user_id, month_year)
-        if existing is not None:
-            if income is not None:
-                existing.income = income
-            if extra is not None:
-                existing.extra = extra
-            if note is not None:
-                existing.note = note[:500]
-            self.session.commit()
-            self.session.refresh(existing)
-            return existing
-        obj = MonthlyBudget(
-            telegram_user_id=user_id,
-            month_year=month_year,
-            income=income if income is not None else Decimal("0"),
-            extra=extra if extra is not None else Decimal("0"),
-            note=note[:500] if note else None,
+        """Reject the retired write path without touching the archive."""
+        raise ValueError(
+            "El presupuesto mensual es un histórico de solo lectura. "
+            "Cargá ingresos y extras en el ciclo con /ingreso y /extra."
         )
-        self.session.add(obj)
-        self.session.commit()
-        self.session.refresh(obj)
-        return obj

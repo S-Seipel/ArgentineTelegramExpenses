@@ -25,7 +25,8 @@ def _seed_balances(*, with_usd=False):
         state = MoneyStateService(session)
         state.set_income(user, cycle_id, "ARS", Decimal("100"))
         if with_usd:
-            state.set_income(user, cycle_id, "USD", Decimal("20"))
+            usd_id = CycleService(session).open_initial_cycle(user, TODAY, currency="USD").cycle_id
+            state.set_income(user, usd_id, "USD", Decimal("20"))
         ExpenseRepository(session).create(ExpenseCreate(
             telegram_user_id=user, name="All ARS spent", amount=Decimal("100"),
             currency="ARS", category_id=1, expense_date=TODAY,
@@ -35,7 +36,7 @@ def _seed_balances(*, with_usd=False):
     return user, cycle_id
 
 
-def test_api_zero_balance_is_explicit_and_keeps_both_currencies(in_memory_db):
+def test_api_zero_balance_is_explicit_and_separate_from_other_currency(in_memory_db):
     _, cycle_id = _seed_balances(with_usd=True)
     app.dependency_overrides[_today] = lambda: TODAY
     try:
@@ -44,10 +45,10 @@ def test_api_zero_balance_is_explicit_and_keeps_both_currencies(in_memory_db):
         app.dependency_overrides.clear()
     assert response.status_code == 200
     money = response.json()["money"]
-    assert money["available_to_spend"] == {"ARS": "0.00", "USD": "20.00"}
+    assert money["available_to_spend"] == {"ARS": "0.00"}
     assert money["daily_safe_to_spend"]["ARS"] == "0.00"
-    assert money["extra"] == {"ARS": "0.00", "USD": "0.00"}
-    assert money["savings_reserved"] == {"ARS": "0.00", "USD": "0.00"}
+    assert money["extra"] == {"ARS": "0.00"}
+    assert money["savings_reserved"] == {"ARS": "0.00"}
 
 
 def test_telegram_zero_is_a_balance_not_missing_data(in_memory_db):
@@ -60,11 +61,14 @@ def test_telegram_zero_is_a_balance_not_missing_data(in_memory_db):
     assert "Sin ingresos" not in daily
 
 
-def test_telegram_keeps_currency_with_zero_alongside_nonzero_currency(in_memory_db):
+def test_telegram_reads_selected_currency_without_mixing_cycles(in_memory_db):
     user, _ = _seed_balances(with_usd=True)
     reply = _handle_cycle_read_command("/disponible", user_id=user, today=TODAY)
     assert "0 ARS" in reply
-    assert "20 USD" in reply
+    assert "USD" not in reply
+    usd_reply = _handle_cycle_read_command("/disponible", user_id=user, today=TODAY, args=["USD"])
+    assert "20 USD" in usd_reply
+    assert "ARS" not in usd_reply
 
 
 def test_expired_cycle_rolls_only_after_explicit_post(in_memory_db):
@@ -135,3 +139,28 @@ def test_unknown_snapshot_is_explicit_for_summary_and_cycle_update(in_memory_db)
         assert response.json()["detail"]["code"] == "unsupported_snapshot_version"
     finally:
         app.dependency_overrides.clear()
+
+
+def test_legacy_mixed_snapshot_is_visible_in_each_currency_history_without_rewrite(in_memory_db):
+    from copy import deepcopy
+
+    user, cycle_id = _seed_balances()
+    with session_scope() as session:
+        CycleService(session).close_cycle(user, cycle_id, force=True)
+        cycle = session.get(FinancialCycle, cycle_id)
+        # Model a closed v1 snapshot preserved by the F3 migration.
+        snapshot = deepcopy(cycle.closing_snapshot)
+        for field in ("income", "gross_income", "available_to_spend"):
+            snapshot["money"][field]["USD"] = "20.00"
+        cycle.closing_snapshot = snapshot
+        cycle.legacy_mixed_currency = True
+    client = TestClient(app)
+    for currency in ("ARS", "USD"):
+        response = client.get("/api/cycle-history", params={"currency": currency})
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [item["cycle_id"] for item in items] == [cycle_id]
+        assert items[0]["legacy_mixed_currency"] is True
+        assert items[0]["money"]["available_to_spend"] == {"ARS": "0.00", "USD": "20.00"}
+    with session_scope() as session:
+        assert session.get(FinancialCycle, cycle_id).closing_snapshot == snapshot

@@ -185,38 +185,43 @@ def test_salte_marks_as_skipped(runtime):
     assert "salteado" in reply.lower()
 
 
-def test_ingreso_and_liberado(runtime, monkeypatch):
-    """``/liberado`` continues to read the legacy ``MonthlyBudget`` row.
-
-    R3 redirects ``/ingreso`` and ``/extra`` to the financial-cycle
-    state (``CycleIncome``), leaving ``MonthlyBudget`` untouched (spec
-    §20: models coexist during the transition). To exercise
-    ``/liberado`` we therefore seed ``MonthlyBudget`` directly.
-    """
-    monkeypatch.setattr("app.bot.handlers.today_in_tz", lambda _tz: date(2026, 9, 25))
+def test_liberado_is_cycle_available_alias_and_ignores_legacy_budget(runtime, monkeypatch):
+    """Legacy income cannot influence today's authoritative available amount."""
+    from app.fixed_expenses.models import MonthlyBudget
     from app.fixed_expenses.service import FixedExpenseDraft
-    with session_scope() as s:
-        service = FixedExpenseService(FixedExpenseRepository(s))
-        service.add(user_id=1, draft=FixedExpenseDraft(
-            name="CASA", expected_amount=Decimal("90000")))
-        service.mark_paid(1, service.list_active(1)[0].id, "2026-09")
-        # Seed MonthlyBudget directly — R3 no longer writes here.
-        service.set_budget(1, "2026-09", income=Decimal("1100000"))
-        service.set_budget(1, "2026-09", extra=Decimal("75000"))
+    from app.money import CycleService, MoneyStateService
 
-    message3 = MagicMock()
-    message3.text = "/liberado"
-    message3.reply_text = AsyncMock()
-    message3.chat.send_action = AsyncMock()
-    update3 = _make_update(1, message3)
-    deps = BotDependencies(runtime=runtime)
-    _run(handle_command(update3, None, deps))
-    reply = message3.reply_text.call_args.args[0]
-    assert "Ingreso" in reply
-    assert "Extra" in reply
-    assert "Liberado" in reply
-    # 1100000 + 75000 - 90000 = 1085000
-    assert "1.085.000" in reply or "1085000" in reply
+    today = date(2026, 9, 25)
+    monkeypatch.setattr("app.bot.handlers.today_in_tz", lambda _tz: today)
+    with session_scope() as session:
+        service = FixedExpenseService(FixedExpenseRepository(session))
+        bill = service.add(user_id=1, draft=FixedExpenseDraft(
+            name="CASA", expected_amount=Decimal("90000")))
+        service.mark_paid(1, bill.id, "2026-09", paid_on=today)
+        session.add(MonthlyBudget(
+            telegram_user_id=1, month_year="2026-09",
+            income=Decimal("99999999"), extra=Decimal("5"),
+        ))
+        session.commit()
+        cycle = CycleService(session).open_initial_cycle(1, today)
+        state = MoneyStateService(session)
+        state.set_income(1, cycle.cycle_id, "ARS", Decimal("1100000"))
+        state.record_extra_income(1, cycle.cycle_id, "ARS", Decimal("75000"), source_key="test")
+
+    replies = []
+    for command in ("/liberado", "/disponible"):
+        message = MagicMock()
+        message.text = command
+        message.reply_text = AsyncMock()
+        message.chat.send_action = AsyncMock()
+        _run(handle_command(_make_update(1, message), None, BotDependencies(runtime=runtime)))
+        replies.append(message.reply_text.call_args.args[0])
+    assert "/liberado es un alias de /disponible" in replies[0]
+    assert replies[0].endswith(replies[1])
+    assert "1.085.000 ARS" in replies[0]
+    with session_scope() as session:
+        legacy = session.query(MonthlyBudget).one()
+        assert legacy.income == Decimal("99999999") and legacy.extra == Decimal("5")
 
 
 def test_gastofijo_del(runtime):

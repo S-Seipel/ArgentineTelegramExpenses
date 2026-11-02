@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -515,9 +516,30 @@ async def api_skip(
 async def api_month_summary(
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
+    month_year: str | None = Query(default=None),
 ):
+    if month_year is not None and (
+        not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month_year)
+        or month_year.startswith("0000-")
+    ):
+        raise HTTPException(status_code=400, detail="Usá month_year=YYYY-MM.")
     with session_scope() as s:
-        return month_summary_dashboard(s, user_id, today)
+        return month_summary_dashboard(s, user_id, today, month_year=month_year)
+
+
+def _parse_cycle_currency(value) -> str:
+    """Validate before resolving a cycle: a typo must not create history."""
+    if isinstance(value, str):
+        value = value.strip()
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z]{3}", value):
+        raise HTTPException(status_code=400, detail={
+            "code": "invalid_currency", "message": "Usá un código de moneda de tres letras, como ARS o USD.",
+        })
+    return value.upper()
+
+
+def _cycle_currency(currency: str = Query(default="ARS")) -> str:
+    return _parse_cycle_currency(currency)
 
 
 def _payday_to_payload(config) -> dict:
@@ -529,6 +551,7 @@ def _payday_to_payload(config) -> dict:
         if rule == "first_weekday" else f"día {config.payday_day} de cada mes"
     )
     return {
+        "currency": getattr(config, "currency", "ARS"),
         "payday_day": config.payday_day,
         "pay_rule": rule,
         "payday_weekday": weekday,
@@ -538,12 +561,15 @@ def _payday_to_payload(config) -> dict:
 
 
 @router.get("/api/settings/payday")
-async def api_payday_settings(user_id: int = Depends(_current_user_id)):
+async def api_payday_settings(
+    user_id: int = Depends(_current_user_id),
+    currency: str = Depends(_cycle_currency),
+):
     from app.money import UserSettingsService
 
     with session_scope() as session:
-        config = UserSettingsService(session).get_settings(user_id)
-        return {"payday": _payday_to_payload(config)}
+        config = UserSettingsService(session).get_settings(user_id, currency=currency)
+        return {"payday": {**_payday_to_payload(config), "inherited": getattr(config, "inherited", False)}}
 
 
 @router.patch("/api/settings/payday")
@@ -551,21 +577,29 @@ async def api_update_payday_settings(
     payload: dict,
     user_id: int = Depends(_current_user_id),
     settings: Settings = Depends(get_settings),
+    currency: str | None = Query(default=None),
 ):
     from app.money import UserSettingsService
 
-    allowed = {"pay_rule", "payday_day", "payday_weekday"}
+    allowed = {"pay_rule", "payday_day", "payday_weekday", "currency"}
     if not payload or set(payload) - allowed:
         raise HTTPException(status_code=400, detail="Configuración de cobro inválida.")
+    body_currency = payload.get("currency")
+    if currency is not None and body_currency is not None and (
+        _parse_cycle_currency(currency) != _parse_cycle_currency(body_currency)
+    ):
+        raise HTTPException(status_code=400, detail="Las monedas de la URL y el cuerpo no coinciden.")
+    currency = _parse_cycle_currency(body_currency if "currency" in payload else (currency or "ARS"))
     rule = payload.get("pay_rule", "fixed_day")
     try:
         with session_scope() as session:
             config = UserSettingsService(session).set_payday_rule(
                 user_id, rule, payday_day=payload.get("payday_day"),
                 weekday=payload.get("payday_weekday"), timezone=settings.timezone,
+                currency=currency,
             )
             return {
-                "payday": _payday_to_payload(config),
+                "payday": {**_payday_to_payload(config), "inherited": getattr(config, "inherited", False)},
                 "message": "Calendario guardado. Los ciclos abiertos conservan sus fechas; el cambio se aplica al próximo ciclo.",
             }
     except ValueError as exc:
@@ -576,12 +610,13 @@ async def api_update_payday_settings(
 async def api_cycle_current(
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
+    currency: str = Depends(_cycle_currency),
 ):
     """Return the open financial cycle that contains today, or null."""
     from app.money import CycleService
 
     with session_scope() as s:
-        view = CycleService(s).get_current_cycle(user_id, today)
+        view = CycleService(s).get_current_cycle(user_id, today, currency=currency)
     if view is None:
         return {"cycle": None}
     return {
@@ -600,6 +635,7 @@ async def api_cycle_current(
 async def api_cycle_open(
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
+    currency: str = Depends(_cycle_currency),
 ):
     """Open the initial cycle for the user.
 
@@ -610,7 +646,7 @@ async def api_cycle_open(
 
     try:
         with session_scope() as s:
-            view = CycleService(s).open_initial_cycle(user_id, today)
+            view = CycleService(s).open_initial_cycle(user_id, today, currency=currency)
     except CycleRolloverRequired as exc:
         raise HTTPException(
             status_code=409,
@@ -655,6 +691,7 @@ def _summary_to_payload(
         "start_date": summary.start_date.isoformat(),
         "end_date": summary.end_date.isoformat(),
         **_payday_to_payload(summary),
+        "legacy_mixed_currency": getattr(summary, "legacy_mixed_currency", False),
         "snapshot_version": summary.snapshot_version,
         "money": {
             "income": summary.base_income.to_dict(),
@@ -738,6 +775,7 @@ async def api_cycle_summary(
     user_id: int = Depends(_current_user_id),
     cycle_id: int | None = Query(default=None),
     today: date = Depends(_today),
+    currency: str = Depends(_cycle_currency),
 ):
     """Return the full R2 cycle summary for the current (or given) cycle.
 
@@ -757,7 +795,7 @@ async def api_cycle_summary(
         engine = MoneyEngine(s)
         if cycle_id is None:
             try:
-                cycle = cycle_service.ensure_current_cycle(user_id, today)
+                cycle = cycle_service.ensure_current_cycle(user_id, today, currency=currency)
             except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
                 raise _cycle_lifecycle_http_error(exc) from exc
             cycle_id = cycle.id
@@ -776,11 +814,13 @@ async def api_cycle_summary(
 async def api_cycle_history(
     user_id: int = Depends(_current_user_id),
     limit: int = Query(100, ge=1, le=500),
+    currency: str = Depends(_cycle_currency),
 ):
     """Read closed cycles solely from their immutable v1 snapshots."""
     from sqlalchemy import select
 
     from app.money.models import FinancialCycle
+    from app.money.repository import cycle_currency_scope
     from app.money.engine import SnapshotVersionMismatchError
     from app.money.snapshot import ensure_snapshot_version
 
@@ -789,6 +829,7 @@ async def api_cycle_history(
             select(FinancialCycle).where(
                 FinancialCycle.telegram_user_id == user_id,
                 FinancialCycle.status == "closed",
+                cycle_currency_scope(currency),
             ).order_by(FinancialCycle.cycle_index.desc()).limit(limit)
         ).scalars().all()
         engine = MoneyEngine(session)
@@ -848,6 +889,7 @@ async def api_cycle_close(
 async def api_cycle_ensure(
     user_id: int = Depends(_current_user_id),
     today: date = Depends(_today),
+    currency: str = Depends(_cycle_currency),
 ):
     """Run ``ensure_current_cycle(today)``. Idempotent."""
     from app.money import (
@@ -859,7 +901,7 @@ async def api_cycle_ensure(
     with session_scope() as s:
         cycle_service = CycleService(s)
         try:
-            cycle = cycle_service.ensure_current_cycle(user_id, today)
+            cycle = cycle_service.ensure_current_cycle(user_id, today, currency=currency)
         except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
             raise _cycle_lifecycle_http_error(exc) from exc
     return {
@@ -880,7 +922,7 @@ async def api_cycle_ensure(
 
 
 def _resolve_open_cycle(
-    user_id: int, cycle_id: int | None, today: date
+    user_id: int, cycle_id: int | None, today: date, *, currency: str = "ARS"
 ) -> FinancialCycle:
     """Return the open cycle a mutation targets.
 
@@ -899,7 +941,7 @@ def _resolve_open_cycle(
         cycle_service = CycleService(s)
         if cycle_id is None:
             try:
-                return cycle_service.ensure_current_cycle(user_id, today)
+                return cycle_service.ensure_current_cycle(user_id, today, currency=currency)
             except (CycleCatchUpLimitExceeded, LookupError, SnapshotVersionMismatchError) as exc:
                 raise _cycle_lifecycle_http_error(exc) from exc
         cycle = s.get(FinancialCycle, cycle_id)
@@ -919,6 +961,11 @@ def _resolve_open_cycle(
                     "message": f"Cycle {cycle_id} not found",
                 },
             )
+        if cycle.currency != currency:
+            raise HTTPException(status_code=409, detail={
+                "code": "cycle_currency_mismatch",
+                "message": "La moneda no coincide con la del ciclo elegido.",
+            })
         if cycle.status != "open":
             raise HTTPException(
                 status_code=409,
@@ -933,32 +980,34 @@ def _resolve_open_cycle(
         return cycle
 
 
-def _parse_amount(raw) -> Decimal:
-    """Parse a request body amount. JSON gives us a string already; the
-    service does its own coercion but we want a clean 400 here.
-    """
-    if raw is None:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "invalid_amount", "message": "amount required"},
-        )
+def _parse_amount(raw, *, positive: bool = False) -> Decimal:
+    """Validate a monetary input before any implicit cycle lifecycle change."""
     try:
-        if isinstance(raw, Decimal):
-            return raw
-        return Decimal(str(raw))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "invalid_amount",
-                "message": f"amount must be a Decimal-compatible value: {exc}",
-            },
-        ) from exc
+        value = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={
+            "code": "invalid_amount", "message": "Ingresá un monto numérico válido.",
+        }) from exc
+    if not value.is_finite() or value < 0 or (positive and value == 0):
+        raise HTTPException(status_code=400, detail={
+            "code": "invalid_argument",
+            "message": "El monto debe ser finito y mayor que cero." if positive else "El monto debe ser finito y no negativo.",
+        })
+    return value
+
+
+def _parse_cycle_id(raw) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not re.fullmatch(r"[1-9][0-9]*", str(raw)):
+        raise HTTPException(status_code=400, detail={"code": "invalid_cycle_id", "message": "El ciclo debe ser un identificador entero positivo."})
+    return int(raw)
 
 
 def _state_error_to_http(exc: Exception) -> HTTPException:
     from app.money import (
         CycleClosedError,
+        CycleCurrencyMismatchError,
         CycleNotFoundError,
         CycleOwnershipMismatchError,
         ExtraIncomeNotFoundError,
@@ -975,6 +1024,8 @@ def _state_error_to_http(exc: Exception) -> HTTPException:
             status_code=409,
             detail={"code": "cycle_closed", "message": str(exc)},
         )
+    if isinstance(exc, CycleCurrencyMismatchError):
+        return HTTPException(status_code=409, detail={"code": "cycle_currency_mismatch", "message": str(exc)})
     if isinstance(exc, MoneySourceCurrencyConflictError):
         return HTTPException(
             status_code=409,
@@ -1003,6 +1054,19 @@ def _state_error_to_http(exc: Exception) -> HTTPException:
         status_code=500,
         detail={"code": "internal_error", "message": str(exc)},
     )
+
+
+def _validate_money_source_currency(user_id: int, source_key, currency: str, *, kind: str) -> None:
+    """Reject a replay in another currency before opening an unrelated cycle."""
+    from app.money import MoneyStateService
+
+    try:
+        with session_scope() as session:
+            MoneyStateService(session).validate_source_currency(
+                user_id, source_key, currency, kind=kind,
+            )
+    except Exception as exc:
+        raise _state_error_to_http(exc) from exc
 
 
 def _income_to_payload(row) -> dict:
@@ -1064,14 +1128,16 @@ async def api_cycle_set_income(
     """Upsert the base income for the open cycle + currency."""
     from app.money import MoneyStateService
 
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+
+    amount = _parse_amount(payload.get("amount"))
     cycle_id = payload.get("cycle_id")
     cycle = _resolve_open_cycle(
         user_id,
-        int(cycle_id) if cycle_id is not None else None,
+        _parse_cycle_id(cycle_id),
         today,
+        currency=currency,
     )
-    amount = _parse_amount(payload.get("amount"))
-    currency = str(payload.get("currency") or "ARS")
     try:
         with session_scope() as s:
             row = MoneyStateService(s).set_income(
@@ -1100,16 +1166,19 @@ async def api_cycle_record_extra(
     """Upsert an extra income identified by ``source_key``."""
     from app.money import MoneyStateService
 
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+    source_key = payload.get("source_key")
+    _validate_money_source_currency(user_id, source_key, currency, kind="extra")
+
+    amount = _parse_amount(payload.get("amount"), positive=True)
+    note = payload.get("note")
     cycle_id = payload.get("cycle_id")
     cycle = _resolve_open_cycle(
         user_id,
-        int(cycle_id) if cycle_id is not None else None,
+        _parse_cycle_id(cycle_id),
         today,
+        currency=currency,
     )
-    amount = _parse_amount(payload.get("amount"))
-    currency = str(payload.get("currency") or "ARS")
-    source_key = payload.get("source_key")
-    note = payload.get("note")
     try:
         with session_scope() as s:
             row = MoneyStateService(s).record_extra_income(
@@ -1198,17 +1267,24 @@ async def api_cycle_set_savings_target(
 ):
     from app.money import MoneyStateService
 
-    cycle_id = payload.get("cycle_id")
-    cycle = _resolve_open_cycle(
-        user_id,
-        int(cycle_id) if cycle_id is not None else None,
-        today,
-    )
-    currency = str(payload.get("currency") or "ARS")
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+
     target_pct = payload.get("target_pct")
     target_amount = payload.get("target_amount")
     pct_decimal = _parse_amount(target_pct) if target_pct is not None else None
     amt_decimal = _parse_amount(target_amount) if target_amount is not None else None
+    if (pct_decimal is None) == (amt_decimal is None):
+        raise HTTPException(status_code=400, detail={"code": "invalid_argument", "message": "Usá exactamente uno de target_pct o target_amount."})
+    if pct_decimal is not None and pct_decimal > 1:
+        raise HTTPException(status_code=400, detail={"code": "invalid_argument", "message": "target_pct debe estar entre 0 y 1."})
+
+    cycle_id = payload.get("cycle_id")
+    cycle = _resolve_open_cycle(
+        user_id,
+        _parse_cycle_id(cycle_id),
+        today,
+        currency=currency,
+    )
     try:
         with session_scope() as s:
             row = MoneyStateService(s).set_savings_target(
@@ -1237,14 +1313,16 @@ async def api_cycle_set_savings_reserved(
 ):
     from app.money import MoneyStateService
 
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+
+    amount = _parse_amount(payload.get("amount"))
     cycle_id = payload.get("cycle_id")
     cycle = _resolve_open_cycle(
         user_id,
-        int(cycle_id) if cycle_id is not None else None,
+        _parse_cycle_id(cycle_id),
         today,
+        currency=currency,
     )
-    amount = _parse_amount(payload.get("amount"))
-    currency = str(payload.get("currency") or "ARS")
     try:
         with session_scope() as s:
             row = MoneyStateService(s).set_savings_reserved(
@@ -1272,14 +1350,16 @@ async def api_cycle_release_savings(
 ):
     from app.money import MoneyStateService
 
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+
+    amount = _parse_amount(payload.get("amount"), positive=True)
     cycle_id = payload.get("cycle_id")
     cycle = _resolve_open_cycle(
         user_id,
-        int(cycle_id) if cycle_id is not None else None,
+        _parse_cycle_id(cycle_id),
         today,
+        currency=currency,
     )
-    amount = _parse_amount(payload.get("amount"))
-    currency = str(payload.get("currency") or "ARS")
     try:
         with session_scope() as s:
             row = MoneyStateService(s).release_savings(
@@ -1307,16 +1387,19 @@ async def api_cycle_record_savings_realized(
 ):
     from app.money import MoneyStateService
 
+    currency = _parse_cycle_currency(payload.get("currency", "ARS"))
+    source_key = payload.get("source_key")
+    _validate_money_source_currency(user_id, source_key, currency, kind="savings_realized")
+
+    amount = _parse_amount(payload.get("amount"), positive=True)
+    note = payload.get("note")
     cycle_id = payload.get("cycle_id")
     cycle = _resolve_open_cycle(
         user_id,
-        int(cycle_id) if cycle_id is not None else None,
+        _parse_cycle_id(cycle_id),
         today,
+        currency=currency,
     )
-    amount = _parse_amount(payload.get("amount"))
-    currency = str(payload.get("currency") or "ARS")
-    source_key = payload.get("source_key")
-    note = payload.get("note")
     try:
         with session_scope() as s:
             row = MoneyStateService(s).record_savings_realized(
@@ -1826,6 +1909,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="panel" id="active-cycle-panel">
       <h2>Ciclo activo</h2>
+      <label style="display:flex;align-items:center;gap:10px;margin-bottom:14px">Moneda del ciclo
+        <input id="cycle-currency" class="fx-input" value="ARS" maxlength="3" pattern="[A-Za-z]{3}" list="cycle-currencies" style="width:90px" onchange="changeCycleCurrency()" aria-label="Moneda del ciclo">
+        <datalist id="cycle-currencies"><option value="ARS"><option value="USD"><option value="EUR"></datalist>
+      </label>
       <div id="active-cycle">Cargando…</div>
       <details style="margin-top:18px;padding-top:14px;border-top:1px solid var(--glass-border)">
         <summary style="cursor:pointer">Configurar calendario de cobro</summary>
@@ -1882,25 +1969,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <h2 id="fixed-title" style="margin-bottom:2px">Gastos fijos</h2>
           <div class="subtitle" id="fixed-subtitle">Cargando…</div>
         </div>
-        <div style="display:flex; gap:18px; align-items:flex-end; flex-wrap:wrap">
-          <div style="text-align:right">
-            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Ingreso</div>
-            <div class="big" id="fixed-income" style="font-size:22px">—</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Extra</div>
-            <div class="big" id="fixed-extra" style="font-size:22px">—</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Pagado</div>
-            <div class="big" id="fixed-paid" style="font-size:22px">—</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em">Liberado</div>
-            <div class="big" id="fixed-liberado" style="font-size:24px">—</div>
-          </div>
-        </div>
       </div>
+      <p class="subtitle" style="margin-bottom:14px">El disponible y el ahorro se calculan en el ciclo de cada moneda. Registrá ingresos con /ingreso &lt;monto&gt; [moneda] y extras con /extra &lt;monto&gt; [moneda].</p>
       <div id="fixed-list"></div>
 
       <div id="fixed-add-row" style="margin-top:14px; display:none">
@@ -2108,6 +2178,21 @@ async function getJSON(url) {
   return r.json();
 }
 
+function selectedCycleCurrency() {
+  return document.getElementById('cycle-currency').value.trim().toUpperCase();
+}
+
+async function changeCycleCurrency() {
+  const currency = selectedCycleCurrency();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    document.getElementById('active-cycle').textContent = 'Usá una moneda de tres letras, como ARS o USD.';
+    return;
+  }
+  document.getElementById('cycle-currency').value = currency;
+  document.getElementById('payday-status').textContent = 'Los ciclos ya abiertos conservan sus fechas. Guardar no abre un ciclo ni registra ingresos.';
+  await Promise.all([refreshPaydaySettings(), refreshActiveCycle()]);
+}
+
 function updatePaydayFields() {
   const fixed = document.getElementById('payday-rule').value === 'fixed_day';
   document.getElementById('payday-day-field').hidden = !fixed;
@@ -2116,28 +2201,43 @@ function updatePaydayFields() {
   document.getElementById('payday-weekday').disabled = fixed;
 }
 
+function setPaydayLoading(loading) {
+  const form = document.getElementById('payday-form');
+  form.setAttribute('aria-busy', String(loading));
+  form.querySelectorAll('input,select,button').forEach(control => { control.disabled = loading; });
+  if (!loading) updatePaydayFields();
+}
+
 async function refreshPaydaySettings() {
+  const currency = selectedCycleCurrency();
+  setPaydayLoading(true);
+  document.getElementById('payday-current-setting').textContent = 'Cargando calendario ' + currency + '…';
   try {
-    const {payday} = await getJSON('/api/settings/payday');
+    const {payday} = await getJSON('/api/settings/payday?currency=' + encodeURIComponent(currency));
+    if (currency !== selectedCycleCurrency()) return;
     document.getElementById('payday-rule').value = payday.pay_rule;
     document.getElementById('payday-day').value = payday.payday_day;
     document.getElementById('payday-weekday').value = payday.payday_weekday == null ? 4 : payday.payday_weekday;
-    document.getElementById('payday-current-setting').textContent = 'Configuración: ' + payday.payday_label + '.';
+    document.getElementById('payday-current-setting').textContent = 'Configuración ' + currency + ': ' + payday.payday_label + (payday.inherited ? ' (heredada de ARS hasta guardar o abrir el primer ciclo).' : '.');
     updatePaydayFields();
   } catch (err) {
-    document.getElementById('payday-current-setting').textContent = 'No se pudo cargar el calendario de cobro.';
+    if (currency === selectedCycleCurrency()) {
+      document.getElementById('payday-current-setting').textContent = 'No se pudo cargar el calendario de cobro.';
+    }
+  } finally {
+    if (currency === selectedCycleCurrency()) setPaydayLoading(false);
   }
 }
 
 async function savePaydaySettings(event) {
   event.preventDefault();
-  const button = document.getElementById('payday-save');
   const status = document.getElementById('payday-status');
   const rule = document.getElementById('payday-rule').value;
-  const payload = {pay_rule: rule};
+  const payload = {pay_rule: rule, currency: selectedCycleCurrency()};
   if (rule === 'fixed_day') payload.payday_day = Number(document.getElementById('payday-day').value);
   else payload.payday_weekday = Number(document.getElementById('payday-weekday').value);
-  button.disabled = true;
+  setPaydayLoading(true);
+  document.getElementById('cycle-currency').disabled = true;
   try {
     const response = await fetch('/api/settings/payday', {
       method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
@@ -2150,20 +2250,24 @@ async function savePaydaySettings(event) {
   } catch (err) {
     status.textContent = 'No se pudo guardar el calendario. Revisá los valores y volvé a intentarlo.';
   } finally {
-    button.disabled = false;
+    setPaydayLoading(false);
+    document.getElementById('cycle-currency').disabled = false;
   }
 }
 
 async function refreshActiveCycle() {
   const target = document.getElementById('active-cycle');
+  const currency = selectedCycleCurrency();
   try {
-    const current = await getJSON('/api/cycle/current');
+    const current = await getJSON('/api/cycle/current?currency=' + encodeURIComponent(currency));
+    if (currency !== selectedCycleCurrency()) return;
     if (!current.cycle) {
-      target.innerHTML = '<p>No hay un ciclo activo para hoy.</p>' +
+      target.innerHTML = '<p>No hay un ciclo activo para hoy en ' + escapeHTML(currency) + '.</p>' +
         '<button type="button" onclick="ensureActiveCycle(this)">Abrir o actualizar ciclo</button>';
       return;
     }
     const summary = await getJSON('/api/cycle-summary?cycle_id=' + encodeURIComponent(current.cycle.id));
+    if (currency !== selectedCycleCurrency()) return;
     const money = summary.money || {};
     const fields = [
       ['income', 'Ingreso base'], ['extra', 'Ingresos extra'],
@@ -2174,7 +2278,7 @@ async function refreshActiveCycle() {
       ['available_to_spend', 'Disponible'], ['daily_safe_to_spend', 'Gasto diario seguro'],
     ];
     const currencies = new Set(fields.flatMap(([key]) => Object.keys(money[key] || {})));
-    const range = escapeHTML(summary.start_date) + ' → ' + escapeHTML(summary.end_date);
+    const range = escapeHTML(summary.currency || currency) + ' · ' + escapeHTML(summary.start_date) + ' → ' + escapeHTML(summary.end_date);
     const calendar = '<p class="subtitle">Cobro del ciclo: ' + escapeHTML(summary.payday_label) + '.</p>';
     if (!currencies.size) {
       target.innerHTML = '<p>' + range + '</p>' + calendar + '<p>Aún no hay ingresos ni movimientos en este ciclo.</p>';
@@ -2194,18 +2298,19 @@ async function refreshActiveCycle() {
         }).join('') + '</div>'
       ).join('') + '</div>';
   } catch (err) {
-    target.textContent = 'No se pudo cargar el ciclo activo.';
+    if (currency === selectedCycleCurrency()) target.textContent = 'No se pudo cargar el ciclo activo.';
   }
 }
 
 async function ensureActiveCycle(button) {
+  const currency = selectedCycleCurrency();
   button.disabled = true;
   try {
-    const response = await fetch('/api/cycle/ensure', {method: 'POST'});
+    const response = await fetch('/api/cycle/ensure?currency=' + encodeURIComponent(currency), {method: 'POST'});
     if (!response.ok) throw new Error('cycle ensure ' + response.status);
     await refreshActiveCycle();
   } catch (err) {
-    document.getElementById('active-cycle').textContent =
+    if (currency === selectedCycleCurrency()) document.getElementById('active-cycle').textContent =
       'No se pudo actualizar el ciclo. Volvé a intentarlo.';
   } finally {
     button.disabled = false;
@@ -2235,7 +2340,7 @@ async function refresh() {
   subtitle.classList.add('refreshing');
 
   const periodParam = '?period=' + currentPeriod;
-  let summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all;
+  let summary, trend, recent, budgets, recurring, comparison, projection, fixed, all;
   try {
     if (monthlyDashboard) {
       const monthParam = selectedMonth ? '?month=' + selectedMonth : '';
@@ -2248,11 +2353,10 @@ async function refresh() {
       comparison = monthly.comparison;
       projection = {applies: false};
       fixed = {items: []};
-      monthSum = null;
       all = monthly.expenses;
       updateMonthNav(monthly);
     } else {
-      [summary, trend, recent, budgets, recurring, comparison, projection, fixed, monthSum, all] =
+      [summary, trend, recent, budgets, recurring, comparison, projection, fixed, all] =
         await Promise.all([
           getJSON('/api/summary' + periodParam),
           getJSON('/api/trend' + periodParam),
@@ -2262,7 +2366,6 @@ async function refresh() {
           getJSON('/api/comparison' + periodParam),
           getJSON('/api/projection' + periodParam),
           getJSON('/api/fixed-expenses'),
-          getJSON('/api/month-summary'),
           getJSON('/api/expenses' + periodParam),
         ]);
     }
@@ -2500,30 +2603,13 @@ async function refresh() {
     </tr>`).join('');
 
   // Fixed expenses section
-  if (!monthlyDashboard) renderFixedExpenses(fixed, monthSum);
+  if (!monthlyDashboard) renderFixedExpenses(fixed);
 
   // All-expenses panel
   renderAllExpenses(all);
 }
 
-function renderFixedExpenses(fixed, monthSum) {
-  const libEl = document.getElementById('fixed-liberado');
-  if (libEl) {
-    const prev = parseFloat(libEl.dataset.value || '0');
-    animateNumber(libEl, monthSum.liberado, 700);
-  }
-  document.getElementById('fixed-income').textContent = '$' + fmt.format(monthSum.income);
-  document.getElementById('fixed-extra').textContent = '$' + fmt.format(monthSum.extra);
-  document.getElementById('fixed-paid').textContent = '$' + fmt.format(monthSum.total_fixed_paid);
-
-  const libColor = monthSum.liberado >= 0 ? '#34d399' : '#f87171';
-  if (libEl) {
-    libEl.style.background = `linear-gradient(180deg, ${libColor} 0%, ${libColor}99 100%)`;
-    libEl.style.webkitBackgroundClip = 'text';
-    libEl.style.backgroundClip = 'text';
-    libEl.style.webkitTextFillColor = 'transparent';
-  }
-
+function renderFixedExpenses(fixed) {
   const sub = document.getElementById('fixed-subtitle');
   const items = fixed.items || [];
   if (items.length === 0) {
@@ -2532,7 +2618,7 @@ function renderFixedExpenses(fixed, monthSum) {
     return;
   }
   const paid = items.filter(i => i.status === 'paid_exact' || i.status === 'paid_more' || i.status === 'paid_less').length;
-  sub.textContent = `${paid}/${items.length} pagados · Mes ${monthSum.month_year}`;
+  sub.textContent = `${paid}/${items.length} pagados este mes · importes separados por moneda`;
 
   const STATUS_ICON = {
     pending: '⏳', paid_exact: '✅', paid_more: '💰', paid_less: '⚠️', skipped: '⏭️',

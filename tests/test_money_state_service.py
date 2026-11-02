@@ -58,11 +58,13 @@ def test_source_key_currency_stays_fixed_through_retry_update_and_restore(
     in_memory_db, model, record_name, update_name, delete_name
 ):
     view = _open_cycle(1, payday_day=2, today=date(2026, 10, 5))
+    with session_scope() as s:
+        usd_view = CycleService(s).open_initial_cycle(1, date(2026, 10, 5), currency="USD")
 
     def record(currency, amount):
         with session_scope() as s:
             return getattr(MoneyStateService(s), record_name)(
-                user_id=1, cycle_id=view.cycle_id, currency=currency,
+                user_id=1, cycle_id=usd_view.cycle_id if currency == "USD" else view.cycle_id, currency=currency,
                 amount=Decimal(amount), source_key="X",
             )
 
@@ -212,12 +214,14 @@ def test_set_income_cross_currency_isolation(in_memory_db):
     today = date(2026, 10, 5)
     view = _open_cycle(1, payday_day=2, today=today)
     with session_scope() as s:
+        usd_view = CycleService(s).open_initial_cycle(1, today, currency="USD")
+    with session_scope() as s:
         MoneyStateService(s).set_income(
             user_id=1, cycle_id=view.cycle_id, currency="ARS",
             amount=Decimal("1100000"),
         )
         MoneyStateService(s).set_income(
-            user_id=1, cycle_id=view.cycle_id, currency="USD",
+            user_id=1, cycle_id=usd_view.cycle_id, currency="USD",
             amount=Decimal("500"),
         )
     # Update ARS; USD must stay intact.
@@ -228,7 +232,10 @@ def test_set_income_cross_currency_isolation(in_memory_db):
         )
     summary = _read_summary(1, view.cycle_id)
     assert summary.base_income.get("ARS") == Decimal("1200000.00")
-    assert summary.base_income.get("USD") == Decimal("500.00")
+    assert summary.base_income.get("USD") == 0
+    usd_summary = _read_summary(1, usd_view.cycle_id)
+    assert usd_summary.base_income.get("USD") == Decimal("500.00")
+    assert usd_summary.base_income.get("ARS") == 0
 
 
 def test_set_income_closed_cycle_rejected(in_memory_db):

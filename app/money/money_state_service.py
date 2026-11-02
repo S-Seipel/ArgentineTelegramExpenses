@@ -48,10 +48,11 @@ serialisations.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,7 @@ from app.money.models import (
     SavingsReserved,
     SavingsTarget,
 )
+from app.money.repository import normalize_currency
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +85,16 @@ class CycleClosedError(MoneyStateError):
 
 class CycleOwnershipMismatchError(MoneyStateError):
     """Defensive: a code path tried to mutate another user's cycle."""
+
+
+class CycleCurrencyMismatchError(MoneyStateError):
+    """A monetary mutation addressed a cycle in another currency."""
+
+    def __init__(self, cycle_id: int, cycle_currency: str, requested_currency: str):
+        self.cycle_id = cycle_id
+        self.cycle_currency = cycle_currency
+        self.requested_currency = requested_currency
+        super().__init__(f"Cycle {cycle_id} uses {cycle_currency}; requested {requested_currency}")
 
 
 class InvalidAmountError(MoneyStateError):
@@ -133,10 +145,10 @@ class SavingsRealizationNotFoundError(MoneyStateError):
 
 
 def _validate_currency(currency: str) -> str:
-    cur = str(currency or "").strip().upper()
-    if not cur or len(cur) > 8:
-        raise InvalidAmountError(f"invalid currency: {currency!r}")
-    return cur
+    try:
+        return normalize_currency(currency)
+    except ValueError as exc:
+        raise InvalidAmountError(f"invalid currency: {currency!r}") from exc
 
 
 def _validate_amount_positive_or_zero(amount, *, name: str) -> Decimal:
@@ -192,7 +204,7 @@ class MoneyStateService:
     # ==================================================================
 
     def _require_open_cycle(
-        self, user_id: int, cycle_id: int
+        self, user_id: int, cycle_id: int, *, currency: Optional[str] = None
     ) -> FinancialCycle:
         """Return the cycle if it exists, belongs to ``user_id`` and
         is open. Raise otherwise.
@@ -219,11 +231,50 @@ class MoneyStateService:
                 f"Cycle {cycle_id} is closed (status={cycle.status!r}); "
                 "historical state is immutable"
             )
+        if currency is not None and cycle.currency != _validate_currency(currency):
+            raise CycleCurrencyMismatchError(cycle_id, cycle.currency, _validate_currency(currency))
         # Preserve this transaction's own pending money changes before the
         # fresh per-row reads below. Never flush a mutation before checking
         # the current, locked lifecycle state.
         self.session.flush()
         return cycle
+
+    def validate_source_currency(
+        self, user_id: int, source_key: str, currency: str, *, kind: str,
+    ) -> None:
+        """Read-only replay precheck; record methods repeat it under a lock."""
+        currency = _validate_currency(currency)
+        if not source_key or not str(source_key).strip():
+            raise InvalidSourceKeyError("source_key is required")
+        source_key = str(source_key).strip()
+        if kind == "extra":
+            model = CycleIncome
+        elif kind == "savings_realized":
+            model = SavingsRealization
+        else:
+            raise InvalidSourceKeyError("unknown source-key operation kind")
+        stmt = select(model.currency).join(
+            FinancialCycle, FinancialCycle.id == model.cycle_id,
+        ).where(
+            FinancialCycle.telegram_user_id == user_id,
+            model.source_key == source_key,
+            model.currency != currency,
+        )
+        if kind == "extra":
+            stmt = stmt.where(CycleIncome.kind == "extra")
+        previous = self.session.execute(stmt.limit(1)).scalar_one_or_none()
+        if previous is not None:
+            raise MoneySourceCurrencyConflictError(source_key, previous, currency)
+
+    def _lock_source_currency(self, user_id: int, source_key: str, currency: str, *, kind: str) -> None:
+        # Cycle locks are intentionally independent across currencies. This
+        # narrow key lock makes the cross-cycle identity check atomic without
+        # serializing unrelated financial operations or adding a ledger.
+        if self.session.get_bind().dialect.name == "postgresql":
+            digest = hashlib.sha256(f"money:{user_id}:{kind}:{source_key}".encode()).digest()
+            lock_id = int.from_bytes(digest[:8], "big", signed=True)
+            self.session.execute(select(func.pg_advisory_xact_lock(lock_id)))
+        self.validate_source_currency(user_id, source_key, currency, kind=kind)
 
     # ==================================================================
     # BASE INCOME
@@ -243,7 +294,7 @@ class MoneyStateService:
         same ``(cycle_id, currency)`` updates the existing row; no
         second physical row is created.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
         amount = _validate_amount_positive_or_zero(amount, name="amount")
         if amount < 0:
@@ -288,7 +339,7 @@ class MoneyStateService:
             # fall through to the re-read + update path. We do not
             # touch ``row`` again — it has been detached by rollback.
             self.session.rollback()
-            self._require_open_cycle(user_id, cycle_id)
+            self._require_open_cycle(user_id, cycle_id, currency=currency)
         # Re-read after rollback to capture the canonical row. After a
         # concurrent insert we end up here; on the happy path the just-
         # flushed row is still in the session so this read returns it.
@@ -329,7 +380,7 @@ class MoneyStateService:
         row instead of creating a duplicate. Concurrent callers on the
         same key observe one physical row.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
         amount = _validate_amount_positive_or_zero(amount, name="amount")
         if amount <= 0:
@@ -341,6 +392,8 @@ class MoneyStateService:
                 "extra income source_key is required and must be non-empty"
             )
         source_key = str(source_key).strip()
+
+        self._lock_source_currency(user_id, source_key, currency, kind="extra")
 
         now = _now_utc()
         existing = self._find_extra(user_id, cycle_id, source_key)
@@ -378,7 +431,8 @@ class MoneyStateService:
             self.session.refresh(row)
         except IntegrityError:
             self.session.rollback()
-            self._require_open_cycle(user_id, cycle_id)
+            self._require_open_cycle(user_id, cycle_id, currency=currency)
+            self._lock_source_currency(user_id, source_key, currency, kind="extra")
             canonical = self._find_extra(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
@@ -422,7 +476,7 @@ class MoneyStateService:
         # Closed-cycle guard: the row itself survives, but no
         # mutation is allowed. ``_require_open_cycle`` raises
         # ``CycleClosedError`` on closed cycles.
-        self._require_open_cycle(user_id, row.cycle_id)
+        self._require_open_cycle(user_id, row.cycle_id, currency=row.currency)
         row = self._find_extra_by_id(user_id, extra_id, refresh=True)
         if row is None or row.deleted_at is not None:
             raise ExtraIncomeNotFoundError(f"extra income {extra_id} not found")
@@ -459,7 +513,7 @@ class MoneyStateService:
             raise ExtraIncomeNotFoundError(
                 f"extra income {extra_id} not found"
             )
-        self._require_open_cycle(user_id, row.cycle_id)
+        self._require_open_cycle(user_id, row.cycle_id, currency=row.currency)
         row = self._find_extra_by_id(user_id, extra_id, refresh=True)
         if row is None:
             raise ExtraIncomeNotFoundError(f"extra income {extra_id} not found")
@@ -528,7 +582,7 @@ class MoneyStateService:
         be non-negative. R3 does NOT auto-insert a 20% row on read —
         the soft default lives in the engine.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
 
         has_pct = target_pct is not None
@@ -600,7 +654,7 @@ class MoneyStateService:
         may legally sit BELOW ``realized`` — the engine emits a
         warning, never an error.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
         amount = _validate_amount_positive_or_zero(amount, name="amount")
         if amount < 0:
@@ -640,7 +694,7 @@ class MoneyStateService:
         ``committed = max(reserved, realized)`` — no transfer
         bookkeeping is invented here.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
         amount = _validate_amount_positive_or_zero(amount, name="amount")
         if amount <= 0:
@@ -688,7 +742,7 @@ class MoneyStateService:
         :meth:`record_extra_income`. ``amount > 0`` is enforced both
         here and at the schema CHECK level.
         """
-        self._require_open_cycle(user_id, cycle_id)
+        self._require_open_cycle(user_id, cycle_id, currency=currency)
         currency = _validate_currency(currency)
         amount = _validate_amount_positive_or_zero(amount, name="amount")
         if amount <= 0:
@@ -700,6 +754,8 @@ class MoneyStateService:
                 "realized source_key is required and must be non-empty"
             )
         source_key = str(source_key).strip()
+
+        self._lock_source_currency(user_id, source_key, currency, kind="savings_realized")
 
         now = _now_utc()
         new_amount = amount.quantize(Decimal("0.01"))
@@ -737,7 +793,8 @@ class MoneyStateService:
             self.session.refresh(row)
         except IntegrityError:
             self.session.rollback()
-            self._require_open_cycle(user_id, cycle_id)
+            self._require_open_cycle(user_id, cycle_id, currency=currency)
+            self._lock_source_currency(user_id, source_key, currency, kind="savings_realized")
             canonical = self._find_realization(user_id, cycle_id, source_key)
             if canonical is None:
                 raise
@@ -768,7 +825,7 @@ class MoneyStateService:
             raise SavingsRealizationNotFoundError(
                 f"savings realization {realization_id} not found"
             )
-        self._require_open_cycle(user_id, row.cycle_id)
+        self._require_open_cycle(user_id, row.cycle_id, currency=row.currency)
         row = self._find_realization_by_id(user_id, realization_id, refresh=True)
         if row is None or row.deleted_at is not None:
             raise SavingsRealizationNotFoundError(f"savings realization {realization_id} not found")
@@ -802,7 +859,7 @@ class MoneyStateService:
             raise SavingsRealizationNotFoundError(
                 f"savings realization {realization_id} not found"
             )
-        self._require_open_cycle(user_id, row.cycle_id)
+        self._require_open_cycle(user_id, row.cycle_id, currency=row.currency)
         row = self._find_realization_by_id(user_id, realization_id, refresh=True)
         if row is None:
             raise SavingsRealizationNotFoundError(f"savings realization {realization_id} not found")
@@ -858,6 +915,7 @@ class MoneyStateService:
 
 __all__ = [
     "CycleClosedError",
+    "CycleCurrencyMismatchError",
     "CycleNotFoundError",
     "CycleOwnershipMismatchError",
     "ExtraIncomeNotFoundError",

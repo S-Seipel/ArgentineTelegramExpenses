@@ -207,7 +207,7 @@ async def handle_command(
     if command in (
         "/gastosfijos", "/gastofijo_add", "/gastofijo_del",
         "/gastofijo_off", "/gastofijo_on",
-        "/pague", "/salte", "/liberado",
+        "/pague", "/salte",
     ):
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         with session_scope() as session:
@@ -230,10 +230,10 @@ async def handle_command(
         await update.effective_message.reply_text(reply)
         return
 
-    if command in ("/cycle", "/disponible", "/gastar_diario"):
+    if command in ("/cycle", "/disponible", "/liberado", "/gastar_diario"):
         await update.effective_message.chat.send_action(ChatAction.TYPING)
         reply = _handle_cycle_read_command(
-            command,
+            command, args=args,
             user_id=user_id,
             today=today_in_tz(deps.runtime.settings.timezone),
         )
@@ -1253,9 +1253,6 @@ def _handle_fixed_expense_command(
                 return f"🤷 Error salteando *{bill.name}*."
             return f"⏭️ *{bill.name}* salteado este mes."
 
-    if command == "/liberado":
-        return _format_month_summary(service, user_id, month_year)
-
     return "Comando no reconocido."
 
 
@@ -1304,35 +1301,8 @@ def _format_fixed_expenses_month(
     lines.append(
         f"\n💰 Ingreso + extra → `/ingreso 1100000`, `/extra 75000`"
     )
-    lines.append(f"📊 Resumen → `/liberado`")
+    lines.append(f"📊 Disponible del ciclo → `/disponible [ARS|USD]` (`/liberado` es un alias)")
     return "\n".join(lines)
-
-
-def _format_month_summary(
-    service: FixedExpenseService, user_id: int, month_year: str
-) -> str:
-    summary = service.month_summary(user_id, month_year)
-    bills = service.with_status_for_month(user_id, month_year)
-    paid_count = sum(1 for b in bills if b.paid)
-    total_count = len(bills)
-    lines = [
-        f"📊 *Resumen del mes {month_year}*",
-        "",
-        f"💵 Ingreso:    ${fmt_money(summary.income)}",
-        f"➕ Extra:       ${fmt_money(summary.extra)}",
-        f"📉 Gastos fijos: ${fmt_money(summary.total_fixed_paid)}",
-        f"   _(esperado ${fmt_money(summary.total_fixed_expected)})_",
-        "",
-        f"💰 *Liberado:   ${fmt_money(summary.liberado)}*",
-        "",
-        f"Pagados: {paid_count}/{total_count}",
-    ]
-    return "\n".join(lines)
-
-
-def fmt_money(n) -> str:
-    from app.utils.formatting import format_amount
-    return format_amount(n)
 
 
 def _handle_config_payday_command(
@@ -1351,8 +1321,11 @@ def _handle_config_payday_command(
             "❓ Decime el día de cobro. Ej: `/config_payday 5`.\n"
             "Valores válidos: 1-31 o `primer_viernes`."
         )
-    if len(args) != 1:
-        return "❓ Usá `/config_payday <1-31>` o `/config_payday primer_viernes`."
+    if len(args) > 2:
+        return "❓ Usá `/config_payday <1-31|primer_viernes> [moneda]`. Ej: `/config_payday primer_viernes ARS`."
+    currency = _parse_cycle_currency_arg(args[1:])
+    if currency is None:
+        return "❓ La moneda debe tener tres letras, como ARS o USD."
     first_weekdays = {
         "primer_lunes": 0, "primer_martes": 1,
         "primer_miercoles": 2, "primer_miércoles": 2,
@@ -1364,10 +1337,10 @@ def _handle_config_payday_command(
     if weekday is not None:
         with session_scope() as session:
             config = UserSettingsService(session).set_payday_rule(
-                user_id, "first_weekday", weekday=weekday, timezone=timezone
+                user_id, "first_weekday", weekday=weekday, timezone=timezone, currency=currency
             )
         return (
-            f"📅 Cobro configurado: {_payday_description(config)}.\n"
+            f"📅 Cobro configurado ({currency}): {_payday_description(config)}.\n"
             "Los ciclos ya abiertos conservan sus fechas; el cambio se aplica al próximo ciclo."
         )
     try:
@@ -1377,12 +1350,12 @@ def _handle_config_payday_command(
     try:
         with session_scope() as session:
             UserSettingsService(session).set_payday_day(
-                user_id=user_id, payday_day=day, timezone=timezone
+                user_id=user_id, payday_day=day, timezone=timezone, currency=currency
             )
     except ValueError:
         return "❓ El día tiene que estar entre 1 y 31."
     return (
-        f"📅 Día de cobro configurado: día *{day}* del mes.\n"
+        f"📅 Día de cobro configurado ({currency}): día *{day}* del mes.\n"
         "Los ciclos ya abiertos conservan sus fechas; el cambio se aplica al próximo ciclo."
     )
 
@@ -1394,11 +1367,23 @@ def _payday_description(config) -> str:
     return f"día {config.payday_day} de cada mes"
 
 
+def _parse_cycle_currency_arg(args: list[str]) -> str | None:
+    """Read-only commands accept one explicit currency; ARS remains the default."""
+    import re
+
+    if not args:
+        return "ARS"
+    if len(args) == 1 and re.fullmatch(r"[A-Za-z]{3}", args[0]):
+        return args[0].upper()
+    return None
+
+
 def _handle_cycle_read_command(
     command: str,
     *,
     user_id: int,
     today,
+    args: list[str] | None = None,
 ) -> str:
     """R2 read commands: ``/cycle``, ``/disponible``, ``/gastar_diario``.
 
@@ -1409,11 +1394,14 @@ def _handle_cycle_read_command(
     """
     from app.money import CycleService
 
+    currency = _parse_cycle_currency_arg(args or [])
+    if currency is None:
+        return f"❓ Usá `{command} [moneda]`, por ejemplo `{command} USD`."
     try:
         with session_scope() as session:
             cycle_service = CycleService(session)
             engine = MoneyEngine(session)
-            cycle = cycle_service.ensure_current_cycle(user_id, today)
+            cycle = cycle_service.ensure_current_cycle(user_id, today, currency=currency)
             summary = engine.get_cycle_summary(
                 user_id, cycle.id, today=today
             )
@@ -1423,8 +1411,9 @@ def _handle_cycle_read_command(
 
     if command == "/cycle":
         return _format_cycle_summary(summary)
-    if command == "/disponible":
-        return _format_available(summary)
+    if command in ("/disponible", "/liberado"):
+        reply = _format_available(summary)
+        return "ℹ️ /liberado es un alias de /disponible.\n" + reply if command == "/liberado" else reply
     if command == "/gastar_diario":
         return _format_daily(summary)
     return "Comando no reconocido."
@@ -1463,7 +1452,7 @@ def _format_cycle_summary(summary) -> str:
     from app.utils.formatting import format_currency_amount
 
     label = (
-        f"📆 Ciclo #{summary.cycle_index} "
+        f"📆 Ciclo #{summary.cycle_index} · {getattr(summary, 'currency', 'ARS')} "
         f"({summary.start_date.isoformat()} → "
         f"{summary.end_date.isoformat()}) — {summary.status}"
     )
@@ -1520,7 +1509,7 @@ def _format_available(summary) -> str:
     if not currencies:
         return (
             "💸 Aún no tengo datos suficientes para calcular tu "
-            "disponible. Cargá un ingreso o un gasto para empezar."
+            f"disponible en {getattr(summary, 'currency', 'ARS')}. Cargá un ingreso o un gasto para empezar."
         )
     bits = ", ".join(
         format_currency_amount(summary.available_to_spend.get(currency), currency)
@@ -1538,7 +1527,7 @@ def _format_daily(summary) -> str:
         return "📅 El ciclo ya cerró; no hay diario para hoy."
     currencies = _cycle_summary_currencies(summary)
     if not currencies:
-        return "💸 Sin ingresos registrados este ciclo."
+        return f"💸 Sin ingresos registrados este ciclo ({getattr(summary, 'currency', 'ARS')})."
     bits = ", ".join(
         format_currency_amount(summary.daily_safe_to_spend.get(currency), currency)
         for currency in currencies
@@ -1566,18 +1555,25 @@ def _tg_source_key(prefix: str, chat_id: int, message_id: int) -> str:
 def _parse_tg_amount(args: list[str]) -> Decimal | None:
     if not args:
         return None
-    return _normalize_decimal(args[0])
+    amount = _normalize_decimal(args[0])
+    return amount if amount is not None and amount.is_finite() else None
 
 
 def _parse_tg_currency(text: str, args: list[str]) -> str:
     # Reuse the existing detector so the surface stays consistent.
     from app.utils.amounts import detect_currency_hint
 
+    if len(args) >= 2:
+        token = args[1]
+        if len(token) == 3 and token.isascii() and token.isalpha() and (
+            token.isupper() or token.lower() in {"ars", "usd", "eur", "jpy", "brl", "clp", "uyu"}
+        ):
+            return token.upper()
     hint = detect_currency_hint(" ".join(args) or text or "")
     return (hint or "ARS").upper()
 
 
-def _resolve_current_cycle_id_or_message(user_id: int, today) -> tuple[int | None, str | None]:
+def _resolve_current_cycle_id_or_message(user_id: int, today, *, currency: str = "ARS") -> tuple[int | None, str | None]:
     """Return ``(cycle_id, error_message)``.
 
     ``CycleService.ensure_current_cycle`` walks the rollover chain so a
@@ -1589,7 +1585,7 @@ def _resolve_current_cycle_id_or_message(user_id: int, today) -> tuple[int | Non
 
     try:
         with session_scope() as s:
-            cycle = CycleService(s).ensure_current_cycle(user_id, today)
+            cycle = CycleService(s).ensure_current_cycle(user_id, today, currency=currency)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Could not resolve cycle for money mutation by user %s", user_id)
         return None, _cycle_failure_message(exc)
@@ -1614,7 +1610,7 @@ def _handle_ingreso_command(
     if amount < 0:
         return "❓ El monto tiene que ser 0 o más."
     currency = _parse_tg_currency(text, args)
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
     try:
@@ -1657,10 +1653,17 @@ def _handle_extra_command(
         return "❓ El monto tiene que ser mayor a 0."
     currency = _parse_tg_currency(text, args)
     note = " ".join(args[1:]).strip() or None
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    source_key = _tg_source_key("extra", chat_id, message_id)
+    try:
+        with session_scope() as session:
+            MoneyStateService(session).validate_source_currency(
+                user_id, source_key, currency, kind="extra",
+            )
+    except MoneySourceCurrencyConflictError:
+        return "⚠️ Ese extra ya fue registrado en otra moneda."
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
-    source_key = _tg_source_key("extra", chat_id, message_id)
     try:
         with session_scope() as s:
             row = MoneyStateService(s).record_extra_income(
@@ -1788,11 +1791,11 @@ def _parse_target_value(args: list[str]) -> tuple[Decimal | None, Decimal | None
     raw = args[0]
     if raw.endswith("%"):
         pct = _normalize_decimal(raw[:-1].strip())
-        if pct is None:
+        if pct is None or not pct.is_finite() or not 0 <= pct <= 100:
             return None, None
         return pct / Decimal("100"), None
     val = _normalize_decimal(raw)
-    if val is None:
+    if val is None or not val.is_finite() or val < 0:
         return None, None
     return None, val
 
@@ -1814,7 +1817,7 @@ def _handle_target_command(
             "`/target 220000` para monto."
         )
     currency = _parse_tg_currency(text, args)
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
     try:
@@ -1851,7 +1854,7 @@ def _handle_reservar_command(
     if amount < 0:
         return "❓ El monto tiene que ser 0 o más."
     currency = _parse_tg_currency(text, args)
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
     try:
@@ -1887,7 +1890,7 @@ def _handle_liberar_command(
     if amount <= 0:
         return "❓ El monto tiene que ser mayor a 0."
     currency = _parse_tg_currency(text, args)
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
     try:
@@ -1929,10 +1932,17 @@ def _handle_ahorro_realizado_command(
         return "❓ El monto tiene que ser mayor a 0."
     currency = _parse_tg_currency(text, args)
     note = " ".join(args[1:]).strip() or None
-    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today)
+    source_key = _tg_source_key("savings", chat_id, message_id)
+    try:
+        with session_scope() as session:
+            MoneyStateService(session).validate_source_currency(
+                user_id, source_key, currency, kind="savings_realized",
+            )
+    except MoneySourceCurrencyConflictError:
+        return "⚠️ Ese ahorro ya fue registrado en otra moneda."
+    cycle_id, err = _resolve_current_cycle_id_or_message(user_id, today, currency=currency)
     if err is not None:
         return err
-    source_key = _tg_source_key("savings", chat_id, message_id)
     try:
         with session_scope() as s:
             row = MoneyStateService(s).record_savings_realized(

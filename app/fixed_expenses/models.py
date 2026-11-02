@@ -6,8 +6,8 @@ Two tables:
 - ``fixed_expense_payments``: per-month payment record (paid_at, actual
   amount, note). Unique on (fixed_expense_id, month_year).
 
-A third table ``monthly_budget`` holds the user's monthly income and
-extra to compute the month's "liberado" (income - extra - spent fixed).
+The archive ``monthly_budget_legacy`` preserves monthly income entered
+before financial cycles. New income belongs to ``cycle_incomes``.
 """
 from __future__ import annotations
 
@@ -149,9 +149,9 @@ class FixedExpensePayment(Base):
 
 
 class MonthlyBudget(Base):
-    """User-defined income / extra for a given month."""
+    """Historical monthly income / extra, retained for read compatibility."""
 
-    __tablename__ = "monthly_budget"
+    __tablename__ = "monthly_budget_legacy"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telegram_user_id: Mapped[int] = mapped_column(

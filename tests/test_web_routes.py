@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config.settings import Settings
 from app.database.database import session_scope
-from app.database.database import session_scope
+from app.fixed_expenses.models import MonthlyBudget
 from app.expenses.repository import ExpenseRepository
 from app.expenses.service import ExpenseDraft, ExpenseService
 from app.budgets.repository import BudgetRepository
@@ -237,13 +237,15 @@ def test_api_month_summary_with_income(in_memory_db, client):
     from app.fixed_expenses.service import FixedExpenseService
     my = today_in_tz("UTC").strftime("%Y-%m")
     with session_scope() as s:
-        svc = FixedExpenseService(FixedExpenseRepository(s))
-        svc.set_budget(123456, my, income=Decimal("1000000"),
-                       extra=Decimal("50000"))
+        s.add(MonthlyBudget(telegram_user_id=123456, month_year=my,
+                            income=Decimal("1000000"), extra=Decimal("50000")))
     r = client.get("/api/month-summary")
     data = r.json()
     assert data["income"] == 1000000.0
     assert data["extra"] == 50000.0
+    assert data["source"] == "monthly_budget_legacy"
+    assert data["read_only"] is True
+    assert data["currency"] == "ARS"
 
 
 def test_api_create_fixed_expense(in_memory_db, client):
@@ -396,11 +398,10 @@ def test_api_full_flow_via_dashboard(in_memory_db, client):
     # Set income
     my = today_in_tz("UTC").strftime("%Y-%m")
     client.post("/api/month-summary")  # warmup
-    # Set income via service directly
+    # Preserve an income row from before migration to financial cycles.
     with session_scope() as s:
-        FixedExpenseService(FixedExpenseRepository(s)).set_budget(
-            123456, my, income=Decimal("1100000"),
-            extra=Decimal("75000"))
+        s.add(MonthlyBudget(telegram_user_id=123456, month_year=my,
+                            income=Decimal("1100000"), extra=Decimal("75000")))
 
     # Pay CASA exact, GYM more
     client.post(f"/api/fixed-expenses/{casa_id}/pay", json={})

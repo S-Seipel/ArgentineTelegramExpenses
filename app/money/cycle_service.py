@@ -48,6 +48,8 @@ from app.money.repository import (
     DEFAULT_PAYDAY_DAY,
     FinancialCycleRepository,
     UserSettingsRepository,
+    cycle_currency_scope,
+    normalize_currency,
 )
 from app.money.snapshot import (
     build_closing_snapshot,
@@ -59,8 +61,8 @@ class UserSettingsService:
         self.session = session
         self.repo = UserSettingsRepository(session)
 
-    def get_settings(self, user_id: int) -> UserSettings:
-        return self.repo.get_or_default(user_id)
+    def get_settings(self, user_id: int, *, currency: str = "ARS"):
+        return self.repo.get_or_default(user_id, currency=currency)
 
     def set_payday_day(
         self,
@@ -68,25 +70,27 @@ class UserSettingsService:
         payday_day: int,
         *,
         timezone: Optional[str] = None,
+        currency: str = "ARS",
     ) -> UserSettings:
         return self.repo.upsert_payday_day(
-            user_id, payday_day, timezone=timezone
+            user_id, payday_day, timezone=timezone, currency=currency
         )
 
     def set_payday_rule(
         self, user_id: int, pay_rule: str, *, weekday: Optional[int] = None,
         payday_day: Optional[int] = None, timezone: Optional[str] = None,
+        currency: str = "ARS",
     ) -> UserSettings:
         return self.repo.upsert_payday_rule(
             user_id, pay_rule, weekday=weekday,
-            payday_day=payday_day, timezone=timezone,
+            payday_day=payday_day, timezone=timezone, currency=currency,
         )
 
     def set_first_weekday(
-        self, user_id: int, weekday: int = 4, *, timezone: Optional[str] = None,
+        self, user_id: int, weekday: int = 4, *, timezone: Optional[str] = None, currency: str = "ARS",
     ) -> UserSettings:
         return self.set_payday_rule(
-            user_id, "first_weekday", weekday=weekday, timezone=timezone,
+            user_id, "first_weekday", weekday=weekday, timezone=timezone, currency=currency,
         )
 
 
@@ -136,6 +140,8 @@ class CurrentCycleView:
     status: str
     pay_rule: str = "fixed_day"
     payday_weekday: Optional[int] = None
+    currency: str = "ARS"
+    legacy_mixed_currency: bool = False
 
 
 class CycleService:
@@ -158,19 +164,17 @@ class CycleService:
     # settings helpers
     # ------------------------------------------------------------------
 
-    def _payday_day(self, user_id: int) -> int:
-        return self._payday_config(user_id)["payday_day"]
+    def _payday_day(self, user_id: int, *, currency: str = "ARS") -> int:
+        return self._payday_config(user_id, currency=currency)["payday_day"]
 
-    def _payday_config(self, user_id: int) -> dict:
-        # Read scalars rather than a possibly cached UserSettings object.
-        row = self.session.execute(
-            select(UserSettings.payday_day, UserSettings.pay_rule, UserSettings.payday_weekday)
-            .where(UserSettings.telegram_user_id == user_id)
-        ).one_or_none()
+    def _payday_config(self, user_id: int, *, currency: str = "ARS", freeze: bool = False) -> dict:
+        currency = normalize_currency(currency)
+        row = (self.settings.materialize_currency(user_id, currency) if freeze
+               else self.settings.get_or_default(user_id, currency=currency))
         return {
-            "payday_day": row.payday_day if row else DEFAULT_PAYDAY_DAY,
-            "pay_rule": row.pay_rule if row else "fixed_day",
-            "payday_weekday": row.payday_weekday if row else None,
+            "payday_day": row.payday_day,
+            "pay_rule": row.pay_rule,
+            "payday_weekday": row.payday_weekday,
         }
 
     # ------------------------------------------------------------------
@@ -178,13 +182,14 @@ class CycleService:
     # ------------------------------------------------------------------
 
     def get_current_cycle(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> Optional[CurrentCycleView]:
         """Return the open cycle that contains ``today``.
 
         READ ONLY. No writes. If the cycle has expired, returns None.
         """
-        open_cycle = self.cycles.find_open_cycle(user_id)
+        currency = normalize_currency(currency)
+        open_cycle = self.cycles.find_open_cycle(user_id, currency=currency)
         if open_cycle is None:
             return None
         window = CycleWindow(
@@ -203,6 +208,8 @@ class CycleService:
             end_date=open_cycle.end_date,
             payday_day=open_cycle.payday_day,
             status=open_cycle.status,
+            currency=open_cycle.currency,
+            legacy_mixed_currency=open_cycle.legacy_mixed_currency,
             pay_rule=open_cycle.pay_rule,
             payday_weekday=open_cycle.payday_weekday,
         )
@@ -212,7 +219,7 @@ class CycleService:
     # ------------------------------------------------------------------
 
     def open_initial_cycle(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> CurrentCycleView:
         """Open the very first cycle for ``user_id`` if none exists.
 
@@ -229,12 +236,12 @@ class CycleService:
         other caller re-reads the canonical row on a fresh session
         so it doesn't depend on the rolled-back transaction's snapshot.
         """
-        return self._open_initial_once(user_id, today)
+        return self._open_initial_once(user_id, today, currency=normalize_currency(currency))
 
     def _open_initial_once(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> CurrentCycleView:
-        existing = self.get_current_cycle(user_id, today)
+        existing = self.get_current_cycle(user_id, today, currency=currency)
         if existing is not None:
             return existing
 
@@ -242,21 +249,22 @@ class CycleService:
         # committed state — critical for the concurrent case.
         self._reset_session()
 
-        if self.cycles.has_any_cycle(user_id):
-            latest = self.cycles.find_latest_cycle(user_id)
+        if self.cycles.has_any_cycle(user_id, currency=currency):
+            latest = self.cycles.find_latest_cycle(user_id, currency=currency)
             assert latest is not None
-            current = self.get_current_cycle(user_id, today)
+            current = self.get_current_cycle(user_id, today, currency=currency)
             if current is not None:
                 return current
             raise CycleRolloverRequired(user_id, latest, today)
 
-        window = cycle_window_for(today, **self._payday_config(user_id))
+        window = cycle_window_for(today, **self._payday_config(user_id, currency=currency, freeze=True))
         opened_at = datetime.now(timezone.utc)
 
         try:
             row = self.cycles.insert_cycle(
                 user_id=user_id,
                 cycle_index=1,
+                currency=currency,
                 start_date=window.start_date,
                 end_date=window.end_date,
                 payday_day=window.payday_day,
@@ -268,7 +276,7 @@ class CycleService:
             self.session.refresh(row)
         except IntegrityError:
             self.session.rollback()
-            return self._recover_after_concurrent_open(user_id, today)
+            return self._recover_after_concurrent_open(user_id, today, currency=currency)
 
         return CurrentCycleView(
             cycle_id=row.id,
@@ -277,6 +285,8 @@ class CycleService:
             end_date=row.end_date,
             payday_day=row.payday_day,
             status=row.status,
+            currency=row.currency,
+            legacy_mixed_currency=row.legacy_mixed_currency,
             pay_rule=row.pay_rule,
             payday_weekday=row.payday_weekday,
         )
@@ -292,7 +302,7 @@ class CycleService:
             pass
 
     def _recover_after_concurrent_open(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> CurrentCycleView:
         """Re-read after a concurrent writer beat us.
 
@@ -306,7 +316,7 @@ class CycleService:
             try:
                 view = CycleService(
                     fresh, session_factory=self._session_factory
-                ).get_current_cycle(user_id, today)
+                ).get_current_cycle(user_id, today, currency=currency)
             finally:
                 fresh.close()
             if view is None:
@@ -316,7 +326,7 @@ class CycleService:
                 )
             return view
 
-        current = self.get_current_cycle(user_id, today)
+        current = self.get_current_cycle(user_id, today, currency=currency)
         if current is None:
             raise RuntimeError(
                 "Concurrency recovery failed: no open cycle after "
@@ -329,20 +339,20 @@ class CycleService:
     # ------------------------------------------------------------------
 
     def _safe_get_current_cycle(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> Optional[CurrentCycleView]:
         """``get_current_cycle`` wrapped in a defensive rollback so a
         session that ended up in an aborted state (e.g., an earlier
         IntegrityError in another operation) doesn't poison the read.
         """
         try:
-            return self.get_current_cycle(user_id, today)
+            return self.get_current_cycle(user_id, today, currency=currency)
         except Exception:
             self.session.rollback()
-            return self.get_current_cycle(user_id, today)
+            return self.get_current_cycle(user_id, today, currency=currency)
 
     def _recover_after_concurrent_open(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> Optional[CurrentCycleView]:
         """Re-read on a fresh session when a concurrent winner beat us.
 
@@ -355,13 +365,13 @@ class CycleService:
             # No factory supplied (typical path from web/telegram):
             # the rolled-back transaction in the same session will
             # auto-begin a new transaction on the next read.
-            return self.get_current_cycle(user_id, today)
+            return self.get_current_cycle(user_id, today, currency=currency)
 
         fresh = self._session_factory()
         try:
             return CycleService(
                 fresh, session_factory=self._session_factory
-            ).get_current_cycle(user_id, today)
+            ).get_current_cycle(user_id, today, currency=currency)
         finally:
             fresh.close()
 
@@ -458,7 +468,7 @@ class CycleService:
         )
 
     def rollover_cycle(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> FinancialCycle:
         """Close any expired open cycle and return the resulting open
         cycle.
@@ -474,10 +484,10 @@ class CycleService:
         catch-up cap is enforced inside :meth:`ensure_current_cycle`
         which is the public entry point for "walk forward".
         """
-        return self._rollover_once(user_id, today, attempt=0)
+        return self._rollover_once(user_id, today, attempt=0, currency=normalize_currency(currency))
 
     def ensure_current_cycle(
-        self, user_id: int, today: date
+        self, user_id: int, today: date, *, currency: str = "ARS"
     ) -> FinancialCycle:
         """Walk forward through any expired cycles until today is
         covered.
@@ -487,14 +497,14 @@ class CycleService:
         raises :class:`CycleCatchUpLimitExceeded` so a runaway catch-up
         never spins forever.
         """
-        return self._rollover_once(user_id, today, attempt=0)
+        return self._rollover_once(user_id, today, attempt=0, currency=normalize_currency(currency))
 
     # ------------------------------------------------------------------
     # R2 internals
     # ------------------------------------------------------------------
 
     def _rollover_once(
-        self, user_id: int, today: date, *, attempt: int
+        self, user_id: int, today: date, *, attempt: int, currency: str = "ARS"
     ) -> FinancialCycle:
         if attempt >= self._CATCH_UP_LIMIT:
             raise CycleCatchUpLimitExceeded(
@@ -502,11 +512,11 @@ class CycleService:
                 f"catch up to {today.isoformat()}; run again later."
             )
 
-        open_cycle = self._latest_open_cycle(user_id)
+        open_cycle = self._latest_open_cycle(user_id, currency=currency)
         if open_cycle is None:
-            latest = self._latest_cycle_any_status(user_id)
+            latest = self._latest_cycle_any_status(user_id, currency=currency)
             if latest is None:
-                view = self.open_initial_cycle(user_id, today)
+                view = self.open_initial_cycle(user_id, today, currency=currency)
                 return self._require_cycle(user_id, view.cycle_id)
             if today <= latest.end_date:
                 raise LookupError(
@@ -517,10 +527,11 @@ class CycleService:
             # contiguous, applying the currently configured payday without
             # changing the closed cycle or its frozen snapshot.
             next_day = latest.end_date + timedelta(days=1)
-            window = successor_window_for(next_day, **self._payday_config(user_id))
+            window = successor_window_for(next_day, **self._payday_config(user_id, currency=currency, freeze=True))
             new_cycle = self._try_insert_open_cycle(
                 user_id=user_id,
-                cycle_index=self._next_cycle_index(user_id),
+                cycle_index=self._next_cycle_index(user_id, currency=currency),
+                currency=currency,
                 start_date=window.start_date,
                 end_date=window.end_date,
                 payday_day=window.payday_day,
@@ -531,7 +542,7 @@ class CycleService:
                 self.session.commit()
             else:
                 self.session.rollback()
-            return self._rollover_once(user_id, today, attempt=attempt + 1)
+            return self._rollover_once(user_id, today, attempt=attempt + 1, currency=currency)
 
         if open_cycle.start_date <= today <= open_cycle.end_date:
             return open_cycle
@@ -553,14 +564,15 @@ class CycleService:
         # Same session — no extra commit needed before opening the
         # next cycle. We rely on the partial unique index to catch the
         # concurrent-writer case.
-        just_closed = self._latest_cycle_any_status(user_id)
+        just_closed = self._latest_cycle_any_status(user_id, currency=currency)
         assert just_closed is not None
         next_day = just_closed.end_date + timedelta(days=1)
-        window = successor_window_for(next_day, **self._payday_config(user_id))
-        next_cycle_index = self._next_cycle_index(user_id)
+        window = successor_window_for(next_day, **self._payday_config(user_id, currency=currency, freeze=True))
+        next_cycle_index = self._next_cycle_index(user_id, currency=currency)
         new_cycle = self._try_insert_open_cycle(
             user_id=user_id,
             cycle_index=next_cycle_index,
+            currency=currency,
             start_date=window.start_date,
             end_date=window.end_date,
             payday_day=window.payday_day,
@@ -572,14 +584,14 @@ class CycleService:
         else:
             # Lost the race; re-read and return the winner.
             self.session.rollback()
-            winner = self._latest_open_cycle(user_id)
+            winner = self._latest_open_cycle(user_id, currency=currency)
             if winner is not None:
                 return winner
 
         # Continue walking: this is also the catch-up path. The
         # defensive cap at ``_CATCH_UP_LIMIT`` keeps the loop bounded
         # in case of a clock-drift or payday-misconfiguration bug.
-        return self._rollover_once(user_id, today, attempt=attempt + 1)
+        return self._rollover_once(user_id, today, attempt=attempt + 1, currency=currency)
 
     def _lock_cycle_for_update(
         self, user_id: int, cycle_id: int
@@ -611,12 +623,13 @@ class CycleService:
         return cycle
 
     def _latest_open_cycle(
-        self, user_id: int
+        self, user_id: int, *, currency: str = "ARS"
     ) -> Optional[FinancialCycle]:
         stmt = (
             select(FinancialCycle)
             .where(
                 FinancialCycle.telegram_user_id == user_id,
+                FinancialCycle.currency == normalize_currency(currency),
                 FinancialCycle.status == "open",
             )
             .order_by(FinancialCycle.cycle_index.desc())
@@ -625,20 +638,20 @@ class CycleService:
         return self.session.execute(stmt).scalar_one_or_none()
 
     def _latest_cycle_any_status(
-        self, user_id: int
+        self, user_id: int, *, currency: str = "ARS"
     ) -> Optional[FinancialCycle]:
         stmt = (
             select(FinancialCycle)
-            .where(FinancialCycle.telegram_user_id == user_id)
+            .where(FinancialCycle.telegram_user_id == user_id, cycle_currency_scope(currency))
             .order_by(FinancialCycle.cycle_index.desc())
             .limit(1)
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
-    def _next_cycle_index(self, user_id: int) -> int:
+    def _next_cycle_index(self, user_id: int, *, currency: str = "ARS") -> int:
         stmt = select(
             func.coalesce(func.max(FinancialCycle.cycle_index), 0)
-        ).where(FinancialCycle.telegram_user_id == user_id)
+        ).where(FinancialCycle.telegram_user_id == user_id, cycle_currency_scope(currency))
         return int(self.session.execute(stmt).scalar_one() or 0) + 1
 
     def _try_insert_open_cycle(
@@ -651,9 +664,11 @@ class CycleService:
         payday_day: int,
         pay_rule: str = "fixed_day",
         payday_weekday: Optional[int] = None,
+        currency: str = "ARS",
     ) -> Optional[FinancialCycle]:
         obj = FinancialCycle(
             telegram_user_id=user_id,
+            currency=normalize_currency(currency),
             cycle_index=cycle_index,
             start_date=start_date,
             end_date=end_date,
@@ -679,6 +694,7 @@ class CycleService:
             select(FinancialCycle)
             .where(
                 FinancialCycle.telegram_user_id == cycle.telegram_user_id,
+                cycle_currency_scope(cycle.currency),
                 FinancialCycle.cycle_index < cycle.cycle_index,
             )
             .order_by(FinancialCycle.cycle_index.desc())
@@ -693,9 +709,9 @@ class CycleService:
         )
 
         ensure_snapshot_version(prev.closing_snapshot)
-        return deserialize_carried_over(
+        return tuple(occ for occ in deserialize_carried_over(
             prev.closing_snapshot.get("carried_over_fixed", [])
-        )
+        ) if occ.currency.upper() == cycle.currency)
 
 
 def _pending_is_zero(mbc) -> bool:

@@ -34,7 +34,7 @@ from app.categories.models import Category
 from app.expenses.models import Expense
 from app.expenses.repository import ExpenseRepository
 from app.expenses.service import ExpenseDraft, ExpenseService
-from app.fixed_expenses.models import FixedExpense, FixedExpensePayment, MonthlyBudget
+from app.fixed_expenses.models import FixedExpense, FixedExpensePayment
 from app.fixed_expenses.repository import FixedExpenseRepository
 from app.fixed_expenses.schemas import (
     FixedExpenseCreate,
@@ -548,7 +548,7 @@ class FixedExpenseService:
                 FixedExpensePayment.skipped.is_(False),
             )
         ).scalar_one()
-        violations = MoneyEngine(session).detect_invariant_violations(user_id)
+        violations = MoneyEngine(session).detect_invariant_violations(user_id, currency=None)
         for violation in violations:
             template = self.repo.get_by_id(user_id, violation.fixed_expense_id)
             if template is None:
@@ -561,7 +561,7 @@ class FixedExpenseService:
             self._repair_one_mirror(user_id, template, payment)
 
         session.flush()
-        remaining = len(MoneyEngine(session).detect_invariant_violations(user_id))
+        remaining = len(MoneyEngine(session).detect_invariant_violations(user_id, currency=None))
         if remaining:
             raise MirrorRepairError("Quedan pagos con espejo inconsistente.")
         return MirrorRepairResult(
@@ -827,10 +827,18 @@ class FixedExpenseService:
         user_id: int,
         month_year: str,
     ) -> MonthlyBudgetOut:
+        """Read the former ARS monthly calculation for historical clients.
+
+        Legacy income has no currency column and represents ARS. Foreign
+        currency bills must never be subtracted from that amount.
+        """
         budget = self.repo.get_budget(user_id, month_year)
         income = budget.income if budget else Decimal("0")
         extra = budget.extra if budget else Decimal("0")
-        bills = self.with_status_for_month(user_id, month_year)
+        bills = [
+            bill for bill in self.with_status_for_month(user_id, month_year)
+            if bill.currency.upper() == "ARS"
+        ]
         total_expected = sum(
             (b.expected_amount for b in bills if b.is_active),
             Decimal("0"),

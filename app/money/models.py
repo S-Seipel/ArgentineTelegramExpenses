@@ -21,6 +21,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -33,6 +34,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    false,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -86,6 +88,35 @@ class UserSettings(Base):
             f"payday_day={self.payday_day}>"
         )
 
+    @property
+    def currency(self) -> str:
+        return "ARS"
+
+
+class CurrencyPaydaySettings(Base):
+    """An independent calendar for a non-ARS currency."""
+
+    __tablename__ = "currency_payday_settings"
+
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    currency: Mapped[str] = mapped_column(String(8), primary_key=True)
+    payday_day: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    pay_rule: Mapped[str] = mapped_column(String(24), nullable=False, default="fixed_day", server_default="fixed_day")
+    payday_weekday: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    timezone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("payday_day BETWEEN 1 AND 31", name="ck_currency_payday_settings_payday_day_range"),
+        CheckConstraint(
+            "(pay_rule = 'fixed_day' AND payday_weekday IS NULL) OR "
+            "(pay_rule = 'first_weekday' AND payday_weekday IS NOT NULL AND payday_weekday BETWEEN 0 AND 6)",
+            name="ck_currency_payday_settings_payday_rule",
+        ),
+        CheckConstraint("length(currency) BETWEEN 1 AND 8 AND currency = upper(currency) AND currency = trim(currency)", name="ck_currency_payday_settings_currency"),
+    )
+
 
 class FinancialCycle(Base):
     """One row per financial cycle the user opens.
@@ -105,6 +136,8 @@ class FinancialCycle(Base):
     telegram_user_id: Mapped[int] = mapped_column(
         BigInteger, nullable=False
     )
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="ARS", server_default="ARS")
+    legacy_mixed_currency: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     cycle_index: Mapped[int] = mapped_column(Integer, nullable=False)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
@@ -139,6 +172,7 @@ class FinancialCycle(Base):
     __table_args__ = (
         UniqueConstraint(
             "telegram_user_id",
+            "currency",
             "cycle_index",
             name="uq_financial_cycles_user_index",
         ),
@@ -150,6 +184,8 @@ class FinancialCycle(Base):
             "end_date >= start_date",
             name="ck_financial_cycles_date_range",
         ),
+        CheckConstraint("length(currency) BETWEEN 1 AND 8 AND currency = upper(currency) AND currency = trim(currency)", name="ck_financial_cycles_currency"),
+        CheckConstraint("NOT legacy_mixed_currency OR status = 'closed'", name="ck_financial_cycles_legacy_closed"),
         CheckConstraint(
             "(pay_rule = 'fixed_day' AND payday_weekday IS NULL) OR "
             "(pay_rule = 'first_weekday' AND payday_weekday IS NOT NULL "
@@ -165,6 +201,7 @@ class FinancialCycle(Base):
         Index(
             "uq_financial_cycles_user_open",
             "telegram_user_id",
+            "currency",
             unique=True,
             postgresql_where=text("status = 'open'"),
             sqlite_where=text("status = 'open'"),

@@ -7,6 +7,7 @@ import pytest
 
 from app.database.database import session_scope
 from app.fixed_expenses.repository import FixedExpenseRepository
+from app.fixed_expenses.models import MonthlyBudget
 from app.fixed_expenses.service import (
     FixedExpenseDraft,
     FixedExpenseService,
@@ -239,8 +240,8 @@ def test_month_summary_with_income(in_memory_db):
             name="GYM", expected_amount=Decimal("60000")))
         service.mark_paid(1, casa.id, "2026-09")
         service.mark_paid(1, gym.id, "2026-09", actual_amount=Decimal("70000"))
-        service.set_budget(1, "2026-09", income=Decimal("1100000"),
-                           extra=Decimal("75000"))
+        s.add(MonthlyBudget(telegram_user_id=1, month_year="2026-09",
+                            income=Decimal("1100000"), extra=Decimal("75000")))
     with session_scope() as s:
         service2 = FixedExpenseService(FixedExpenseRepository(s))
         summary = service2.month_summary(1, "2026-09")
@@ -260,7 +261,8 @@ def test_month_summary_skipped_excluded(in_memory_db):
             name="GYM", expected_amount=Decimal("60000")))
         service.mark_paid(1, casa.id, "2026-09")
         service.mark_skipped(1, gym.id, "2026-09")
-        service.set_budget(1, "2026-09", income=Decimal("1000000"))
+        s.add(MonthlyBudget(telegram_user_id=1, month_year="2026-09",
+                            income=Decimal("1000000")))
     with session_scope() as s:
         service2 = FixedExpenseService(FixedExpenseRepository(s))
         summary = service2.month_summary(1, "2026-09")
@@ -270,14 +272,33 @@ def test_month_summary_skipped_excluded(in_memory_db):
     assert summary.liberado == Decimal("910000")
 
 
-def test_budget_upsert(in_memory_db):
+def test_legacy_budget_write_rejected_without_changing_history(in_memory_db):
+    with session_scope() as s:
+        s.add(MonthlyBudget(telegram_user_id=1, month_year="2026-09",
+                            income=Decimal("1000000")))
+    with session_scope() as s:
+        repo = FixedExpenseRepository(s)
+        service = FixedExpenseService(repo)
+        with pytest.raises(ValueError, match="solo lectura"):
+            service.set_budget(1, "2026-09", extra=Decimal("50000"))
+        with pytest.raises(ValueError, match="solo lectura"):
+            repo.upsert_budget(1, "2026-10", income=Decimal("50"))
+        old = repo.get_budget(1, "2026-09")
+        assert old.income == Decimal("1000000")
+        assert old.extra == Decimal("0")
+        assert repo.get_budget(1, "2026-10") is None
+
+
+def test_legacy_ars_summary_does_not_subtract_usd_bills(in_memory_db):
     with session_scope() as s:
         service = FixedExpenseService(FixedExpenseRepository(s))
-        b1 = service.set_budget(1, "2026-09", income=Decimal("1000000"))
-    assert b1.income == Decimal("1000000")
-    assert b1.extra == Decimal("0")
+        usd = service.add(user_id=1, draft=FixedExpenseDraft(
+            name="USD bill", expected_amount=Decimal("100"), currency="USD"))
+        service.mark_paid(1, usd.id, "2026-09")
+        s.add(MonthlyBudget(telegram_user_id=1, month_year="2026-09",
+                            income=Decimal("1000")))
     with session_scope() as s:
-        service2 = FixedExpenseService(FixedExpenseRepository(s))
-        b2 = service2.set_budget(1, "2026-09", extra=Decimal("50000"))
-    assert b2.income == Decimal("1000000")  # preserved
-    assert b2.extra == Decimal("50000")
+        summary = FixedExpenseService(FixedExpenseRepository(s)).month_summary(1, "2026-09")
+        assert summary.total_fixed_expected == Decimal("0")
+        assert summary.total_fixed_paid == Decimal("0")
+        assert summary.liberado == Decimal("1000")

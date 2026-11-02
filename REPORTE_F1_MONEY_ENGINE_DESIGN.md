@@ -2,6 +2,12 @@
 
 Reference HEAD: `0b2973d` (post-F0 closure + lease fix).
 
+> Documento de diseño histórico. La implementación posterior de F1.1/F2/F3
+> archiva `MonthlyBudget`, convierte `/liberado` en alias de `/disponible`
+> y agrega ciclos y calendarios por moneda. Los alcances «futuro» y las
+> preguntas de este documento describen aquella referencia, no pendientes
+> de la versión actual. Ver `ROADMAP.md` y `REPORTE_F3_CURRENCY_RELEASE.md`.
+
 ---
 
 ## A. CURRENT MODEL AUDIT

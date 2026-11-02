@@ -122,13 +122,15 @@ def test_currency_partition_and_history(in_memory_db):
     today = date(2026, 10, 15)
     with session_scope() as session:
         UserSettingsService(session).set_payday_day(user, 1)
-        cycle = CycleService(session).open_initial_cycle(user, today).cycle_id
+        cycles = {currency: CycleService(session).open_initial_cycle(
+            user, today, currency=currency).cycle_id for currency in ("ARS", "USD")}
         state = MoneyStateService(session)
         fixed = FixedExpenseService(FixedExpenseRepository(session))
         for currency, income, saving, expense, pending in (
             ("ARS", "1000", "100", "200", "50"),
             ("USD", "500", "80", "20", "30"),
         ):
+            cycle = cycles[currency]
             state.set_income(user, cycle, currency, Decimal(income))
             state.set_savings_reserved(user, cycle, currency, Decimal(saving))
             _expense(session, user, expense, currency, today)
@@ -138,15 +140,17 @@ def test_currency_partition_and_history(in_memory_db):
             ))
     with session_scope() as session:
         engine = MoneyEngine(session)
-        summary = engine.get_cycle_summary(user, cycle, today=today)
-        assert summary.gross_income.to_dict() == {"ARS": "1000.00", "USD": "500.00"}
-        assert summary.available_to_spend.to_dict() == {"ARS": "650.00", "USD": "370.00"}
-        CycleService(session).close_cycle(user, cycle, force=True)
-    history = TestClient(app).get("/api/cycle-history").json()["items"]
-    assert history[0]["money"]["available_to_spend"] == {
-        "ARS": "650.00", "USD": "370.00"
-    }
-    assert history[0]["money"]["daily_safe_to_spend"] is None
+        for currency, income, available in (("ARS", "1000.00", "650.00"), ("USD", "500.00", "370.00")):
+            summary = engine.get_cycle_summary(user, cycles[currency], today=today)
+            assert summary.gross_income.to_dict() == {currency: income}
+            assert summary.available_to_spend.to_dict() == {currency: available}
+            CycleService(session).close_cycle(user, cycles[currency], force=True)
+    for currency, available in (("ARS", "650.00"), ("USD", "370.00")):
+        history = TestClient(app).get(f"/api/cycle-history?currency={currency}").json()["items"]
+        assert len(history) == 1
+        assert history[0]["cycle_id"] == cycles[currency]
+        assert history[0]["money"]["available_to_spend"] == {currency: available}
+        assert history[0]["money"]["daily_safe_to_spend"] is None
 
 
 def test_history_rejects_unknown_snapshot_version(in_memory_db):

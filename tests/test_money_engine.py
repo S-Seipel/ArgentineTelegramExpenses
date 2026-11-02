@@ -518,12 +518,14 @@ def test_pending_occurrence_uses_expected_amount(in_memory_db):
 def test_ars_and_usd_independent(in_memory_db):
     today = date(2026, 10, 15)
     view = _open_cycle(1, payday_day=1, today=today)
+    with session_scope() as s:
+        usd_view = CycleService(s).open_initial_cycle(1, today, currency="USD")
     _add_income(view.cycle_id, currency="ARS", amount=Decimal("1100000"))
-    _add_income(view.cycle_id, currency="USD", amount=Decimal("100"))
+    _add_income(usd_view.cycle_id, currency="USD", amount=Decimal("100"))
     _add_target(view.cycle_id, currency="ARS", pct=Decimal("0.20"))
-    _add_target(view.cycle_id, currency="USD", pct=Decimal("0.20"))
+    _add_target(usd_view.cycle_id, currency="USD", pct=Decimal("0.20"))
     _add_reserved(view.cycle_id, currency="ARS", amount=Decimal("220000"))
-    _add_reserved(view.cycle_id, currency="USD", amount=Decimal("20"))
+    _add_reserved(usd_view.cycle_id, currency="USD", amount=Decimal("20"))
     _add_expense(
         1, amount=Decimal("400000"), currency="ARS", expense_date=date(2026, 10, 5)
     )
@@ -537,12 +539,15 @@ def test_ars_and_usd_independent(in_memory_db):
     with session_scope() as s:
         engine = MoneyEngine(s)
         summary = engine.get_cycle_summary(1, view.cycle_id, today=today)
+        usd_summary = engine.get_cycle_summary(1, usd_view.cycle_id, today=today)
     # ARS: 1100 - 220 - 400 - 50 = 430 (F1=50 pending)
     # USD: 100 - 20 - 50 - 20 = 10
     assert summary.available_to_spend.get("ARS") == Decimal("430000")
-    assert summary.available_to_spend.get("USD") == Decimal("10")
+    assert usd_summary.available_to_spend.get("USD") == Decimal("10")
+    assert summary.available_to_spend.get("USD") == 0
+    assert usd_summary.available_to_spend.get("ARS") == 0
     # And: total() refuses to add them.
-    assert summary.available_to_spend.total() is None
+    assert summary.available_to_spend.union(usd_summary.available_to_spend).total() is None
 
 
 def test_money_by_currency_total_returns_none_for_multi_currency():

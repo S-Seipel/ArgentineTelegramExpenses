@@ -25,6 +25,7 @@ def register_all_models() -> None:
     )
     from app.money.models import (  # noqa: F401, F811
         CycleIncome,
+        CurrencyPaydaySettings,
         FinancialCycle,
         SavingsRealization,
         SavingsReserved,

@@ -42,6 +42,7 @@ def resolve_pending_recurring_obligations(
     templates = session.execute(
         select(RecurringExpense).where(
             RecurringExpense.telegram_user_id == user_id,
+            RecurringExpense.currency == cycle.currency,
             RecurringExpense.is_active.is_(True),
             RecurringExpense.is_obligation.is_(True),
         )

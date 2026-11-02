@@ -240,15 +240,16 @@ y los vas tildando a medida que los pagás.
 /disponible
 ```
 
-`/liberado` conserva el resumen mensual anterior y sus datos históricos.
-Los nuevos `/ingreso` y `/extra` alimentan el ciclo financiero, sin sincronizar
-el presupuesto mensual anterior. Para planificar usá `/disponible` y el panel
-**Ciclo activo** del dashboard.
+`/liberado` es un alias de `/disponible`: ambos muestran el ciclo financiero.
+`/ingreso` y `/extra` alimentan ese ciclo. Los importes del presupuesto
+anterior se conservan en `monthly_budget_legacy`, sin nuevas escrituras ni
+copias automáticas a ingresos del ciclo. El histórico se consulta con
+`GET /api/month-summary?month_year=2026-09` (ARS, `read_only: true`).
 
 El resumen visual mensual está en `/dashboard/mensual`. Abre el último mes
 cerrado y permite recorrer los meses con los botones anterior/siguiente.
 
-### Planificación por ciclo financiero (F1)
+### Planificación por ciclo financiero (F1–F3)
 
 Configurá un día fijo con `/config_payday <día>` o el primer viernes de
 cada mes con `/config_payday primer_viernes`. El ciclo va de un
@@ -270,13 +271,13 @@ La API `GET/PATCH /api/settings/payday` consulta y guarda `pay_rule`:
 `payday_weekday` de 0 (lunes) a 6 (domingo). El primer viernes es
 `{"pay_rule":"first_weekday","payday_weekday":4}`; su ordinal siempre es 1.
 Las instalaciones existentes deben ejecutar `alembic upgrade head` para
-aplicar `0015_payday_calendar_rule` antes de iniciar esta versión.
+aplicar todas las migraciones hasta `0017_currency_cycles` antes de iniciar
+esta versión.
 El disponible descuenta ahorro comprometido, gastos realizados y obligaciones
 fijas pendientes; puede ser negativo. ARS y USD se muestran por separado,
 sin conversión ni suma entre monedas.
 
-`/liberado` conserva su cálculo mensual **legacy**. Para planificación por
-ciclo usá `/disponible`. `/repair_fixed_payments` revisa y repara los espejos
+`/repair_fixed_payments` revisa y repara los espejos
 de pagos fijos inconsistentes; informa si no había nada que reparar.
 
 El dashboard local y privado incluye **Ciclo activo** con los valores del
@@ -286,6 +287,37 @@ Si no hay ciclo para hoy, **Abrir o actualizar ciclo** lo crea o actualiza
 mediante una acción explícita. Un disponible de cero se muestra como cero;
 un gasto diario no disponible se identifica por separado. Las inversiones se
 gestionan fuera de la aplicación.
+
+Cada moneda puede tener un calendario distinto y un ciclo abierto propio:
+
+```text
+/config_payday primer_viernes ARS
+/config_payday 15 USD
+/ingreso 1100000 ARS
+/ingreso 200 USD
+/disponible ARS
+/disponible USD
+/gastar_diario USD
+```
+
+Sin moneda se usa ARS. El selector del panel **Ciclo activo** permite cambiar
+entre ARS y USD para consultar el ciclo y guardar su calendario. Los ingresos,
+ahorros, gastos y obligaciones se calculan únicamente en la moneda de ese
+ciclo; cerrar o actualizar ARS no cierra USD. Los calendarios nuevos heredan
+la configuración inicial en ARS hasta configurar su propia regla o abrir
+su primer ciclo; desde ese momento conservan una configuración independiente.
+La API acepta `?currency=USD` en las consultas de ciclos, su historial y las
+acciones de apertura/actualización. `PATCH /api/settings/payday` y las
+mutaciones de dinero aceptan `currency` en el cuerpo. Enviar un `cycle_id`
+con una moneda diferente devuelve `409 cycle_currency_mismatch`.
+
+La migración conserva los cierres antiguos con varias monedas y los marca
+como históricos compartidos. Si encuentra un ciclo abierto con varias
+monedas, se detiene antes de modificar el esquema: ese ciclo debe cerrarse
+con la versión anterior para conservar su cálculo y snapshot completos.
+No redistribuye importes ni cambia snapshots automáticamente. Hacé una copia
+verificada antes de actualizar; el procedimiento de cierre se describe en
+el informe de esta versión.
 
 ### Compromisos recurrentes (F1.5)
 

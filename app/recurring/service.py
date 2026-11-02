@@ -391,6 +391,7 @@ class RecurringService:
         window = self.repo.session.execute(
             select(FinancialCycle.start_date, FinancialCycle.end_date).where(
                 FinancialCycle.telegram_user_id == template.telegram_user_id,
+                FinancialCycle.currency == template.currency,
                 FinancialCycle.status == "open",
                 FinancialCycle.start_date <= today,
                 FinancialCycle.end_date >= today,

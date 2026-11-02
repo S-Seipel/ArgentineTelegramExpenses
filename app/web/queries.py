@@ -859,8 +859,9 @@ def month_summary_dashboard(
     session: Session,
     user_id: int,
     today: date,
+    month_year: str | None = None,
 ) -> dict:
-    """Income + extra + fixed totals + liberado for the current month."""
+    """Read-only compatibility view of archived ARS monthly income."""
     from app.fixed_expenses.repository import FixedExpenseRepository
     from app.fixed_expenses.service import (
         FixedExpenseService,
@@ -868,10 +869,13 @@ def month_summary_dashboard(
     )
     repo = FixedExpenseRepository(session)
     service = FixedExpenseService(repo)
-    my = current_month_year(today)
+    my = month_year or current_month_year(today)
     summary = service.month_summary(user_id, my)
     return {
         "month_year": my,
+        "currency": "ARS",
+        "source": "monthly_budget_legacy",
+        "read_only": True,
         "income": float(summary.income),
         "extra": float(summary.extra),
         "total_fixed_expected": float(summary.total_fixed_expected),

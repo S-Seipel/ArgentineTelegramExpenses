@@ -79,6 +79,7 @@ from app.money.snapshot import (
     deserialize_money_block,
     ensure_snapshot_version,
 )
+from app.money.repository import normalize_currency
 
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,7 @@ class MoneyEngine:
         return summary.daily_safe_to_spend
 
     def detect_invariant_violations(
-        self, user_id: int
+        self, user_id: int, *, currency: Optional[str] = "ARS"
     ) -> list[InvariantViolation]:
         """Detect inconsistencies between ``FixedExpensePayment`` rows and
         their linked ``Expense`` mirrors.
@@ -215,7 +216,7 @@ class MoneyEngine:
         them.
         """
         out: list[InvariantViolation] = []
-        payments = self.session.execute(
+        stmt = (
             select(FixedExpensePayment)
             .join(FixedExpense, FixedExpense.id == FixedExpensePayment.fixed_expense_id)
             .where(
@@ -223,7 +224,10 @@ class MoneyEngine:
                 FixedExpensePayment.paid_at.is_not(None),
                 FixedExpensePayment.skipped.is_(False),
             )
-        ).scalars().all()
+        )
+        if currency is not None:
+            stmt = stmt.where(FixedExpense.currency == normalize_currency(currency))
+        payments = self.session.execute(stmt).scalars().all()
         for p in payments:
             if p.expense_id is None:
                 out.append(
@@ -317,13 +321,16 @@ class MoneyEngine:
         cycle: FinancialCycle,
         today: Optional[date] = None,
     ) -> CycleSummary:
-        base = self._sum_incomes(user_id, cycle.id, kind="income")
-        extra = self._sum_incomes(user_id, cycle.id, kind="extra")
+        def scoped(value: MoneyByCurrency) -> MoneyByCurrency:
+            return MoneyByCurrency({cycle.currency: value.get(cycle.currency)})
+
+        base = scoped(self._sum_incomes(user_id, cycle.id, kind="income"))
+        extra = scoped(self._sum_incomes(user_id, cycle.id, kind="extra"))
         gross = base.union(extra)
 
-        target = self._savings_target(user_id, cycle.id, gross)
-        reserved_row = self._savings_reserved(user_id, cycle.id)
-        realized = self._sum_realizations(user_id, cycle.id)
+        target = scoped(self._savings_target(user_id, cycle.id, gross))
+        reserved_row = scoped(self._savings_reserved(user_id, cycle.id))
+        realized = scoped(self._sum_realizations(user_id, cycle.id))
         committed = _max_by_currency(reserved_row, realized)
 
         realized_expenses = self._sum_realized_expenses(user_id, cycle)
@@ -374,6 +381,8 @@ class MoneyEngine:
             payday_day=cycle.payday_day,
             pay_rule=cycle.pay_rule,
             payday_weekday=cycle.payday_weekday,
+            currency=cycle.currency,
+            legacy_mixed_currency=cycle.legacy_mixed_currency,
             snapshot_version=CURRENT_SNAPSHOT_VERSION,
             base_income=base,
             extra_income=extra,
@@ -411,6 +420,8 @@ class MoneyEngine:
             payday_day=cycle.payday_day,
             pay_rule=cycle.pay_rule,
             payday_weekday=cycle.payday_weekday,
+            currency=cycle.currency,
+            legacy_mixed_currency=cycle.legacy_mixed_currency,
             snapshot_version=version,
             base_income=money_block["income"],
             extra_income=money_block["extra"],
@@ -441,7 +452,13 @@ class MoneyEngine:
     def _require_cycle(
         self, user_id: int, cycle_id: int
     ) -> FinancialCycle:
-        cycle = self.session.get(FinancialCycle, cycle_id)
+        # A long-lived reader may have cached this row before another
+        # transaction closed it. Always select the current lifecycle state
+        # so closed cycles are read from their immutable snapshot.
+        cycle = self.session.execute(
+            select(FinancialCycle).where(FinancialCycle.id == cycle_id)
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
         if cycle is None or cycle.telegram_user_id != user_id:
             raise LookupError(f"Cycle {cycle_id} not found for user {user_id}")
         return cycle
@@ -526,6 +543,7 @@ class MoneyEngine:
             func.coalesce(func.sum(Expense.amount), 0),
         ).where(
             Expense.telegram_user_id == user_id,
+            Expense.currency == cycle.currency,
             Expense.deleted_at.is_(None),
             Expense.expense_date >= cycle.start_date,
             Expense.expense_date <= cycle.end_date,

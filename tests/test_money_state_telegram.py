@@ -127,6 +127,7 @@ def test_tg_source_key_currency_conflict_is_friendly_and_keeps_one_row(
     assert "otra moneda" in conflict
     assert "telegram:" not in conflict
     with session_scope() as s:
+        assert s.query(models.FinancialCycle).count() == 1
         rows = s.query(getattr(models, model)).filter_by(cycle_id=view.cycle_id).all()
         if model == "CycleIncome":
             rows = [row for row in rows if row.kind == "extra"]

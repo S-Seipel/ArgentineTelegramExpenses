@@ -35,7 +35,7 @@ def test_concurrent_obligation_responses_resolve_once(fresh_db, actions):
     next_occurrence = date(2026, 11, 15)
     with session_scope() as session:
         cycle = CycleService(session).open_initial_cycle(
-            user_id=user_id, today=date(2026, 10, 1)
+            user_id=user_id, today=date(2026, 10, 1), currency="USD"
         )
         cycle_id = cycle.cycle_id
         service = RecurringService(RecurringRepository(session))

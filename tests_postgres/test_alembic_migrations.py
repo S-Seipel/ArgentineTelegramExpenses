@@ -45,7 +45,7 @@ def test_alembic_upgrade_from_empty_db(pg_database_url):
             "budgets",
             "fixed_expenses",
             "fixed_expense_payments",
-            "monthly_budget",
+            "monthly_budget_legacy",
             "recurring_reminders",
         } <= tables
         col_names = {c["name"] for c in inspector.get_columns("expenses")}

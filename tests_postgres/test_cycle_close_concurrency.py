@@ -25,7 +25,7 @@ from tests_postgres.test_fixed_payment_concurrency import fresh_db  # noqa: F401
 def _open_cycle():
     with session_scope() as session:
         return CycleService(session).open_initial_cycle(
-            user_id=42, today=date(2026, 10, 15)
+            user_id=42, today=date(2026, 10, 15), currency="USD"
         ).cycle_id
 
 
