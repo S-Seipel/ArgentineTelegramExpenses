@@ -21,6 +21,10 @@ COPY --chown=app:app app ./app
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app alembic.ini ./alembic.ini
 
+ENV HF_HOME=/app/.cache/huggingface
+RUN mkdir -p /app/.cache/huggingface \
+    && chown app:app /app/.cache /app/.cache/huggingface
+
 USER app
 
 EXPOSE 8000
