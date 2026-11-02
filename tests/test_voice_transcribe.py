@@ -24,11 +24,13 @@ class _FakeWhisperModel:
         self.text = text or "gasté diez lucas en café"
         self.exc = exc
         self.calls: list[str] = []
+        self.vad_filters: list[bool] = []
 
-    def transcribe(self, audio_path: str):
+    def transcribe(self, audio_path: str, *, vad_filter: bool = False):
+        self.calls.append(audio_path)
+        self.vad_filters.append(vad_filter)
         if self.exc is not None:
             raise self.exc
-        self.calls.append(audio_path)
         return ([_FakeSegment(self.text)], object())
 
 
@@ -57,6 +59,7 @@ async def test_transcribe_returns_text():
     await svc.aclose()
     assert out == "hola mundo"
     assert len(model.calls) == 1
+    assert model.vad_filters == [True]
     assert model.calls[0].endswith(".audio")
     assert os.path.exists(model.calls[0]) is False
 
@@ -92,6 +95,34 @@ async def test_transcribe_empty_model_output_raises():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message", [
+    "max() arg is an empty sequence", "max() iterable argument is empty",
+])
+async def test_transcribe_vad_without_speech_returns_controlled_empty_error(message):
+    model = _FakeWhisperModel(exc=ValueError(message))
+    svc = _make_service(model)
+    try:
+        with pytest.raises(AIError, match="No pude detectar voz"):
+            await svc.transcribe(b"synthetic silence")
+    finally:
+        await svc.aclose()
+    assert model.vad_filters == [True]
+    assert not os.path.exists(model.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_transcribe_does_not_hide_unrelated_value_errors():
+    model = _FakeWhisperModel(exc=ValueError("invalid audio codec"))
+    svc = _make_service(model)
+    try:
+        with pytest.raises(ValueError, match="invalid audio codec"):
+            await svc.transcribe(b"invalid audio")
+    finally:
+        await svc.aclose()
+    assert not os.path.exists(model.calls[0])
+
+
+@pytest.mark.asyncio
 async def test_transcribe_missing_ffmpeg_maps_to_unavailable():
     model = _FakeWhisperModel(exc=FileNotFoundError("ffmpeg missing"))
     svc = _make_service(model)
@@ -108,9 +139,9 @@ async def test_transcribe_uses_asyncio_thread():
     sub_thread_id = []
 
     class _CapturingModel(_FakeWhisperModel):
-        def transcribe(self, audio_path: str):
+        def transcribe(self, audio_path: str, *, vad_filter: bool = False):
             sub_thread_id.append(os.getpid() if hasattr(os, "getpid") else id(self))
-            return super().transcribe(audio_path)
+            return super().transcribe(audio_path, vad_filter=vad_filter)
 
     model = _CapturingModel()
     svc = _make_service(model)
@@ -146,7 +177,7 @@ async def test_lazy_load_initializes_on_first_call():
             self.device = kwargs.get("device")
             self.compute_type = kwargs.get("compute_type")
 
-        def transcribe(self, audio):
+        def transcribe(self, audio, *, vad_filter: bool = False):
             return ([_FakeSegment("lazy")], object())
 
     svc = OllamaAIService(cfg)

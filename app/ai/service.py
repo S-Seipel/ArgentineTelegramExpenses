@@ -160,8 +160,21 @@ class OllamaAIService:
             model = self._get_whisper_model()
 
             def _run() -> str:
-                segments, _info = model.transcribe(tmp_path)
-                return " ".join(seg.text for seg in segments).strip()
+                try:
+                    segments, _info = model.transcribe(tmp_path, vad_filter=True)
+                    return " ".join(seg.text for seg in segments).strip()
+                except ValueError as exc:
+                    # faster-whisper 1.0.3 attempts language detection on an
+                    # empty sequence when VAD removes all audio. Treat only
+                    # that known no-speech state as an empty transcription.
+                    if str(exc) in {
+                        "max() arg is an empty sequence",
+                        "max() iterable argument is empty",
+                    }:
+                        raise AIError(
+                            "No pude detectar voz en el audio. Probá grabarlo de nuevo."
+                        ) from exc
+                    raise
 
             try:
                 text = await asyncio.to_thread(_run)
