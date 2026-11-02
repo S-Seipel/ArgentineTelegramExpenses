@@ -14,8 +14,19 @@ original 2026-09-09 prioritization and are not a completion checklist.
 | F1 R1 | Payday configuration and cycle bootstrap | Closed |
 | F1 R2 | Read-only MoneyEngine, cycle closing, rollover and snapshots | Closed |
 | F1 R3 | Income, extras and savings mutations | Closed |
-| F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Implemented locally |
-| F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Implemented locally; migration 0014 required |
+| F1 R4 | Repair, Telegram/API/dashboard integration, immutable history and concurrency checks | Running locally |
+| F1.5 | Opt-in recurring commitments with stable due dates across reminder snoozes | Running locally on migration 0014 |
+
+The existing local installation was updated on 2026-11-02. Telegram polling,
+the dashboard, and the configured text provider were checked after startup.
+Whisper's cached model runs as the non-root app user; silent audio is rejected
+without inventing a transcription. The existing environment configuration
+was preserved. Original database records and currency totals were unchanged.
+
+Release validation: 667 normal tests on the Python 3.12 runtime image,
+31 PostgreSQL tests plus the R1/R2/R3 concurrency scripts, and zero known
+Python dependency vulnerabilities in that image. Database upgrade from the
+previous installation was rehearsed on an isolated restored backup first.
 
 F1.5 forecasts the cycle and retains one overdue occurrence per recurring
 template; it does not accumulate forgotten monthly installments as debt.
