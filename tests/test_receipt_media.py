@@ -112,7 +112,8 @@ def test_expiry_date_does_not_override_receipt_date_and_caption_is_only_descript
     assert draft.name == "Compra del día, 900 pesos"
 
 
-@pytest.mark.parametrize("text", ["", "   ", "X" * (128 * 1024 + 1)])
+@pytest.mark.parametrize("text", ["", "   ", "X" * (128 * 1024 + 1)],
+                         ids=["empty", "whitespace", "over_128_kb"])
 def test_missing_or_excessive_text_is_rejected(text):
     with pytest.raises(ReceiptError):
         parse_receipt_text(text)
@@ -133,7 +134,8 @@ def test_jpeg_and_png_dimensions_are_checked_before_ocr():
     assert image_dimensions(jpeg) == (10, 20, ".jpg")
 
 
-@pytest.mark.parametrize("image", [b"", b"GIF89a\x00", b"\xff\xd8\xff\xc0\x00\xff", b"\x89PNG\r\n\x1a\n", b"x" * (10 * 1024 * 1024 + 1)])
+@pytest.mark.parametrize("image", [b"", b"GIF89a\x00", b"\xff\xd8\xff\xc0\x00\xff", b"\x89PNG\r\n\x1a\n", b"x" * (10 * 1024 * 1024 + 1)],
+                         ids=["empty", "unsupported_gif", "truncated_jpeg", "truncated_png", "over_10_mb"])
 def test_invalid_payloads_are_rejected_before_ocr(image):
     with pytest.raises(ReceiptError):
         image_dimensions(image)

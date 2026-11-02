@@ -83,7 +83,8 @@ async def test_speech_errors_and_cancellation_cleanup(monkeypatch, error, expect
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [b"", b"NOT OGG", b"OggS" + b"x" * (2 * 1024 * 1024)])
+@pytest.mark.parametrize("payload", [b"", b"NOT OGG", b"OggS" + b"x" * (2 * 1024 * 1024)],
+                         ids=["empty", "invalid_ogg", "over_2_mb"])
 async def test_invalid_or_oversized_encoded_audio_is_rejected(monkeypatch, payload):
     from app.media import voice as module
     async def run(args, **kwargs):
