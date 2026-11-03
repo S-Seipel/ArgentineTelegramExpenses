@@ -24,7 +24,7 @@ items in `docker-compose.yml` must be revisited:
 
 | Item | Current (dev) | Recommended (prod) |
 |------|---------------|---------------------|
-| Postgres port | `127.0.0.1:5432:5432` | not exposed; use unix socket or private network |
+| Postgres port | `127.0.0.1:15432:5432` (host loopback only) | not exposed; use unix socket or private network |
 | Postgres password | `expenses` (in compose) | strong random password via secret store |
 | API port | `127.0.0.1:8000:8000` | reverse proxy with TLS |
 | Bot token | required | rotate if leaked (`/revoke` via @BotFather) |

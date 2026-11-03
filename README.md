@@ -702,6 +702,17 @@ docker compose logs app
 docker compose logs postgres
 ```
 
+### Conectar desde Beekeeper Studio, TablePlus u otro cliente de PostgreSQL
+
+Usá host `127.0.0.1`, puerto `15432`, usuario `expenses` y base `expenses`,
+con la contraseña de PostgreSQL configurada en `docker-compose.yml`.
+Para esta conexión local, SSL y túnel SSH quedan desactivados.
+
+El puerto `5432` de la Mac puede pertenecer a otra instalación de PostgreSQL.
+Si aparece `role "expenses" does not exist`, verificá que el cliente use
+`127.0.0.1:15432`. La app sigue conectándose dentro de Docker a
+`postgres:5432`; su `DATABASE_URL` no cambia.
+
 ### La IA se inventa montos
 
 El modelo devolvió algo sin `needs_clarification`. El sistema valida: si falta el monto **no guarda nada** y pregunta. Si ves guardado algo raro, abrí un issue con el texto original y el JSON devuelto.
@@ -745,7 +756,8 @@ docker compose exec app alembic upgrade head
 - Con `AI_PROVIDER=ollama`, la interpretación del texto y la transcripción
   de voz son locales. Con `AI_PROVIDER=minimax`, los mensajes y el contexto
   de análisis se envían a MiniMax; la transcripción de voz sigue siendo local.
-- Postgres **no** se expone al host (`127.0.0.1:5432`).
+- Postgres se publica sólo en el loopback de la Mac (`127.0.0.1:15432`),
+  sin acceso directo desde otros equipos.
 - Ollama **no** se expone al host.
 - El bot sólo responde a tu `TELEGRAM_ALLOWED_USER_ID`.
 - No se loggean mensajes ni montos en producción.
